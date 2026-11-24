@@ -544,6 +544,7 @@ impl<'a> Tracer<'a> {
             })) != Some(v)
             || f.abs != 0
             || f.neg != 0
+            || f.clamp
             || f.sdwa.is_some()
             || f.dpp.is_some()
         {
@@ -3050,5 +3051,30 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
+    }
+
+    /// `global_load_dword v4, v[2:3], off` at `v2 = s10 + v1` (a
+    /// `v_add_nc_u32_e64`, saturating when `clamp`), `v3 = 0`.
+    fn global_load_at_sum(clamp: bool) -> Result<Resources, ShaderError> {
+        let words = [
+            0xD525_0002 | u32::from(clamp) << 15, // v_add_nc_u32_e64 v2, s10, v1
+            0x0002_020A,
+            0x7E06_0280, // v_mov_b32 v3, 0
+            0xDC20_8000,
+            0x047D_0002, // global_load_dword v4, v[2:3], off
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        track(&p, &[param(Table, 10, 1)], HwStage::Cs, lanes(&p).as_ref())
+    }
+
+    #[test]
+    fn a_saturating_add_is_no_address_sum() {
+        let r = global_load_at_sum(false).unwrap();
+        assert_eq!((r.scalar[0].1.param, r.scalar[0].1.offset), (0, 0));
+        assert!(r.scalar[0].1.dynamic.is_some());
+        // The sum clamps at 2^32 - 1: it is not base + index.
+        assert!(global_load_at_sum(true).is_err());
     }
 }
