@@ -1,11 +1,14 @@
 //! End-to-end tests of synthetic GFX10 VALU shaders lowered to DXIL, validated
-//! by `dxil.dll` when present, and executed on the host GPU and WARP.
+//! by `dxil.dll` and executed on the host GPU and on WARP. Each of the three
+//! is skipped with a printed line where it is missing (`crate::testing`);
+//! D3DMetal under Wine has no WARP, so there these tests run on the hardware
+//! adapter only.
 //!
 //! Covers RDNA2 hardware semantics that differ from naive DXIL lowering:
 //! `v_med3_f32`/`v_med3_f16` with NaN operands, `v_fract_f32`/`v_fract_f16`
 //! near `1.0`, and turn-range reduction for `v_sin_*`/`v_cos_*`.
 
-use super::host::{Dispatch, Host, Root, View};
+use super::host::{Dispatch, Root, View};
 use super::{HostShader, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -152,16 +155,17 @@ pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(()
 
 /// Runs `shader` on every available SM 6.6 host (hardware GPU and WARP) for
 /// each 4-dword input set and invokes `check(backend, case_index, inputs, result_dword)`.
+/// A host that is missing is a printed skip, or a failure with
+/// `VICTORY_REQUIRE_GPU=1` (hardware) or `VICTORY_REQUIRE_WARP=1` (WARP):
+/// with neither host and neither switch, `check` is never called.
 fn run_cases(
     shader: &HostShader,
     cases: &[[u32; 4]],
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
+        let Some(host) = crate::testing::host(warp) else {
             continue;
         };
         let (root, pso) = host
@@ -190,9 +194,7 @@ fn run_cases(
                 .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
             check(label, i, inputs, out[0][0]);
         }
-        ran += 1;
     }
-    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
 
 fn is_f16_nan(bits: u16) -> bool {
@@ -937,8 +939,10 @@ fn v_cmp_class_f16_matches_rdna2() {
 }
 
 /// A console container assembled by the testkit goes the whole way on a
-/// device: `translate`, a compute pipeline on the hardware adapter and on
-/// WARP, and a dispatch that stores root constant 0 where the program says.
+/// device: `translate`, a compute pipeline on each available SM 6.6 device
+/// (the hardware adapter, and WARP where there is one: not under Wine with
+/// D3DMetal), and a dispatch that stores root constant 0 where the program
+/// says.
 #[test]
 fn a_translated_console_container_creates_a_compute_pipeline() {
     let shader = super::translate(&crate::testkit::cs_store_root_constant()).expect("translate");

@@ -1,11 +1,12 @@
 //! End-to-end tests of waterfall loops over per-lane descriptors: the
 //! synthetic GFX10 programs of `resource::tests` lowered to DXIL, validated
-//! by `dxil.dll` when present, and run on the host GPU and WARP, each lane
-//! reading the resource its own descriptor names.
+//! by `dxil.dll`, and run on the host GPU and WARP, each lane reading the
+//! resource its own descriptor names. Validator, GPU and WARP are each
+//! skipped with a printed line where missing (`crate::testing`).
 
 use windows::Win32::Graphics::Direct3D12::*;
 
-use super::host::{Dispatch, Host, Root, Stride, View};
+use super::host::{Dispatch, Root, Stride, View};
 use super::{HostShader, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -88,7 +89,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
 }
 
 /// Runs `shader` with `views` at heap indices 0.. (the UAV last) on the
-/// hardware GPU and on WARP (each skipped without a device) and returns,
+/// hardware GPU and on WARP (each a printed skip without a device) and returns,
 /// per one that ran, the UAV's 32 dwords.
 fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
     let samplers = [D3D12_SAMPLER_DESC {
@@ -108,8 +109,7 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
+        let Some(host) = crate::testing::host(warp) else {
             continue;
         };
         let (root, pso) = match host.compute_pipeline(shader) {

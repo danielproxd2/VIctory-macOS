@@ -65,6 +65,32 @@ pub(crate) fn skip_unless_required(var: &str, reason: &str) {
     skip(reason);
 }
 
+/// The host's SM 6.6 device for a test: the hardware adapter, or WARP
+/// with `warp`. Without one the test goes on without it after a skip
+/// line; `VICTORY_REQUIRE_GPU=1` (hardware) and `VICTORY_REQUIRE_WARP=1`
+/// (WARP) make that a failure. D3DMetal under Wine has no WARP.
+#[cfg(windows)]
+pub(crate) fn host(warp: bool) -> Option<crate::emit::host::Host> {
+    let (var, what) = if warp {
+        ("VICTORY_REQUIRE_WARP", "no SM 6.6 WARP device")
+    } else {
+        ("VICTORY_REQUIRE_GPU", "no host D3D12 device")
+    };
+    match crate::emit::host::Host::new(warp) {
+        Ok(host) => Some(host),
+        Err(e) => {
+            let e = e.trim();
+            let why = if e.is_empty() {
+                what.to_string()
+            } else {
+                format!("{what}: {e}")
+            };
+            skip_unless_required(var, &why);
+            None
+        }
+    }
+}
+
 /// Has `dxil.dll` validate an emitted container and checks that the hash
 /// we wrote is the one the validator signs it with. Where the validator
 /// cannot be loaded (always so off Windows) this is a skip line, and a

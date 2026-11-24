@@ -588,8 +588,7 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn stub_pipeline_is_created() {
-        let Ok(host) = super::host::Host::new(false) else {
-            eprintln!("no SM 6.6 device; skipped");
+        let Some(host) = crate::testing::host(false) else {
             return;
         };
         let ps = super::HostShader {

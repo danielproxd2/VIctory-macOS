@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
-use super::host::{Draw, Host, Root};
+use super::host::{Draw, Root};
 use super::{HostShader, RootType, translate};
 
 const RS: &str = "RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT), \
@@ -718,8 +718,7 @@ fn translated_shaders_draw_as_pc_ones() {
         eprintln!("no console or PC compiler; skipped");
         return;
     };
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 device; skipped");
+    let Some(host) = crate::testing::host(false) else {
         return;
     };
     let dir = std::env::temp_dir().join(format!("victory-diff-{}", std::process::id()));
@@ -869,8 +868,7 @@ fn translated_mesh_shaders_draw_as_pc_ones() {
         eprintln!("no console or PC compiler; skipped");
         return;
     };
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 device; skipped");
+    let Some(host) = crate::testing::host(false) else {
         return;
     };
     let dir = std::env::temp_dir().join(format!("victory-diff-ms-{}", std::process::id()));
@@ -981,8 +979,7 @@ fn float_semantics_are_the_consoles() {
         eprintln!("no console compiler; skipped");
         return;
     };
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 device; skipped");
+    let Some(host) = crate::testing::host(false) else {
         return;
     };
     let dir = std::env::temp_dir().join(format!("victory-float-{}", std::process::id()));
@@ -1070,8 +1067,7 @@ fn translated_compute_matches_pc() {
         eprintln!("no console or PC compiler; skipped");
         return;
     };
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 device; skipped");
+    let Some(host) = crate::testing::host(false) else {
         return;
     };
     let dir = std::env::temp_dir().join(format!("victory-diff-cs-{}", std::process::id()));
@@ -1191,7 +1187,7 @@ fn translated_compute_matches_pc() {
             Ok(p) => p,
             // WARP runs no fixed wave size of 64.
             Err(e) if std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1") => {
-                eprintln!("{name}: skipped on WARP ({e})");
+                crate::testing::skip(&format!("{name} on WARP: {e}"));
                 continue;
             }
             Err(e) => panic!("{name}: {e}"),
