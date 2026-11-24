@@ -116,10 +116,40 @@ impl Title {
         }
     }
 
+    /// [`Title::from_manifest`] of the manifest file's bytes: UTF-8, or
+    /// UTF-16 behind a byte-order mark (XML requires the mark of a UTF-16
+    /// document). Bytes that are neither say nothing about the title.
+    pub fn from_manifest_bytes(bytes: &[u8]) -> Title {
+        match manifest_text(bytes) {
+            Some(text) => Title::from_manifest(&text),
+            None => {
+                tracing::warn!("the title's manifest is neither UTF-8 nor marked UTF-16; ignored");
+                Title::default()
+            }
+        }
+    }
+
     /// Where game saves live: next to persistent local storage, under the
     /// data directory, never the cache.
     pub fn saves(&self) -> PathBuf {
         self.storage.with_file_name("saves")
+    }
+}
+
+/// The text of a manifest file, if its bytes are text in its encoding.
+fn manifest_text(bytes: &[u8]) -> Option<String> {
+    let utf16 = |bytes: &[u8], unit: fn([u8; 2]) -> u16| {
+        let units = bytes.chunks_exact(2);
+        if !units.remainder().is_empty() {
+            return None;
+        }
+        let units: Vec<u16> = units.map(|u| unit([u[0], u[1]])).collect();
+        String::from_utf16(&units).ok()
+    };
+    match bytes {
+        [0xff, 0xfe, rest @ ..] => utf16(rest, u16::from_le_bytes),
+        [0xfe, 0xff, rest @ ..] => utf16(rest, u16::from_be_bytes),
+        _ => std::str::from_utf8(bytes).ok().map(str::to_owned),
     }
 }
 
@@ -362,6 +392,46 @@ mod tests {
         assert_eq!(game(&format!("{ID}<Other>{ID}</Other>")).id, 0x639A_A8DD);
     }
 
+    /// The manifest file as bytes: UTF-8 with or without its mark, UTF-16
+    /// of either byte order behind its mark; anything else is no manifest.
+    #[test]
+    fn manifests_are_read_in_their_encoding() {
+        let text = "<?xml version=\"1.0\" encoding=\"utf-16\"?>\n<Game configVersion=\"1\">\
+                    <TitleId>639AA8DD</TitleId><StoreId>9\u{e9}\u{1f600}</StoreId>\
+                    <PersistentLocalStorage><SizeMB>8</SizeMB></PersistentLocalStorage></Game>";
+        let expected = Title::from_manifest(text);
+        assert_eq!(
+            (expected.id, expected.storage_bytes),
+            (0x639A_A8DD, 8 << 20)
+        );
+        assert_eq!(expected.store_id, "9\u{e9}\u{1f600}");
+
+        let utf16 = |mark: [u8; 2], bytes: fn(u16) -> [u8; 2]| {
+            let units = text.encode_utf16().flat_map(bytes);
+            mark.into_iter().chain(units).collect::<Vec<u8>>()
+        };
+        let little = utf16([0xff, 0xfe], u16::to_le_bytes);
+        let big = utf16([0xfe, 0xff], u16::to_be_bytes);
+        let marked_utf8 = [b"\xef\xbb\xbf", text.as_bytes()].concat();
+        for bytes in [text.as_bytes(), &marked_utf8, &little, &big] {
+            assert_eq!(Title::from_manifest_bytes(bytes), expected);
+        }
+
+        // Not text in its encoding: no title, rather than part of one.
+        let none = Title::default();
+        let unmarked = &little[2..];
+        let odd = &little[..little.len() - 1];
+        let lone_surrogate = [&little[..], &[0x00, 0xd8]].concat();
+        let bad_utf8 = [text.as_bytes(), b"\xff"].concat();
+        let swapped = [&[0xfe, 0xff][..], &little[2..]].concat();
+        for bytes in [unmarked, odd, &lone_surrogate, &bad_utf8, &swapped] {
+            assert_eq!(Title::from_manifest_bytes(bytes), none);
+        }
+        for bytes in [&b""[..], b"\xff\xfe", b"\xfe\xff", b"\xff", b"\xef\xbb\xbf"] {
+            assert_eq!(Title::from_manifest_bytes(bytes), none);
+        }
+    }
+
     /// A small xorshift generator, so the random cases are the same on
     /// every run and host.
     struct Random(u64);
@@ -448,6 +518,19 @@ mod tests {
             assert!(t.id == 0 || named("Game/TitleId"), "{text:?}");
             assert!(t.store_id.is_empty() || named("Game/StoreId"), "{text:?}");
             assert_eq!(t.storage_bytes % (1 << 20), 0, "{text:?}");
+            // The file's encoding does not change what is read.
+            assert_eq!(Title::from_manifest_bytes(text.as_bytes()), t, "{text:?}");
+            let utf16 = text.encode_utf16().flat_map(u16::to_le_bytes);
+            let utf16: Vec<u8> = [0xff, 0xfe].into_iter().chain(utf16).collect();
+            assert_eq!(Title::from_manifest_bytes(&utf16), t, "{text:?}");
+            // Nor do bytes that are no text at all stop it.
+            let noise: Vec<u8> = (0..random.below(64)).map(|_| random.next() as u8).collect();
+            let cut = &utf16[..random.below(utf16.len() + 1)];
+            for bytes in [&noise[..], cut] {
+                let t = Title::from_manifest_bytes(bytes);
+                assert_eq!(t.storage, PathBuf::new());
+                assert_eq!(t.storage_bytes % (1 << 20), 0, "{bytes:?}");
+            }
             if t.id == 0 {
                 without += 1;
             } else {

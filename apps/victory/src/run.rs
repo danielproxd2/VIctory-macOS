@@ -45,9 +45,8 @@ pub fn run(
     let wanted = |dll: &str| title_dll(&resolver.host, dll);
     let title_dir = exe.parent().unwrap_or(Path::new("."));
     // A missing manifest leaves id 0 and no storage quota.
-    let manifest =
-        std::fs::read_to_string(title_dir.join("MicrosoftGame.config")).unwrap_or_default();
-    let title = victory_hle::runtime::Title::from_manifest(&manifest);
+    let manifest = std::fs::read(title_dir.join("MicrosoftGame.config")).unwrap_or_default();
+    let title = victory_hle::runtime::Title::from_manifest_bytes(&manifest);
     let storage = cfg.data_subdir(&format!("{:08X}/storage", title.id))?;
     println!(
         "title          {:08X}, storage {} ({} MB)",
