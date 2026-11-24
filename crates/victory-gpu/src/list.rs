@@ -840,7 +840,11 @@ extern "system" fn resolve_queries(
         PIPELINE_STATISTICS => (Written::Value(0), 88),
         _ => (Written::Value(0), 16),
     };
-    if offset + u64::from(count) * bytes > size {
+    // The title's offset can be anything: a wrapped end would pass the check.
+    let fits = (u64::from(count) * bytes)
+        .checked_add(offset)
+        .is_some_and(|end| end <= size);
+    if !fits {
         return;
     }
     for i in 0..u64::from(count) {
@@ -1469,5 +1473,65 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    /// A committed upload buffer of `width` bytes, made through the device
+    /// method (the resource types' fields are private to their module).
+    fn upload_buffer(width: u64) -> This {
+        let properties = [1u32, 0, 0, 0, 0];
+        // dimension (buffer), alignment, width, height | depth | mips,
+        // format | sample count, quality | layout, flags.
+        let desc = [1u64, 0, width, 1 | 1 << 32 | 1 << 48, 1 << 32, 1 << 32, 0];
+        let iid = guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let mut buffer = std::ptr::null();
+        let hr = crate::resource::create_committed(
+            std::ptr::null(),
+            std::ptr::from_ref(&properties).cast(),
+            0,
+            std::ptr::from_ref(&desc).cast(),
+            0,
+            std::ptr::null(),
+            &iid,
+            &mut buffer,
+        );
+        assert_eq!(hr, S_OK);
+        buffer
+    }
+
+    /// A query range is checked against the buffer without overflow: an
+    /// offset near `u64::MAX` wraps the end of the range past the check
+    /// (and is a panic, which cannot unwind out of the method, in a debug
+    /// build) and would write far outside the buffer.
+    #[test]
+    fn resolved_queries_stay_inside_their_buffer() {
+        let null = std::ptr::null();
+        let buffer = upload_buffer(32);
+        let (data, size) = crate::resource::buffer_bytes(buffer).unwrap();
+        assert_eq!(size, 32);
+        let bytes = || {
+            // SAFETY: the buffer holds 32 bytes.
+            unsafe { std::slice::from_raw_parts(data, 32) }.to_vec()
+        };
+        const OCCLUSION: u32 = 0;
+        // Two 8-byte results fit at 16, exactly to the end.
+        resolve_queries(null, null, OCCLUSION, 0, 2, buffer, 16);
+        let written = bytes();
+        assert_eq!(written[..16], [0; 16]);
+        assert_eq!(written[16..24], (1u64 << 20).to_le_bytes());
+        assert_eq!(written[24..], (1u64 << 20).to_le_bytes());
+        // One byte further, or an offset that wraps the end around: nothing.
+        // SAFETY: the buffer holds 32 bytes.
+        unsafe { data.write_bytes(0, 32) };
+        resolve_queries(null, null, OCCLUSION, 0, 2, buffer, 17);
+        resolve_queries(null, null, OCCLUSION, 0, 2, buffer, u64::MAX - 7);
+        resolve_queries(null, null, OCCLUSION, u32::MAX, u32::MAX, buffer, 0);
+        assert_eq!(bytes(), [0; 32]);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(buffer), 0);
     }
 }
