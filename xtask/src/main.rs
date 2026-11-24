@@ -36,7 +36,9 @@ fn main() -> Result<()> {
     let root = workspace_root();
     match Cli::parse().command {
         Cmd::Policy { staged } => policy::run(&root, staged),
-        Cmd::EmbedClamp { folder } => embed_clamp::run(&root, &folder),
+        Cmd::EmbedClamp { folder } => {
+            embed_clamp::run(&root.join("crates/victory-gpu/src"), &folder)
+        }
         Cmd::InstallHooks => {
             let status = Command::new("git")
                 .args(["config", "core.hooksPath", ".githooks"])
