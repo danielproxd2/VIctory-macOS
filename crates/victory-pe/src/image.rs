@@ -404,16 +404,42 @@ fn va_to_rva(va: u64, image_base: u64) -> Result<u32, PeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::{DELAYLOAD_RVA_BASED, Export, PeBuilder, scn};
 
-    /// The test binary itself is a real MSVC-linked PE32+ image.
-    fn own_image() -> Vec<u8> {
-        std::fs::read(std::env::current_exe().unwrap()).unwrap()
+    fn by_name(hint: u16, name: &str) -> ImportSymbol {
+        ImportSymbol::Name {
+            hint,
+            name: name.to_owned(),
+        }
     }
 
+    /// An executable shaped like a linked one: code, an exception table,
+    /// imports from two DLLs and a TLS directory. `.text` is at RVA 0x1000
+    /// and `.pdata` at 0x2000.
+    fn sample() -> PeBuilder {
+        PeBuilder::new()
+            .entry_rva(0x1010)
+            .section(".text", scn::CODE, &[0xC3; 0x40])
+            .section(".pdata", scn::RDATA, &[0; 12])
+            .data_directory(dir::EXCEPTION, 0x2000, 12)
+            .import(
+                "alpha.dll",
+                &[by_name(3, "First"), ImportSymbol::Ordinal(7)],
+            )
+            .import("beta.dll", &[by_name(0, "Second")])
+            .tls_without_callbacks()
+    }
+
+    fn sample_image() -> Vec<u8> {
+        sample().build().unwrap().bytes
+    }
+
+    /// The test binary itself is a real linked PE32+ image.
+    #[cfg(windows)]
     #[test]
-    #[cfg_attr(not(windows), ignore = "reads its own test binary as a PE file")]
     fn parses_own_test_binary() {
-        let info = ImageInfo::parse(&own_image()).unwrap();
+        let data = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let info = ImageInfo::parse(&data).unwrap();
         assert_eq!(info.machine, MACHINE_AMD64);
         assert!(!info.is_dll());
         assert!(info.entry_rva != 0);
@@ -428,113 +454,212 @@ mod tests {
         // Rust std uses static TLS, so a TLS directory must be present (its
         // callback array may legitimately be empty).
         assert!(info.tls.is_some());
-    }
-
-    #[test]
-    #[cfg_attr(not(windows), ignore = "reads its own test binary as a PE file")]
-    fn rva_to_file_offset_maps_entry_point() {
-        let data = own_image();
-        let info = ImageInfo::parse(&data).unwrap();
         let off = info.rva_to_file_offset(info.entry_rva).unwrap() as usize;
         assert!(off < data.len());
     }
 
     #[test]
-    #[cfg_attr(not(windows), ignore = "reads its own test binary as a PE file")]
-    fn rva_to_file_offset_rejects_offsets_past_4_gib() {
-        let mut info = ImageInfo::parse(&own_image()).unwrap();
-        let rva = info.sections[0].rva + 0x20;
-        assert!(info.rva_to_file_offset(rva).is_some());
-        // Used to overflow (a panic in debug builds, a wrong offset in
-        // release ones).
-        info.sections[0].file_offset = u32::MAX - 0x10;
-        assert_eq!(info.rva_to_file_offset(rva), None);
-    }
-
-    #[test]
-    fn rejects_garbage_without_panicking() {
-        assert!(ImageInfo::parse(b"").is_err());
-        assert!(ImageInfo::parse(b"MZ not really").is_err());
-        let mut truncated = own_image();
-        truncated.truncate(0x200);
-        assert!(ImageInfo::parse(&truncated).is_err());
-    }
-
-    #[test]
-    #[cfg_attr(not(windows), ignore = "reads its own test binary as a PE file")]
-    fn rejects_iat_outside_image() {
-        let mut data = own_image();
-        let dd = layout::data_directory_offset(&data, dir::IMPORT).unwrap();
-        let import_rva = layout::read_u32(&data, dd).unwrap();
-        let desc = ImageInfo::parse(&data)
+    fn parses_synthetic_executable() {
+        let guid: [u8; 16] = std::array::from_fn(|i| 0xA0 + i as u8);
+        let data = sample()
+            .timestamp(0x1234_5678)
+            .stack_reserve(0x20_0000)
+            .codeview(guid, 2, "sample.pdb")
+            .build()
             .unwrap()
-            .rva_to_file_offset(import_rva)
-            .unwrap() as usize;
-        // First descriptor's FirstThunk, at the 4 GiB limit: used to overflow.
-        data[desc + 16..desc + 20].copy_from_slice(&0xFFFF_FFF8u32.to_le_bytes());
+            .bytes;
+        let info = ImageInfo::parse(&data).unwrap();
+        assert_eq!(info.machine, MACHINE_AMD64);
+        assert!(!info.is_dll());
+        assert_eq!(info.timestamp, 0x1234_5678);
+        assert_eq!(info.entry_rva, 0x1010);
+        assert_eq!(info.image_base, crate::testing::DEFAULT_IMAGE_BASE);
+        assert_eq!(info.stack_reserve, 0x20_0000);
+        assert_eq!(info.subsystem_name(), "windows-cui");
+        assert!(info.has_exception_table);
+        assert!(!info.has_relocations);
+        assert!(!info.has_load_config);
+        let text = &info.sections[0];
+        assert!(text.name.starts_with(".text"));
+        assert_eq!((text.rva, text.virtual_size), (0x1000, 0x40));
+        assert_eq!(text.characteristics, scn::CODE);
+        let last = info.sections.last().unwrap();
+        assert!(last.rva + last.virtual_size <= info.size_of_image);
+        let cv = info.codeview.expect("an RSDS record was added");
+        assert_eq!((cv.guid, cv.age), (guid, 2));
+        assert_eq!(cv.pdb_path, "sample.pdb");
+
+        let dll = PeBuilder::new().dll(true).build().unwrap().bytes;
+        assert!(ImageInfo::parse(&dll).unwrap().is_dll());
+    }
+
+    #[test]
+    fn rejects_other_machines() {
+        // IMAGE_FILE_MACHINE_ARM64.
+        let data = sample().machine(0xAA64).build().unwrap().bytes;
+        assert!(matches!(
+            ImageInfo::parse(&data),
+            Err(PeError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn parses_synthetic_imports_by_name_and_ordinal() {
+        let data = sample_image();
+        let info = ImageInfo::parse(&data).unwrap();
+        assert_eq!(info.import_count(), 3);
+        let modules: Vec<_> = info.imports.iter().map(|m| m.dll.as_str()).collect();
+        assert_eq!(modules, ["alpha.dll", "beta.dll"]);
+        let alpha: Vec<_> = info.imports[0].entries.iter().map(|e| &e.symbol).collect();
+        assert_eq!(alpha, [&by_name(3, "First"), &ImportSymbol::Ordinal(7)]);
+        assert_eq!(info.imports[1].entries[0].symbol, by_name(0, "Second"));
+
+        // Consecutive 8-byte slots per module, inside the IAT directory,
+        // each still holding its name-table value in the file.
+        let slots = &info.imports[0].entries;
+        assert_eq!(slots[1].iat_slot_rva, slots[0].iat_slot_rva + 8);
+        let iat = layout::data_directory_offset(&data, dir::IAT).unwrap();
+        let iat_rva = layout::read_u32(&data, iat).unwrap();
+        let iat_size = layout::read_u32(&data, iat + 4).unwrap();
+        for entry in info.imports.iter().flat_map(|m| &m.entries) {
+            assert!(entry.iat_slot_rva >= iat_rva);
+            assert!(entry.iat_slot_rva + 8 <= iat_rva + iat_size);
+        }
+        let at = info.rva_to_file_offset(slots[1].iat_slot_rva).unwrap() as usize;
+        assert_eq!(layout::read_u64(&data, at), Some(1 << 63 | 7));
+    }
+
+    #[test]
+    fn parses_synthetic_delay_imports() {
+        let data = sample()
+            .delay_import(
+                "late.dll",
+                DELAYLOAD_RVA_BASED,
+                &[by_name(1, "Later"), ImportSymbol::Ordinal(9)],
+            )
+            .build()
+            .unwrap()
+            .bytes;
+        let info = ImageInfo::parse(&data).unwrap();
+        // Delay imports are kept apart from the eager ones.
+        assert_eq!(info.import_count(), 3);
+        assert_eq!(info.delay_imports.len(), 1);
+        let late = &info.delay_imports[0];
+        assert_eq!(late.dll, "late.dll");
+        let symbols: Vec<_> = late.entries.iter().map(|e| &e.symbol).collect();
+        assert_eq!(symbols, [&by_name(1, "Later"), &ImportSymbol::Ordinal(9)]);
+        assert_eq!(
+            late.entries[1].iat_slot_rva,
+            late.entries[0].iat_slot_rva + 8
+        );
+        // The delay IAT is its own table, not part of the eager IAT.
+        let eager: Vec<_> = info
+            .imports
+            .iter()
+            .flat_map(|m| &m.entries)
+            .map(|e| e.iat_slot_rva)
+            .collect();
+        assert!(
+            late.entries
+                .iter()
+                .all(|e| !eager.contains(&e.iat_slot_rva))
+        );
+    }
+
+    #[test]
+    fn parses_synthetic_tls_callbacks() {
+        let built = PeBuilder::new()
+            .section(".text", scn::CODE, &[0xC3; 0x40])
+            .tls_callbacks(&[0x1000, 0x1020])
+            .build()
+            .unwrap();
+        let info = ImageInfo::parse(&built.bytes).unwrap();
+        let tls = info.tls.expect("a TLS directory was added");
+        assert_eq!(Some(tls.directory_rva), built.tls_directory_rva);
+        assert_eq!(tls.callback_rvas, [0x1000, 0x1020]);
+        let array = tls.callbacks_va - info.image_base;
+        assert!(array < u64::from(info.size_of_image));
+
+        // A directory without a callback array is still a TLS directory.
+        let info = ImageInfo::parse(&sample_image()).unwrap();
+        let tls = info.tls.expect("a TLS directory was added");
+        assert_eq!(tls.callbacks_va, 0);
+        assert!(tls.callback_rvas.is_empty());
+
+        let none = PeBuilder::new().build().unwrap().bytes;
+        assert!(ImageInfo::parse(&none).unwrap().tls.is_none());
+    }
+
+    #[test]
+    fn rejects_tls_callbacks_below_the_image_base() {
+        let built = PeBuilder::new().tls_callbacks(&[0x1000]).build().unwrap();
+        let mut data = built.bytes;
+        let info = ImageInfo::parse(&data).unwrap();
+        let tls = info.tls.as_ref().unwrap();
+        let array = u32::try_from(tls.callbacks_va - info.image_base).unwrap();
+        let at = info.rva_to_file_offset(array).unwrap() as usize;
+        data[at..at + 8].copy_from_slice(&(info.image_base - 1).to_le_bytes());
         assert!(matches!(
             ImageInfo::parse(&data),
             Err(PeError::Malformed(_))
         ));
     }
-    /// A minimal PE32+ image: one section at RVA 0x1000 holding `body`, with
-    /// the export directory (RVA 0x1000, 0x80 bytes) pointing at it.
-    fn synthetic_image(body: &[u8]) -> Vec<u8> {
-        let mut d = vec![0u8; 0x200];
-        d[0..2].copy_from_slice(b"MZ");
-        d[0x3C..0x40].copy_from_slice(&0x40u32.to_le_bytes());
-        d[0x40..0x44].copy_from_slice(b"PE\0\0");
-        d[0x44..0x46].copy_from_slice(&MACHINE_AMD64.to_le_bytes());
-        d[0x46..0x48].copy_from_slice(&1u16.to_le_bytes()); // sections
-        d[0x54..0x56].copy_from_slice(&240u16.to_le_bytes()); // optional header size
-        d[0x56..0x58].copy_from_slice(&0x2022u16.to_le_bytes()); // DLL, large address aware
-        let opt = 0x58;
-        d[opt..opt + 2].copy_from_slice(&0x20Bu16.to_le_bytes());
-        d[opt + 24..opt + 32].copy_from_slice(&0x1_8000_0000u64.to_le_bytes());
-        d[opt + 32..opt + 36].copy_from_slice(&0x1000u32.to_le_bytes());
-        d[opt + 36..opt + 40].copy_from_slice(&0x200u32.to_le_bytes());
-        d[opt + 56..opt + 60].copy_from_slice(&0x2000u32.to_le_bytes());
-        d[opt + 60..opt + 64].copy_from_slice(&0x200u32.to_le_bytes());
-        d[opt + 108..opt + 112].copy_from_slice(&16u32.to_le_bytes());
-        d[opt + 112..opt + 116].copy_from_slice(&0x1000u32.to_le_bytes());
-        d[opt + 116..opt + 120].copy_from_slice(&0x80u32.to_le_bytes());
-        let sec = opt + 240;
-        d[sec..sec + 6].copy_from_slice(b".edata");
-        d[sec + 8..sec + 12].copy_from_slice(&0x200u32.to_le_bytes()); // virtual size
-        d[sec + 12..sec + 16].copy_from_slice(&0x1000u32.to_le_bytes());
-        d[sec + 16..sec + 20].copy_from_slice(&0x200u32.to_le_bytes()); // raw size
-        d[sec + 20..sec + 24].copy_from_slice(&0x200u32.to_le_bytes()); // raw offset
-        d.extend_from_slice(body);
-        d.resize(0x400, 0);
-        d
+
+    #[test]
+    fn parses_synthetic_exports_with_forwarder() {
+        let data = PeBuilder::new()
+            .dll(true)
+            .section(".text", scn::CODE, &[0xC3; 0x40])
+            .exports(
+                "t.dll",
+                5,
+                vec![
+                    Export::named("gamma", 0x1010),
+                    Export::ordinal_only(0x1020),
+                    Export::forwarder("alpha", "other.Target"),
+                    Export::forwarder("beta", "other.#12"),
+                ],
+            )
+            .build()
+            .unwrap()
+            .bytes;
+        let info = ImageInfo::parse(&data).unwrap();
+        let mut exports: Vec<_> = info
+            .exports
+            .iter()
+            .map(|e| (e.ordinal, e.name.as_deref(), e.rva, e.forward.as_deref()))
+            .collect();
+        exports.sort();
+        assert_eq!(
+            exports,
+            [
+                (5, Some("gamma"), Some(0x1010), None),
+                (6, None, Some(0x1020), None),
+                (7, Some("alpha"), None, Some("other.Target")),
+                (8, Some("beta"), None, Some("other.#12")),
+            ]
+        );
     }
 
     #[test]
     fn unused_export_slots_are_not_exports() {
         // Ordinal base 1; three address slots: "alpha", an unused hole (0),
         // and "gamma". The Windows loader treats address 0 as "not exported".
-        let mut body = vec![0u8; 0x100];
-        let put32 =
-            |b: &mut Vec<u8>, at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
-        put32(&mut body, 12, 0x1040); // name of the DLL
-        put32(&mut body, 16, 1); // ordinal base
-        put32(&mut body, 20, 3); // number of functions
-        put32(&mut body, 24, 2); // number of names
-        put32(&mut body, 28, 0x1028); // address table
-        put32(&mut body, 32, 0x1034); // name pointer table
-        put32(&mut body, 36, 0x103C); // name ordinal table
-        put32(&mut body, 0x28, 0x1200);
-        put32(&mut body, 0x2C, 0);
-        put32(&mut body, 0x30, 0x1204);
-        put32(&mut body, 0x34, 0x1044);
-        put32(&mut body, 0x38, 0x104A);
-        body[0x3C..0x3E].copy_from_slice(&0u16.to_le_bytes());
-        body[0x3E..0x40].copy_from_slice(&2u16.to_le_bytes());
-        body[0x40..0x44].copy_from_slice(b"t.dl");
-        body[0x44..0x4A].copy_from_slice(b"alpha\0");
-        body[0x4A..0x50].copy_from_slice(b"gamma\0");
-
-        let info = ImageInfo::parse(&synthetic_image(&body)).unwrap();
+        let data = PeBuilder::new()
+            .dll(true)
+            .exports(
+                "t.dll",
+                1,
+                vec![
+                    Export::named("alpha", 0x1200),
+                    Export::unused(),
+                    Export::named("gamma", 0x1204),
+                ],
+            )
+            .build()
+            .unwrap()
+            .bytes;
+        let info = ImageInfo::parse(&data).unwrap();
         let exports: Vec<_> = info
             .exports
             .iter()
@@ -547,5 +672,91 @@ mod tests {
                 (Some("gamma"), 3, Some(0x1204))
             ]
         );
+    }
+
+    #[test]
+    fn reports_base_relocations_unless_stripped() {
+        let with = PeBuilder::new().reloc_block(0x1000, &[(crate::testing::reloc::DIR64, 8)]);
+        let info = ImageInfo::parse(&with.clone().build().unwrap().bytes).unwrap();
+        assert!(info.has_relocations);
+        let stripped = with.relocs_stripped(true).build().unwrap().bytes;
+        assert!(!ImageInfo::parse(&stripped).unwrap().has_relocations);
+    }
+
+    #[test]
+    fn symbol_key_known_answer() {
+        let cv = CodeViewInfo {
+            pdb_path: String::new(),
+            guid: std::array::from_fn(|i| i as u8),
+            age: 1,
+        };
+        // The first three GUID fields are little-endian integers, the last
+        // eight bytes are printed in order; the age follows in hex.
+        assert_eq!(cv.symbol_key(), "030201000504070608090A0B0C0D0E0F1");
+        let cv = CodeViewInfo { age: 0x2A, ..cv };
+        assert!(cv.symbol_key().ends_with("0E0F2A"));
+    }
+
+    #[test]
+    fn rva_to_file_offset_maps_entry_point() {
+        let data = sample_image();
+        let info = ImageInfo::parse(&data).unwrap();
+        let off = info.rva_to_file_offset(info.entry_rva).unwrap() as usize;
+        assert_eq!(off, info.sections[0].file_offset as usize + 0x10);
+        assert_eq!(data[off], 0xC3);
+        // Past the section's data, and in the headers: not file-backed.
+        assert_eq!(info.rva_to_file_offset(0x1040), None);
+        assert_eq!(info.rva_to_file_offset(0x10), None);
+    }
+
+    #[test]
+    fn rva_to_file_offset_rejects_offsets_past_4_gib() {
+        let mut info = ImageInfo::parse(&sample_image()).unwrap();
+        let rva = info.sections[0].rva + 0x20;
+        assert!(info.rva_to_file_offset(rva).is_some());
+        // Used to overflow (a panic in debug builds, a wrong offset in
+        // release ones).
+        info.sections[0].file_offset = u32::MAX - 0x10;
+        assert_eq!(info.rva_to_file_offset(rva), None);
+    }
+
+    #[test]
+    fn rejects_garbage_without_panicking() {
+        assert!(ImageInfo::parse(b"").is_err());
+        assert!(ImageInfo::parse(b"MZ not really").is_err());
+        // Headers that describe sections the file no longer has.
+        let data = sample_image();
+        let headers = info_headers_len(&data);
+        assert!(ImageInfo::parse(&data[..headers]).is_err());
+        assert!(ImageInfo::parse(&data[..0x100]).is_err());
+    }
+
+    /// File offset of the first section's data: where the headers end.
+    fn info_headers_len(data: &[u8]) -> usize {
+        ImageInfo::parse(data).unwrap().sections[0].file_offset as usize
+    }
+
+    #[test]
+    fn rejects_iat_outside_image() {
+        let mut data = sample_image();
+        let dd = layout::data_directory_offset(&data, dir::IMPORT).unwrap();
+        let import_rva = layout::read_u32(&data, dd).unwrap();
+        let desc = ImageInfo::parse(&data)
+            .unwrap()
+            .rva_to_file_offset(import_rva)
+            .unwrap() as usize;
+        // First descriptor's FirstThunk, at the 4 GiB limit: used to overflow.
+        data[desc + 16..desc + 20].copy_from_slice(&0xFFFF_FFF8u32.to_le_bytes());
+        assert!(matches!(
+            ImageInfo::parse(&data),
+            Err(PeError::Malformed(_))
+        ));
+        // Inside 4 GiB but past the end of the image.
+        let size_of_image = ImageInfo::parse(&sample_image()).unwrap().size_of_image;
+        data[desc + 16..desc + 20].copy_from_slice(&(size_of_image - 8).to_le_bytes());
+        assert!(matches!(
+            ImageInfo::parse(&data),
+            Err(PeError::Malformed(_))
+        ));
     }
 }
