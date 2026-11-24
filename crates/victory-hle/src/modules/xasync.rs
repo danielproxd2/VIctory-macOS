@@ -514,6 +514,7 @@ fn status(block: *mut AsyncBlock) -> HRESULT {
     words(block).0.load(Ordering::Acquire) as u32 as i32
 }
 
+/// Ends the call on `block` whose status is already final.
 fn release(block: *mut AsyncBlock) {
     // Unlocked before the provider runs: it may call back into us.
     let removed = lock(&CALLS).remove(&(block as usize));
@@ -602,11 +603,24 @@ pub fn XAsyncComplete(block: *mut AsyncBlock, result: HRESULT, required_size: us
     // SAFETY: a block in flight is valid.
     let (handle, routine) = unsafe { ((*block).queue, (*block).callback) };
     let (status, size) = words(block);
-    if result < 0 || required_size == 0 {
-        release(block);
+    // A call with nothing to hand out ends here. It leaves the table and
+    // its status becomes final in one step under the table's lock: a
+    // waiter that no longer finds the call must not read a status that
+    // still says pending (`XAsyncGetStatus` would return `E_PENDING` from
+    // a wait), and a title that reads the final status may begin a new
+    // call on the same block at once.
+    let ended = {
+        let mut calls = lock(&CALLS);
+        size.store(required_size, Ordering::Release);
+        status.store(result as u32 as usize, Ordering::Release);
+        (result < 0 || required_size == 0)
+            .then(|| calls.remove(&(block as usize)))
+            .flatten()
+    };
+    // Unlocked before the provider runs: it may call back into us.
+    if let Some(ended) = ended {
+        ended.provider(OP_CLEANUP, block, 0, std::ptr::null_mut());
     }
-    size.store(required_size, Ordering::Release);
-    status.store(result as u32 as usize, Ordering::Release);
     *done = true;
     call.finished.notify_all();
     drop(done);
@@ -1209,6 +1223,68 @@ mod tests {
             "the call ends with its result"
         );
         XTaskQueueCloseHandle(q);
+    }
+
+    /// A failed call leaves the table before its provider cleans up. A
+    /// wait that starts in between finds no call to wait on, so the status
+    /// must be final by then: it once still said pending, and a title
+    /// waiting for a cancelled dialog got `E_PENDING` back.
+    #[test]
+    fn a_wait_during_cleanup_sees_the_final_status() {
+        use std::sync::mpsc::{Receiver, Sender, channel};
+        struct Gate {
+            cleaning: Mutex<Sender<()>>,
+            go_on: Mutex<Receiver<()>>,
+        }
+        extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
+            if op == OP_CLEANUP {
+                // SAFETY: the context is the test's gate, which outlives
+                // the call.
+                let gate = unsafe { &*(*data).context.cast::<Gate>() };
+                let _ = lock(&gate.cleaning).send(());
+                let _ = lock(&gate.go_on).recv_timeout(Duration::from_secs(30));
+            }
+            S_OK
+        }
+        let (cleaning, in_cleanup) = channel();
+        let (release, go_on) = channel();
+        let gate = Gate {
+            cleaning: Mutex::new(cleaning),
+            go_on: Mutex::new(go_on),
+        };
+        let mut block = AsyncBlock {
+            queue: std::ptr::null(),
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        };
+        let context = (&raw const gate).cast_mut().cast();
+        assert_eq!(
+            XAsyncBegin(
+                &mut block,
+                context,
+                std::ptr::null(),
+                std::ptr::null(),
+                Some(provider)
+            ),
+            S_OK
+        );
+        assert_eq!(XAsyncGetStatus(&mut block, false), E_PENDING);
+        let address = &raw mut block as usize;
+        let completing = std::thread::spawn(move || {
+            XAsyncComplete(address as *mut AsyncBlock, E_ABORT, 0);
+        });
+        // The completing thread now stands in the provider's cleanup.
+        assert!(in_cleanup.recv_timeout(Duration::from_secs(30)).is_ok());
+        assert!(call(&raw mut block).is_none(), "the call has ended");
+        let waited = XAsyncGetStatus(&mut block, true);
+        let polled = XAsyncGetStatus(&mut block, false);
+        let mut size = 1;
+        let sized = XAsyncGetResultSize(&mut block, &mut size);
+        release.send(()).unwrap();
+        completing.join().unwrap();
+        assert_eq!((waited, polled, sized), (E_ABORT, E_ABORT, E_ABORT));
+        assert_eq!(XAsyncGetStatus(&mut block, true), E_ABORT);
     }
 
     #[test]
