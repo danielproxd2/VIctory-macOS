@@ -64,6 +64,8 @@ pub const BLOB_NOT_FOUND: HRESULT = 0x8083_0008_u32 as i32;
 const QUOTA: u64 = 256 << 20;
 /// What one update may write in all, as documented.
 const MAX_UPDATE: usize = 16 << 20;
+/// Plain COM failure, for a result that is not what we built.
+const E_FAIL: HRESULT = 0x8000_4005_u32 as i32;
 const MANIFEST: &str = "manifest";
 /// Readable part of a container's folder name, at most.
 const READABLE: usize = 100;
@@ -521,8 +523,11 @@ fn read(c: &Container, names: Option<Vec<String>>) -> Result<Vec<(String, Vec<u8
                 .iter()
                 .position(|b| *b == name)
                 .ok_or(BLOB_NOT_FOUND)?;
-            let data = std::fs::read(version.blob(i)).map_err(|e| io_error(&c.dir, &e))?;
-            Ok((name, data))
+            let file = version.blob(i);
+            let io = |e| io_error(&c.dir, &e);
+            // Before it is read: a file no blob can be is not loaded.
+            blob_size(std::fs::metadata(&file).map_err(io)?.len())?;
+            Ok((name, std::fs::read(file).map_err(io)?))
         })
         .collect()
 }
@@ -530,32 +535,84 @@ fn read(c: &Container, names: Option<Vec<String>>) -> Result<Vec<(String, Vec<u8
 /// One blob as the public API lays it out: name, size, data.
 const BLOB: usize = 24;
 
+/// A blob's size as the public API states it, in 32 bits. Nothing we
+/// write is larger (an update holds 16 MB at most), so a file that is was
+/// not written by us: the container is unusable rather than the size cut
+/// short.
+fn blob_size(bytes: u64) -> Result<u32, HRESULT> {
+    u32::try_from(bytes).map_err(|_| NO_ACCESS)
+}
+
 /// Blobs laid out as the title reads them: the blob array, then each name
 /// (NUL-terminated) and its data, with pointers `base` plus offset.
-fn layout(blobs: &[(String, Vec<u8>)], base: usize) -> Vec<u8> {
+fn layout(blobs: &[(String, Vec<u8>)], base: usize) -> Result<Vec<u8>, HRESULT> {
     let mut out = vec![0u8; blobs.len() * BLOB];
     for (i, (name, data)) in blobs.iter().enumerate() {
-        let name_at = base + out.len();
+        let size = blob_size(data.len() as u64)?;
+        let name_at = base.wrapping_add(out.len());
         out.extend_from_slice(name.as_bytes());
         out.push(0);
-        let data_at = base + out.len();
+        let data_at = base.wrapping_add(out.len());
         out.extend_from_slice(data);
         let entry = &mut out[i * BLOB..(i + 1) * BLOB];
         entry[..8].copy_from_slice(&name_at.to_le_bytes());
-        entry[8..12].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        entry[8..12].copy_from_slice(&size.to_le_bytes());
         entry[16..].copy_from_slice(&data_at.to_le_bytes());
     }
-    out
+    Ok(out)
 }
 
-/// The names a title passes (`count` strings, or all blobs if null).
-fn names(names: *const *const c_char, count: u32) -> Option<Vec<String>> {
-    if names.is_null() {
+/// Makes the pointers of a [`layout`] with base 0 point into the buffer at
+/// `base` that holds it, and counts its blobs. `None`, with nothing
+/// changed, unless `bytes` is such a layout: the blob array (the first
+/// name follows it, so its offset gives the count), then every name and
+/// every blob's data inside `bytes`.
+fn rebase(bytes: &mut [u8], base: usize) -> Option<u32> {
+    let word = |bytes: &[u8], at: usize| {
+        let word = bytes.get(at..at.checked_add(8)?)?;
+        usize::try_from(u64::from_le_bytes(word.try_into().ok()?)).ok()
+    };
+    if bytes.is_empty() {
+        return Some(0);
+    }
+    let array = word(bytes, 0)?;
+    if array == 0 || array % BLOB != 0 || array > bytes.len() {
         return None;
     }
-    // SAFETY: the title passes `count` strings.
-    let names = unsafe { std::slice::from_raw_parts(names, count as usize) };
-    Some(names.iter().map(|&n| text(n).unwrap_or_default()).collect())
+    let blobs = array / BLOB;
+    for i in 0..blobs {
+        let (name, data) = (word(bytes, i * BLOB)?, word(bytes, i * BLOB + 16)?);
+        let size = bytes[i * BLOB + 8..i * BLOB + 12].try_into().ok()?;
+        let size = u32::from_le_bytes(size) as usize;
+        // The name and its NUL come before the data, the data ends inside.
+        if name < array || name >= data || data.checked_add(size)? > bytes.len() {
+            return None;
+        }
+    }
+    for i in 0..blobs {
+        for field in [i * BLOB, i * BLOB + 16] {
+            let moved = word(bytes, field)?.wrapping_add(base);
+            bytes[field..field + 8].copy_from_slice(&(moved as u64).to_le_bytes());
+        }
+    }
+    u32::try_from(blobs).ok()
+}
+
+/// The names a title passes: all blobs for a null array, else `count`
+/// strings, none of them null.
+fn names(names: *const *const c_char, count: u32) -> Result<Option<Vec<String>>, HRESULT> {
+    if names.is_null() {
+        return Ok(None);
+    }
+    let name = |i| {
+        // SAFETY: the title passes `count` strings; only as many pointers
+        // are read as it takes to find one that is no string.
+        text(unsafe { names.add(i).read_unaligned() }).ok_or(E_INVALIDARG)
+    };
+    (0..count as usize)
+        .map(name)
+        .collect::<Result<_, _>>()
+        .map(Some)
 }
 
 type This = *const Object;
@@ -599,7 +656,7 @@ fn report(
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map_or(0, |d| d.as_secs() as i64);
                 let size = v.sizes().iter().map(|(_, s)| s).sum();
-                let count = v.blobs.len() as u32;
+                let count = u32::try_from(v.blobs.len()).unwrap_or(u32::MAX);
                 (cstring(&v.name), cstring(&v.display), count, size, modified)
             })
             .collect()
@@ -754,11 +811,18 @@ extern "system" fn enumerate_blobs(
         let version = current_named(&c.dir, &c.name).ok().flatten();
         version.map(|v| v.sizes()).unwrap_or_default()
     };
+    // Sizes first: a container with a file no blob can be reports none.
+    let mut infos = Vec::new();
     for (name, size) in blobs.into_iter().filter(|(n, _)| n.starts_with(&prefix)) {
-        let name = cstring(&name);
+        match blob_size(size) {
+            Ok(size) => infos.push((cstring(&name), size)),
+            Err(hr) => return hr,
+        }
+    }
+    for (name, size) in &infos {
         let info = BlobInfo {
             name: name.as_ptr(),
-            size: size as u32,
+            size: *size,
         };
         if !callback(&info, context) {
             break;
@@ -775,22 +839,26 @@ extern "system" fn read_blobs(
     size: usize,
     out: *mut u8,
 ) -> HRESULT {
-    let Some(c) = get(container) else {
+    // SAFETY: the title passes its count, which is also where the number
+    // read goes.
+    let (Some(c), Some(&wanted)) = (get(container), unsafe { count.as_ref() }) else {
         return E_INVALIDARG;
     };
-    // SAFETY: the title passes its count.
-    let wanted = unsafe { count.as_ref() }.copied().unwrap_or(0);
-    let blobs = match read(c, names(blob_names, wanted)) {
-        Ok(blobs) => blobs,
+    let read = names(blob_names, wanted).and_then(|names| read(c, names));
+    let laid_out = read.and_then(|blobs| {
+        let read = u32::try_from(blobs.len()).map_err(|_| E_FAIL)?;
+        Ok((layout(&blobs, out as usize)?, read))
+    });
+    let (bytes, read) = match laid_out {
+        Ok(done) => done,
         Err(hr) => return hr,
     };
-    let bytes = layout(&blobs, out as usize);
     if out.is_null() || size < bytes.len() {
         return BUFFER_TOO_SMALL;
     }
     // SAFETY: the buffer holds `size` bytes, checked above.
     unsafe { out.copy_from_nonoverlapping(bytes.as_ptr(), bytes.len()) };
-    put(count, blobs.len() as u32)
+    put(count, read)
 }
 
 /// Read at once; the result holds the layout with pointers relative to the
@@ -803,7 +871,9 @@ extern "system" fn read_async(
     block: *mut AsyncBlock,
 ) -> HRESULT {
     let result = match get(container) {
-        Some(c) => read(c, names(blob_names, count)).map(|blobs| layout(&blobs, 0)),
+        Some(c) => names(blob_names, count)
+            .and_then(|names| read(c, names))
+            .and_then(|blobs| layout(&blobs, 0)),
         None => Err(E_INVALIDARG),
     };
     xasync::finished_with(block, (&raw const READ).cast(), result)
@@ -815,6 +885,11 @@ extern "system" fn read_result(
     out: *mut u8,
     count: *mut u32,
 ) -> HRESULT {
+    // Checked first: taking the result ends the call, and without a place
+    // for the count the title could not use what it took.
+    if count.is_null() {
+        return E_INVALIDARG;
+    }
     let mut used = 0;
     let hr = xasync::XAsyncGetResult(block, (&raw const READ).cast(), size, out.cast(), &mut used);
     // The documented error for a small buffer; the result stays for a
@@ -825,23 +900,16 @@ extern "system" fn read_result(
     if hr < 0 {
         return hr;
     }
-    // The first name follows the blob array, so its offset gives the count.
-    let blobs = if used == 0 {
-        0
-    } else {
-        // SAFETY: the result holds at least one blob entry.
-        unsafe { out.cast::<usize>().read_unaligned() / BLOB }
-    };
-    for i in 0..blobs {
-        for field in [0, 16] {
-            // SAFETY: within the blob array just written.
-            unsafe {
-                let p = out.add(i * BLOB + field).cast::<usize>();
-                p.write_unaligned(p.read_unaligned() + out as usize);
-            }
-        }
+    if used == 0 {
+        return put(count, 0);
     }
-    put(count, blobs as u32)
+    // SAFETY: the call just wrote `used` bytes to `out`, having checked
+    // that the title's buffer holds as many.
+    let bytes = unsafe { std::slice::from_raw_parts_mut(out, used) };
+    match rebase(bytes, out as usize) {
+        Some(blobs) => put(count, blobs),
+        None => E_FAIL,
+    }
 }
 
 extern "system" fn create_update(
@@ -1411,5 +1479,259 @@ mod tests {
         assert!(found.is_empty());
         close_container(this, container);
         close_provider(this, provider);
+    }
+
+    /// The public API states a blob's size in 32 bits; a size that does
+    /// not fit is an error, not its low 32 bits.
+    #[test]
+    fn a_size_past_32_bits_is_not_cut_short() {
+        assert_eq!(blob_size(0), Ok(0));
+        assert_eq!(blob_size(u64::from(u32::MAX)), Ok(u32::MAX));
+        assert_eq!(blob_size(u64::from(u32::MAX) + 1), Err(NO_ACCESS));
+        assert_eq!(blob_size(u64::MAX), Err(NO_ACCESS));
+    }
+
+    /// Blob `i` of a result in `buffer`: its name and data, through the
+    /// pointers the call left there.
+    fn blob_at(buffer: &[u64], i: usize) -> (String, Vec<u8>) {
+        let range = buffer.as_ptr_range();
+        let inside =
+            |p: usize, len: usize| p >= range.start as usize && p + len <= range.end as usize;
+        // SAFETY: the layout the call wrote; every pointer is checked to
+        // lie in the buffer before it is followed.
+        unsafe {
+            let entry = buffer.as_ptr().cast::<u8>().add(i * BLOB);
+            let name = entry.cast::<*const c_char>().read_unaligned();
+            let len = entry.add(8).cast::<u32>().read_unaligned() as usize;
+            let data = entry.add(16).cast::<*const u8>().read_unaligned();
+            assert!(inside(name as usize, 1) && inside(data as usize, len));
+            (
+                text(name).unwrap(),
+                std::slice::from_raw_parts(data, len).to_vec(),
+            )
+        }
+    }
+
+    #[test]
+    fn read_result_with_a_small_buffer_keeps_the_result() {
+        let this: This = &OBJECT;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(
+            update(root, "one", &[("a", Some("alpha")), ("b", Some(""))]),
+            S_OK
+        );
+        let slot = Provider { root: root.into() }.container("Slot");
+
+        let mut b = block();
+        assert_eq!(read_async(this, &slot, std::ptr::null(), 0, &mut b), S_OK);
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
+        let mut size = 0;
+        assert_eq!(xasync::XAsyncGetResultSize(&mut b, &mut size), S_OK);
+        assert_eq!(size, 2 * BLOB + "a\0alpha".len() + "b\0".len());
+
+        let mut buffer = vec![0u64; size.div_ceil(8)];
+        let out = buffer.as_mut_ptr().cast::<u8>();
+        let mut count = 99;
+        // Too small, in every way a title can get it wrong, any number of
+        // times: the documented error, and nothing is written or lost.
+        for _ in 0..2 {
+            for small in [0, 1, BLOB, size - 1] {
+                assert_eq!(
+                    read_result(this, &mut b, small, out, &mut count),
+                    BUFFER_TOO_SMALL
+                );
+            }
+            let null = std::ptr::null_mut();
+            assert_eq!(
+                read_result(this, &mut b, size, null, &mut count),
+                BUFFER_TOO_SMALL
+            );
+            // Nowhere to put the count: refused before the result is taken.
+            assert_eq!(
+                read_result(this, &mut b, size, out, null.cast()),
+                E_INVALIDARG
+            );
+        }
+        assert_eq!(count, 99);
+        assert!(
+            buffer.iter().all(|w| *w == 0),
+            "a refused read wrote something"
+        );
+
+        assert_eq!(read_result(this, &mut b, size, out, &mut count), S_OK);
+        assert_eq!(count, 2);
+        assert_eq!(blob_at(&buffer, 0), ("a".into(), b"alpha".to_vec()));
+        assert_eq!(blob_at(&buffer, 1), ("b".into(), Vec::new()));
+
+        // Taken once: the call is over.
+        let mut again = 99;
+        assert_eq!(
+            read_result(this, &mut b, size, out, &mut again),
+            xasync::E_ILLEGAL_METHOD_CALL
+        );
+        assert_eq!(again, 99);
+
+        // A container without blobs reads as none, with no buffer at all.
+        let mut u = Update {
+            name: "Empty".into(),
+            dir: container_dir(root, "Empty"),
+            display: None,
+            changes: Vec::new(),
+        };
+        assert_eq!(u.submit(), S_OK);
+        u.changes.clear();
+        let empty = Provider { root: root.into() }.container("Empty");
+        let mut b = block();
+        assert_eq!(read_async(this, &empty, std::ptr::null(), 0, &mut b), S_OK);
+        assert_eq!(
+            read_result(this, &mut b, 0, std::ptr::null_mut(), &mut count),
+            S_OK
+        );
+        assert_eq!(count, 0);
+    }
+
+    /// The fix-up of a read result only touches bytes that are the layout
+    /// we build, whatever the buffer holds.
+    #[test]
+    fn a_result_that_is_no_blob_layout_is_refused() {
+        let blobs = [
+            ("a".to_owned(), b"alpha".to_vec()),
+            ("name".to_owned(), Vec::new()),
+            ("z".to_owned(), vec![0xff; 40]),
+        ];
+        let good = layout(&blobs, 0).unwrap();
+        let base = 0x1_0000_0000;
+        let mut moved = good.clone();
+        assert_eq!(rebase(&mut moved, base), Some(3));
+        assert_eq!(moved, layout(&blobs, base).unwrap());
+        assert_eq!(rebase(&mut [], base), Some(0));
+        assert_eq!(layout(&[], base).unwrap(), Vec::<u8>::new());
+
+        let refused = |bytes: &[u8]| {
+            let mut copy = bytes.to_vec();
+            let count = rebase(&mut copy, base);
+            assert!(count.is_some() || copy == bytes, "refused, yet changed");
+            count.is_none()
+        };
+        // Cut short anywhere.
+        for cut in 1..good.len() {
+            assert!(refused(&good[..cut]), "cut at {cut}");
+        }
+        // Any one of its words (blob array offsets, sizes) set wrong.
+        let with = |at: usize, value: u64| {
+            let mut bytes = good.clone();
+            bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
+            bytes
+        };
+        let len = good.len() as u64;
+        for entry in 0..blobs.len() {
+            for field in [0, 16] {
+                for value in [0, 1, len, len + 1, u64::MAX, u64::MAX - 7] {
+                    let bytes = with(entry * BLOB + field, value);
+                    // No bytes at the very end are an empty blob's data.
+                    let empty_at_end = field == 16 && value == len && blobs[entry].1.is_empty();
+                    assert_eq!(
+                        refused(&bytes),
+                        !empty_at_end,
+                        "blob {entry} field {field} = {value:#x}"
+                    );
+                }
+            }
+            let mut bytes = good.clone();
+            bytes[entry * BLOB + 8..entry * BLOB + 12].copy_from_slice(&u32::MAX.to_le_bytes());
+            assert!(refused(&bytes), "blob {entry} size");
+        }
+        // And bytes that were never a layout: seeded noise, same every run.
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        for _ in 0..2000 {
+            let mut noise = vec![0u8; (state % 200) as usize];
+            for byte in &mut noise {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                // Small values, so that offsets often land inside.
+                *byte = if state & 3 == 0 {
+                    (state >> 8) as u8
+                } else {
+                    0
+                };
+            }
+            let mut copy = noise.clone();
+            match rebase(&mut copy, base) {
+                None => assert_eq!(copy, noise),
+                Some(count) => assert!(count as usize * BLOB <= noise.len()),
+            }
+        }
+    }
+
+    /// A null string among the blob names, or no place for the count, is
+    /// an invalid argument, not a blob that was not found or a read whose
+    /// count is lost.
+    #[test]
+    fn blob_names_and_counts_are_checked() {
+        let this: This = &OBJECT;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(
+            update(root, "one", &[("a", Some("alpha")), ("b", Some("beta"))]),
+            S_OK
+        );
+        let slot = Provider { root: root.into() }.container("Slot");
+
+        let wanted = [c"b".as_ptr(), std::ptr::null(), c"a".as_ptr()];
+        assert_eq!(names(wanted.as_ptr(), 1), Ok(Some(vec!["b".into()])));
+        assert_eq!(names(wanted.as_ptr(), 0), Ok(Some(Vec::new())));
+        assert_eq!(names(wanted.as_ptr(), 2), Err(E_INVALIDARG));
+        assert_eq!(names(wanted.as_ptr(), 3), Err(E_INVALIDARG));
+        assert_eq!(names(std::ptr::null(), 3), Ok(None));
+
+        let mut buffer = vec![0u64; 32];
+        let (out, size) = (buffer.as_mut_ptr().cast::<u8>(), 32 * 8);
+        let mut count = 3;
+        assert_eq!(
+            read_blobs(this, &slot, wanted.as_ptr(), &mut count, size, out),
+            E_INVALIDARG
+        );
+        let none = std::ptr::null_mut();
+        assert_eq!(
+            read_blobs(this, &slot, wanted.as_ptr(), none, size, out),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            read_blobs(this, &slot, std::ptr::null(), none, size, out),
+            E_INVALIDARG
+        );
+        assert_eq!(count, 3);
+        assert!(
+            buffer.iter().all(|w| *w == 0),
+            "a refused read wrote something"
+        );
+
+        let mut b = block();
+        assert_eq!(read_async(this, &slot, wanted.as_ptr(), 3, &mut b), S_OK);
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), E_INVALIDARG);
+        assert_eq!(
+            read_result(this, &mut b, size, out, &mut count),
+            E_INVALIDARG
+        );
+
+        // The names it does give are read in its order.
+        count = 1;
+        assert_eq!(
+            read_blobs(this, &slot, wanted.as_ptr(), &mut count, size, out),
+            S_OK
+        );
+        assert_eq!(count, 1);
+        assert_eq!(blob_at(&buffer, 0), ("b".into(), b"beta".to_vec()));
+        // And all of them for no names, whatever the count said.
+        count = 7;
+        assert_eq!(
+            read_blobs(this, &slot, std::ptr::null(), &mut count, size, out),
+            S_OK
+        );
+        assert_eq!(count, 2);
+        assert_eq!(blob_at(&buffer, 0), ("a".into(), b"alpha".to_vec()));
+        assert_eq!(blob_at(&buffer, 1), ("b".into(), b"beta".to_vec()));
     }
 }
