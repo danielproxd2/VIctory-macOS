@@ -1033,6 +1033,87 @@ mod tests {
         assert_eq!(signed(2), 4);
     }
 
+    /// Reads `width` bits from bit `at` of the little-endian stream.
+    fn bits(bytes: &[u8], at: &mut usize, width: u32) -> u64 {
+        let mut v = 0u64;
+        for k in 0..width as usize {
+            let bit = bytes[(*at + k) / 8] >> ((*at + k) % 8) & 1;
+            v |= u64::from(bit) << k;
+        }
+        *at += width as usize;
+        v
+    }
+
+    fn read_vbr(bytes: &[u8], at: &mut usize, width: u32) -> u64 {
+        let (hi, mut v, mut shift) = (1u64 << (width - 1), 0u64, 0);
+        loop {
+            let chunk = bits(bytes, at, width);
+            v |= (chunk & (hi - 1)) << shift;
+            if chunk & hi == 0 {
+                return v;
+            }
+            shift += width - 1;
+        }
+    }
+
+    /// Values at and around every chunk boundary, in several widths, and
+    /// the largest 64-bit values, survive a write and a read, whatever the
+    /// bit offset they start at.
+    #[test]
+    fn vbr_round_trips_at_chunk_boundaries() {
+        let mut values = vec![0u64, 1, u64::MAX, u64::MAX - 1, 1 << 63];
+        for n in 1..64 {
+            values.extend([(1u64 << n) - 1, 1 << n, (1 << n) + 1]);
+        }
+        for width in [3, 4, 6, 8] {
+            for pad in 0..5 {
+                let mut w = Writer::default();
+                w.emit(0, pad);
+                for &v in &values {
+                    w.vbr(v, width);
+                }
+                let bytes = w.finish();
+                let mut at = pad as usize;
+                for &v in &values {
+                    assert_eq!(read_vbr(&bytes, &mut at, width), v, "width {width}");
+                }
+            }
+        }
+    }
+
+    /// A block's length word counts the words after it, nested blocks
+    /// included, and unabbreviated records read back.
+    #[test]
+    fn nested_blocks_and_records_read_back() {
+        let mut w = Writer::default();
+        w.enter(8, 3);
+        w.record(7, &[0, 1, u64::MAX, 1 << 40]);
+        w.enter(11, 4);
+        w.record(2, &[]);
+        w.exit();
+        w.record(9, &[33]);
+        w.exit();
+        let bytes = w.finish();
+        let words: Vec<u32> = bytes
+            .chunks(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        // Outer header: ENTER_SUBBLOCK (1, 2 bits), id 8 (vbr8), width 3
+        // (vbr4), then its length word, which covers everything after it.
+        let mut at = 0;
+        assert_eq!(bits(&bytes, &mut at, 2), 1);
+        assert_eq!(read_vbr(&bytes, &mut at, 8), 8);
+        assert_eq!(read_vbr(&bytes, &mut at, 4), 3);
+        let at_len = at.div_ceil(32);
+        assert_eq!(words[at_len] as usize, words.len() - at_len - 1);
+        let mut at = (at_len + 1) * 32;
+        assert_eq!(bits(&bytes, &mut at, 3), 3);
+        assert_eq!(read_vbr(&bytes, &mut at, 6), 7);
+        assert_eq!(read_vbr(&bytes, &mut at, 6), 4);
+        let ops: Vec<u64> = (0..4).map(|_| read_vbr(&bytes, &mut at, 6)).collect();
+        assert_eq!(ops, [0, 1, u64::MAX, 1 << 40]);
+    }
+
     /// A structured shader's shape: `stages` if/else diamonds in a row, each
     /// merge with one phi per register (as the lowering makes them), then a
     /// loop, and a tail that reads only the first `read` registers.

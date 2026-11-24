@@ -386,4 +386,62 @@ mod tests {
             .collect();
         assert_eq!(hex, "900150983cd24fb0d6963f7d28e17f72");
     }
+
+    /// The hash's last block depends on whether the tail leaves room for
+    /// the bit count (under 56 bytes): rebuild the padded message here, by
+    /// block, for lengths on both sides of the switch.
+    #[test]
+    fn hash_pads_the_tail_as_the_container_format_does() {
+        for len in [0usize, 1, 54, 55, 56, 57, 63, 64, 65, 119, 120, 128] {
+            let data: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
+            // Message: data, 0x80, zeros, then the final word; the bit
+            // count takes the first word of the last data block when the
+            // tail fits under 56 bytes, else of a block of its own.
+            let left = len % 64;
+            let mut msg = data[..len - left].to_vec();
+            let mut last = Vec::new();
+            if left < 56 {
+                last.extend(((len * 8) as u32).to_le_bytes());
+                last.extend(&data[len - left..]);
+                last.push(0x80);
+                last.resize(60, 0);
+            } else {
+                last.extend(&data[len - left..]);
+                last.push(0x80);
+                last.resize(64 + 4, 0);
+                last.resize(64 + 60, 0);
+                last[64..68].copy_from_slice(&((len * 8) as u32).to_le_bytes());
+            }
+            last.extend(((len * 2 + 1) as u32).to_le_bytes());
+            msg.extend(last);
+            assert_eq!(msg.len() % 64, 0, "len {len}");
+            let mut state = [0x6745_2301u32, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
+            for b in msg.chunks(64) {
+                md5_block(&mut state, b.try_into().unwrap());
+            }
+            let want: Vec<u8> = state.iter().flat_map(|s| s.to_le_bytes()).collect();
+            assert_eq!(hash(&data).to_vec(), want, "len {len}");
+        }
+    }
+
+    /// Part offsets and sizes, the total, and a hash that covers all bytes
+    /// after the hash field.
+    #[test]
+    fn build_lays_out_parts_and_hashes_them() {
+        let a = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let b = [9u8; 12];
+        let out = build(&[(b"AAAA", &a), (b"BBBB", &b)]);
+        let u32_at = |at: usize| u32::from_le_bytes(out[at..at + 4].try_into().unwrap());
+        assert_eq!(&out[..4], b"DXBC");
+        assert_eq!(u32_at(24), out.len() as u32);
+        assert_eq!(u32_at(28), 2);
+        let table = 0x20 + 8;
+        assert_eq!(u32_at(0x20), table as u32);
+        assert_eq!(u32_at(0x24), (table + 8 + a.len()) as u32);
+        assert_eq!(&out[table..table + 4], b"AAAA");
+        assert_eq!(u32_at(table + 4), a.len() as u32);
+        assert_eq!(&out[table + 8..table + 16], &a);
+        assert_eq!(out.len(), table + 8 + a.len() + 8 + b.len());
+        assert_eq!(out[4..20], hash(&out[20..]));
+    }
 }
