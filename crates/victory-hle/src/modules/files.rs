@@ -153,7 +153,13 @@ pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
     let drives = drives();
     let (_, root) = drives.iter().find(|(l, _)| *l == letter)?;
     let tail = &rest[2..];
-    if prefix.is_empty() && root.len() + tail.len() >= LONG {
+    // The host resolves `..` itself in the short form, past the folder
+    // behind the drive; the drive's root has no parent, so resolve it here.
+    let dot = u16::from(b'.');
+    let climbs = tail
+        .split(|c| SEPARATORS.contains(c))
+        .any(|part| part == [dot; 2]);
+    if prefix.is_empty() && (climbs || root.len() + tail.len() >= LONG) {
         let mut out = verbatim(root, tail);
         out.push(0);
         return Some(out);
@@ -804,6 +810,23 @@ mod tests {
         assert_eq!(
             verbatim(&w(r"\\server\share\")[..15], &w("/x/../../y")[..10]),
             w(r"\\?\UNC\server\share\y")[..22].to_vec()
+        );
+    }
+
+    #[test]
+    fn dot_dot_stops_at_the_drive_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().into_owned();
+        let letter = mount(dir.path()).unwrap();
+        let tr = |s: String| translate(&w(&s)[..s.encode_utf16().count()]).map(|v| text(&v));
+        let inside = Some(format!(r"\\?\{root}\Windows\x"));
+        assert_eq!(tr(format!(r"{letter}:\..\..\Windows\x")), inside);
+        assert_eq!(tr(format!(r"{letter}:/a/../../Windows/x")), inside);
+        assert_eq!(tr(format!(r"{letter}:..\Windows\x")), inside);
+        // Within the folder, `..` is still resolved.
+        assert_eq!(
+            tr(format!(r"{letter}:\a\..\b")),
+            Some(format!(r"\\?\{root}\b"))
         );
     }
 
