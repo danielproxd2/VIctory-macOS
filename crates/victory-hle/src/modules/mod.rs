@@ -47,6 +47,11 @@ pub mod xuser;
 // modules declare them themselves, at the same paths.
 #[cfg(not(windows))]
 #[allow(dead_code)]
+mod files {
+    pub(crate) mod paths;
+}
+#[cfg(not(windows))]
+#[allow(dead_code)]
 mod net {
     pub(crate) mod addr;
 }

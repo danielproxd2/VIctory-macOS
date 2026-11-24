@@ -13,6 +13,8 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 #![allow(clippy::too_many_arguments)]
 
+pub(crate) mod paths;
+
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
@@ -21,6 +23,7 @@ use std::sync::{Mutex, MutexGuard};
 use windows_sys::Win32::Globalization::{CP_ACP, MultiByteToWideChar};
 use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
 
+use self::paths::SEPARATORS;
 use crate::{HleExport, HleModule, hle_export};
 
 /// The host's own function: what the import would have been bound to.
@@ -93,93 +96,10 @@ fn root_wide(root: &Path) -> Vec<u16> {
     wide
 }
 
-const SEPARATORS: [u16; 2] = [b'\\' as u16, b'/' as u16];
-const VERBATIM: [u16; 4] = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
-
-/// Host paths from this length on take the `\\?\` form, which lifts the
-/// host's MAX_PATH limit (248 characters for a directory, 260 for a file).
-const LONG: usize = 248;
-
-/// `root` and the title's `tail` as a `\\?\` path. That form turns off the
-/// host's own clean-up, so `/` becomes `\` and `.` and `..` are resolved
-/// here (`..` stops at the root).
-fn verbatim(root: &[u16], tail: &[u16]) -> Vec<u16> {
-    let backslash = u16::from(b'\\');
-    let mut out = if root.starts_with(&VERBATIM) {
-        root.to_vec()
-    } else if let Some(unc) = root.strip_prefix(&[backslash; 2][..]) {
-        let mut out = VERBATIM.to_vec();
-        out.extend("UNC\\".encode_utf16());
-        out.extend_from_slice(unc);
-        out
-    } else {
-        [&VERBATIM[..], root].concat()
-    };
-    while out.last() == Some(&backslash) {
-        out.pop();
-    }
-    let dot = u16::from(b'.');
-    let mut parts: Vec<&[u16]> = Vec::new();
-    for part in tail.split(|c| SEPARATORS.contains(c)) {
-        match part {
-            [] => {}
-            [d] if *d == dot => {}
-            [d, e] if [*d, *e] == [dot; 2] => drop(parts.pop()),
-            _ => parts.push(part),
-        }
-    }
-    for part in parts {
-        out.push(backslash);
-        out.extend_from_slice(part);
-    }
-    out
-}
-
 /// The host path, NUL-terminated, for `path` (without its NUL) if it is on
 /// a virtual drive.
 pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
-    let (prefix, rest) = match path.strip_prefix(&VERBATIM[..]) {
-        Some(rest) => (&VERBATIM[..], rest),
-        None => (&[][..], path),
-    };
-    let &[letter, colon, ..] = rest else {
-        return None;
-    };
-    if colon != u16::from(b':') {
-        return None;
-    }
-    let letter = u8::try_from(letter).ok().filter(u8::is_ascii_alphabetic)?;
-    let letter = u16::from(letter.to_ascii_uppercase());
-    let drives = drives();
-    let (_, root) = drives.iter().find(|(l, _)| *l == letter)?;
-    let tail = &rest[2..];
-    // The host resolves `..` itself in the short form, past the folder
-    // behind the drive; the drive's root has no parent, so resolve it here.
-    let dot = u16::from(b'.');
-    let climbs = tail
-        .split(|c| SEPARATORS.contains(c))
-        .any(|part| part == [dot; 2]);
-    if prefix.is_empty() && (climbs || root.len() + tail.len() >= LONG) {
-        let mut out = verbatim(root, tail);
-        out.push(0);
-        return Some(out);
-    }
-    let mut out = prefix.to_vec();
-    out.extend_from_slice(root);
-    // `X:` and `X:name` are relative to the root.
-    if !tail.first().is_some_and(|c| SEPARATORS.contains(c)) {
-        out.push(b'\\'.into());
-    }
-    let verbatim = !prefix.is_empty();
-    out.extend(tail.iter().map(|&c| {
-        if verbatim && c == u16::from(b'/') {
-            b'\\'.into()
-        } else {
-            c
-        }
-    }));
-    out.push(0);
-    Some(out)
+    paths::translate(&drives(), path)
 }
 
 /// A title's wide path: the host path when it is on a virtual drive, else
@@ -738,6 +658,7 @@ pub(crate) fn module() -> HleModule {
 
 #[cfg(test)]
 mod tests {
+    use super::paths::verbatim;
     use super::*;
 
     fn w(s: &str) -> Vec<u16> {
