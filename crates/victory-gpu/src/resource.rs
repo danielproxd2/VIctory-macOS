@@ -377,12 +377,22 @@ fn subresource(desc: &ResourceDesc, index: u32) -> Option<(PlacedFootprint, u32,
         return None;
     }
     let (element, block) = element(desc.format)?;
-    let width = (desc.width >> mip).max(1).next_multiple_of(block);
-    let height = (u64::from(desc.height) >> mip)
+    let width = desc
+        .width
+        .checked_shr(mip)
+        .unwrap_or(0)
+        .max(1)
+        .next_multiple_of(block);
+    let height = u64::from(desc.height)
+        .checked_shr(mip)
+        .unwrap_or(0)
         .max(1)
         .next_multiple_of(block);
     let depth = if desc.dimension == TEXTURE_3D {
-        (u32::from(desc.depth_or_array_size) >> mip).max(1)
+        u32::from(desc.depth_or_array_size)
+            .checked_shr(mip)
+            .unwrap_or(0)
+            .max(1)
     } else {
         1
     };
@@ -1623,6 +1633,15 @@ mod tests {
         };
         allocation_info(&mut info, std::ptr::null(), 0, 2, [half, half].as_ptr());
         assert_eq!(info.size, u64::MAX);
+    }
+
+    #[test]
+    fn absurd_mip_counts_do_not_overflow_shifts() {
+        let mut desc = texture(16, 16, 28, 100);
+        desc.depth_or_array_size = 4;
+        assert!(subresource(&desc, 70).is_some());
+        desc.dimension = TEXTURE_3D;
+        assert!(subresource(&desc, 70).is_some());
     }
 
     /// A 4x4 texture filled from a title buffer through our list and queue,
