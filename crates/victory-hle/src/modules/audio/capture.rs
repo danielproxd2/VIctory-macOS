@@ -93,7 +93,9 @@ pub fn child() -> bool {
 }
 
 fn header(frames: u64) -> [u8; 44] {
-    let data = u32::try_from(frames * FRAME_BYTES as u64).unwrap_or(u32::MAX - 36);
+    // At most what `36 + data` still holds in the RIFF size field.
+    let data =
+        u32::try_from(frames * FRAME_BYTES as u64).map_or(u32::MAX - 36, |d| d.min(u32::MAX - 36));
     let mut h = [0u8; 44];
     let fields: [(&[u8], usize); 11] = [
         (b"RIFF", 0),
