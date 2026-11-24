@@ -49,6 +49,27 @@ On an M4 with D3DMetal 4.0 beta 3 this gives 260 passed, 4 failed and 4 ignored.
 
 After these fixes the whole suite passes under CrossOver Wine with D3DMetal on an M4: 343 passed, 0 failed and 4 ignored.
 
+## What a test run did not check
+
+A shader test that lacks something it needs passes after printing one line that starts with `skipped:` and names the test. The line is written past the test harness's capture, so `tools/macos/test-wine.sh ... 2>&1 | grep 'skipped: '` lists everything a run left out. A switch per need turns the skip into a failure.
+
+- `VICTORY_REQUIRE_GPU=1`: the host's D3D12 device with shader model 6.6.
+- `VICTORY_REQUIRE_WARP=1`: the WARP software device beside it. D3DMetal under Wine has no WARP, so on a Mac the device tests run on the hardware adapter only, and each prints `skipped: no SM 6.6 WARP device`.
+- `VICTORY_REQUIRE_DXIL=1`: the DXIL validator, described below.
+- `VICTORY_REQUIRE_DIFF=1`: the console compiler (`VICTORY_CONSOLE_DXC`) and a PC `dxc.exe` (`VICTORY_PC_DXC`) for the differential shader tests.
+
+## The DXIL validator
+
+The shader tests can have Microsoft's DXIL validator (`dxil.dll`) check every container the translator emits, and compare the container hash VIctory computes with the one the validator signs. The DLL is not part of this repository and must never be committed. It ships with the Windows SDK and with the releases of Microsoft's open-source DirectXShaderCompiler. Keep it outside the repository, for example in `~/Library/Caches/victory-macos/dxc/`, and name it by its macOS path.
+
+```sh
+VICTORY_DXIL_UNIX="$HOME/Library/Caches/victory-macos/dxc/dxil.dll" VICTORY_REQUIRE_DXIL=1 tools/macos/test-wine.sh -p victory-shader --no-fail-fast
+```
+
+`test-wine.sh` passes the file to the tests as `VICTORY_DXIL`, the `Z:` path Wine knows it by. On Windows, set `VICTORY_DXIL` yourself, or leave it unset to use the newest Windows SDK's copy. Without a validator each validating test prints `skipped: DXIL validation: ...`; the native macOS build cannot load the DLL at all and always prints that line, so `VICTORY_REQUIRE_DXIL=1` fails there.
+
+Whether Wine can load `dxil.dll` and run its validator has not been tried yet. Until a run with `VICTORY_REQUIRE_DXIL=1` has passed under Wine, the validator has checked nothing on a Mac.
+
 ## Route A: next steps
 
 The first playable route is the upstream Windows build running under Wine, with D3D12 going to Metal through Apple's D3DMetal. DXMT cannot be used because it covers D3D11 only. Rosetta 2 runs the title's x86-64 code and has supported AVX2 since macOS 15.

@@ -12,6 +12,13 @@
 # The stand-in title and its DLLs (tests/fixtures) are built here, once, in
 # the profile the tests are built in, and VICTORY_FIXTURE_DIR tells the tests
 # where they are: cargo cannot be started inside Wine.
+# VICTORY_DXIL_UNIX names a dxil.dll (Microsoft's DXIL validator, kept
+# outside the repository) by its macOS path; the tests get it as
+# VICTORY_DXIL, the Z: path Wine knows it by. VICTORY_REQUIRE_DXIL=1 makes
+# the shader tests fail where the validator cannot be loaded, instead of
+# printing "skipped: DXIL validation: ...". VICTORY_REQUIRE_WARP=1 and
+# VICTORY_REQUIRE_DIFF=1 do the same for WARP and for the compilers of the
+# differential shader tests.
 # Cargo splits the runner on spaces, so the runner is a wrapper script in a
 # temporary folder without spaces, removed when this script ends.
 set -e
@@ -65,6 +72,18 @@ export WINEDEBUG="${WINEDEBUG:--all}"
 export WINEDLLOVERRIDES="mscoree,mshtml=;winedbg.exe=d$D3DMETAL${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
 # Wine hands its environment to the tests; said here so that it stays so.
 [ -z "${VICTORY_REQUIRE_GPU:-}" ] || export VICTORY_REQUIRE_GPU
+[ -z "${VICTORY_REQUIRE_WARP:-}" ] || export VICTORY_REQUIRE_WARP
+[ -z "${VICTORY_REQUIRE_DXIL:-}" ] || export VICTORY_REQUIRE_DXIL
+[ -z "${VICTORY_REQUIRE_DIFF:-}" ] || export VICTORY_REQUIRE_DIFF
+if [ -n "${VICTORY_DXIL_UNIX:-}" ]; then
+    [ -f "$VICTORY_DXIL_UNIX" ] || { echo "VICTORY_DXIL_UNIX: no file at $VICTORY_DXIL_UNIX" >&2; exit 1; }
+    case "$VICTORY_DXIL_UNIX" in
+        /*) ;;
+        *) echo "VICTORY_DXIL_UNIX must be an absolute path" >&2; exit 1 ;;
+    esac
+    VICTORY_DXIL="Z:$(printf '%s' "$VICTORY_DXIL_UNIX" | tr / '\\')"
+    export VICTORY_DXIL
+fi
 export CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_RUNNER="$LINK"
 cargo build --quiet --locked --manifest-path tests/fixtures/Cargo.toml \
     --target-dir target/fixtures --target "$TARGET" $FIXTURE_PROFILE
