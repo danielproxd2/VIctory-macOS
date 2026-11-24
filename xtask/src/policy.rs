@@ -60,12 +60,23 @@ pub fn run(root: &Path, staged: bool) -> Result<()> {
                 .args(["show", &format!(":{path}")])
                 .current_dir(root)
                 .output()?;
-            // `--diff-filter=ACMR` lists no deletions, so a failure here
-            // is an error, never a reason to skip the file unchecked.
-            anyhow::ensure!(out.status.success(), "git cannot read staged file {path:?}");
+            if !out.status.success() {
+                // A submodule is staged as a link to a commit: no content.
+                if is_gitlink(root, path)? {
+                    continue;
+                }
+                // `--diff-filter=ACMRT` lists no deletions, so any other
+                // failure is an error, never a reason to skip the file.
+                bail!("git cannot read staged file {path:?}");
+            }
             out.stdout
         } else {
-            match std::fs::read(root.join(path)) {
+            let file = root.join(path);
+            // A nested repository or submodule: git lists the folder itself.
+            if file.is_dir() {
+                continue;
+            }
+            match std::fs::read(&file) {
                 Ok(c) => c,
                 // Listed by git but deleted in the working tree.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -88,6 +99,17 @@ pub fn run(root: &Path, staged: bool) -> Result<()> {
          see docs/asset-policy.md",
         violations.len()
     )
+}
+
+/// Whether the index holds `path` as a submodule link (mode 160000).
+fn is_gitlink(root: &Path, path: &str) -> Result<bool> {
+    let out = Command::new("git")
+        .args(["ls-files", "--stage", "-z", "--", path])
+        .env("GIT_LITERAL_PATHSPECS", "1")
+        .current_dir(root)
+        .output()
+        .context("running git")?;
+    Ok(out.status.success() && out.stdout.starts_with(b"160000 "))
 }
 
 fn list_files(root: &Path, staged: bool) -> Result<Vec<String>> {
@@ -118,7 +140,8 @@ fn list_files(root: &Path, staged: bool) -> Result<Vec<String>> {
             "diff",
             "--cached",
             "--name-only",
-            "--diff-filter=ACMR",
+            // T: a type change, such as a symlink replaced by a file.
+            "--diff-filter=ACMRT",
             "-z",
         ])?
         .context("--staged needs a git repository");
@@ -141,10 +164,16 @@ fn list_files(root: &Path, staged: bool) -> Result<Vec<String>> {
         .filter_map(Result::ok)
         .filter(|e| e.file_type().is_file())
         .filter_map(|e| {
-            e.path()
-                .strip_prefix(root)
-                .ok()
-                .map(|p| p.to_string_lossy().replace('\\', "/"))
+            e.path().strip_prefix(root).ok().map(|p| {
+                // Only the host's own separator is rewritten: elsewhere
+                // a backslash is part of the name.
+                let p = p.to_string_lossy();
+                if cfg!(windows) {
+                    p.replace('\\', "/")
+                } else {
+                    p.into_owned()
+                }
+            })
         })
         .collect())
 }
@@ -197,20 +226,43 @@ fn longest_encoded_run(content: &[u8]) -> Option<usize> {
 mod tests {
     use super::check;
 
+    /// Runs git in `dir`, with an identity and without the user's hooks,
+    /// so that commits work anywhere.
+    #[cfg(unix)]
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let st = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.invalid",
+            ])
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .unwrap();
+        assert!(st.success(), "git {args:?}");
+    }
+
+    /// An empty folder of this test's own, outside the repository.
+    #[cfg(unix)]
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("victory-xtask-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
     #[cfg(unix)]
     fn staged_file_with_backslash_in_name_is_checked() {
-        let git = |dir: &std::path::Path, args: &[&str]| {
-            let st = std::process::Command::new("git")
-                .args(args)
-                .current_dir(dir)
-                .status()
-                .unwrap();
-            assert!(st.success(), "git {args:?}");
-        };
-        let dir = std::env::temp_dir().join(format!("victory-xtask-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("backslash");
         git(&dir, &["init", "-q"]);
         std::fs::write(dir.join("evil\\x.bin"), b"MZ\x90\0").unwrap();
         git(&dir, &["add", "-A"]);
@@ -219,6 +271,61 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(staged.is_err(), "staged file passed the policy");
         assert!(tracked.is_err(), "tracked file passed the policy");
+    }
+
+    /// Without git, the files are found by walking the folder: a backslash
+    /// in a name is still part of the name there.
+    #[test]
+    #[cfg(unix)]
+    fn walked_file_with_backslash_in_name_is_checked() {
+        let dir = scratch("walk");
+        std::fs::write(dir.join("evil\\x.bin"), b"MZ\x90\0").unwrap();
+        let walked = super::run(&dir, false);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(walked.is_err(), "walked file passed the policy");
+    }
+
+    /// A committed symlink replaced by a file is staged as a type change,
+    /// and the file's content is checked like any other.
+    #[test]
+    #[cfg(unix)]
+    fn staged_type_change_is_checked() {
+        let dir = scratch("typechange");
+        git(&dir, &["init", "-q"]);
+        std::os::unix::fs::symlink("elsewhere", dir.join("notes.txt")).unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-q", "-m", "a link"]);
+        std::fs::remove_file(dir.join("notes.txt")).unwrap();
+        std::fs::write(dir.join("notes.txt"), b"MZ\x90\0").unwrap();
+        git(&dir, &["add", "-A"]);
+        let staged = super::run(&dir, true);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(staged.is_err(), "staged type change passed the policy");
+    }
+
+    /// A nested repository is listed as a folder, and staged as a link to
+    /// a commit: neither has content to check, and neither is an error.
+    #[test]
+    #[cfg(unix)]
+    fn nested_repositories_are_not_read_as_files() {
+        let dir = scratch("nested");
+        git(&dir, &["init", "-q"]);
+        std::fs::write(dir.join("readme.md"), b"ours\n").unwrap();
+        let inner = dir.join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        git(&inner, &["init", "-q"]);
+        std::fs::write(inner.join("readme.md"), b"theirs\n").unwrap();
+        git(&inner, &["add", "-A"]);
+        git(&inner, &["commit", "-q", "-m", "inner"]);
+        let untracked = super::run(&dir, false);
+        // Staging the folder records the inner repository as a link.
+        git(&dir, &["add", "-A"]);
+        let staged = super::run(&dir, true);
+        let tracked = super::run(&dir, false);
+        let _ = std::fs::remove_dir_all(&dir);
+        untracked.expect("an untracked nested repository");
+        staged.expect("a staged link to a nested repository");
+        tracked.expect("a tracked link to a nested repository");
     }
 
     /// Enforces the policy wherever tests run, even in clones without the hook.
