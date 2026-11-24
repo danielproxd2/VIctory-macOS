@@ -179,7 +179,7 @@ fn write(bytes: &mut [u8], at: usize, v: &[u8]) -> Result<(), PrepareError> {
 mod tests {
     use super::*;
     use victory_pe::ImportSymbol;
-    use victory_pe::testing::{PeBuilder, reloc, scn};
+    use victory_pe::testing::{DEFAULT_IMAGE_BASE, PeBuilder, SyntheticPe, reloc, scn};
 
     fn by_name(name: &str) -> ImportSymbol {
         ImportSymbol::Name {
@@ -204,8 +204,8 @@ mod tests {
     /// [`title`] with two TLS callbacks and, if `page` is given, one base
     /// relocation block with that page RVA holding a single DIR64 entry at
     /// offset 0x18: the TLS directory's callbacks field when the page is
-    /// the directory's own. Returns the image and the directory's RVA.
-    fn tls_title(page: Option<u32>) -> (Vec<u8>, u32) {
+    /// the directory's own. The image is at the builder's default base.
+    fn tls_title(page: Option<u32>) -> SyntheticPe {
         let mut builder = title().tls_callbacks(&[0x1000, 0x1020]);
         if let Some(page) = page {
             builder = builder.reloc_block(
@@ -213,14 +213,19 @@ mod tests {
                 &[(reloc::DIR64, layout::TLS64_ADDRESS_OF_CALLBACKS as u16)],
             );
         }
-        let built = builder.build().unwrap();
-        (built.bytes, built.tls_directory_rva.unwrap())
+        builder.build().unwrap()
+    }
+
+    /// `AddressOfCallBacks` of an image from [`tls_title`]: the builder's
+    /// image base plus the RVA it gave the callback array.
+    fn callbacks_va(built: &SyntheticPe) -> u64 {
+        DEFAULT_IMAGE_BASE + u64::from(built.tls_callbacks_rva.unwrap())
     }
 
     /// Page RVA of the TLS directory of [`tls_title`]. The builder places
     /// base relocations last, so adding a block does not move the directory.
     fn tls_directory_page() -> u32 {
-        let (_, directory_rva) = tls_title(None);
+        let directory_rva = tls_title(None).tls_directory_rva.unwrap();
         assert_eq!(directory_rva & 0xFFF, 0, "the directory starts its page");
         directory_rva
     }
@@ -316,12 +321,13 @@ mod tests {
 
     #[test]
     fn synthetic_tls_callbacks_are_neutralised() {
-        let (original, directory_rva) = tls_title(Some(tls_directory_page()));
+        let built = tls_title(Some(tls_directory_page()));
+        let (original, directory_rva) = (&built.bytes, built.tls_directory_rva.unwrap());
 
-        let prepared = prepare(&original).unwrap();
+        let prepared = prepare(original).unwrap();
         let tls = prepared.info.tls.as_ref().expect("info keeps the TLS data");
         assert_eq!(tls.callback_rvas, [0x1000, 0x1020]);
-        assert_ne!(tls.callbacks_va, 0);
+        assert_eq!(tls.callbacks_va, callbacks_va(&built));
 
         let patched = ImageInfo::parse(&prepared.bytes).unwrap();
         let patched_tls = patched.tls.as_ref().expect("the directory stays");
@@ -426,17 +432,24 @@ mod tests {
     #[test]
     fn a_relocation_page_near_4_gib_does_not_overflow() {
         // Header values are untrusted: page + offset used to overflow u32.
-        let (original, _) = tls_title(Some(0xFFFF_FFFF));
-        let entry = first_relocation_entry(&original);
+        let built = tls_title(Some(0xFFFF_FFFF));
+        let original = &built.bytes;
+        let entry = first_relocation_entry(original);
         let dir64 = (u16::from(reloc::DIR64) << 12 | 0x18).to_le_bytes();
         assert_eq!(original[entry..entry + 2], dir64);
-        let prepared = prepare(&original).expect("prepare must not panic");
-        assert_ne!(prepared.info.tls.as_ref().unwrap().callbacks_va, 0);
+        let prepared = prepare(original).expect("prepare must not panic");
+        // The original's TLS data is reported untouched: the callback array
+        // is where the builder put it, 64 bytes into the `.tls` section
+        // that follows `.text` and `.idata`.
+        let tls = prepared.info.tls.as_ref().unwrap();
+        assert_eq!(tls.callbacks_va, callbacks_va(&built));
+        assert_eq!(tls.callbacks_va, 0x1_8000_3040);
+        assert_eq!(tls.callback_rvas, [0x1000, 0x1020]);
         // The entry is left alone: it names no field of the image.
         assert_eq!(prepared.bytes[entry..entry + 2], dir64);
         // On the directory's own page it is the callbacks field's
         // relocation, and is turned into a no-op.
-        let (original, _) = tls_title(Some(tls_directory_page()));
+        let original = tls_title(Some(tls_directory_page())).bytes;
         assert_eq!(first_relocation_entry(&original), entry);
         let prepared = prepare(&original).unwrap();
         assert_eq!(prepared.bytes[entry..entry + 2], [0, 0]);
