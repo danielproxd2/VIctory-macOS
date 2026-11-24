@@ -552,6 +552,25 @@ mod tests {
             late.entries[1].iat_slot_rva,
             late.entries[0].iat_slot_rva + 8
         );
+        // The slots are those of the descriptor's ImportAddressTableRVA
+        // (offset 12 of IMAGE_DELAYLOAD_DESCRIPTOR), read from the file,
+        // and not of the name table that follows it at offset 16.
+        let directory = layout::data_directory_offset(&data, dir::DELAY_IMPORT).unwrap();
+        let descriptor_rva = layout::read_u32(&data, directory).unwrap();
+        let descriptor = info.rva_to_file_offset(descriptor_rva).unwrap() as usize;
+        let iat = layout::read_u32(&data, descriptor + 12).unwrap();
+        let names = layout::read_u32(&data, descriptor + 16).unwrap();
+        assert_ne!(iat, 0);
+        assert_ne!(iat, names, "the two tables are apart in this image");
+        let slots: Vec<_> = late.entries.iter().map(|e| e.iat_slot_rva).collect();
+        assert_eq!(slots, [iat, iat + 8]);
+        // The name table holds the two thunks; the IAT is not a copy of it.
+        let names_at = info.rva_to_file_offset(names).unwrap() as usize;
+        assert_eq!(
+            layout::read_u64(&data, names_at + 8),
+            Some(1 << 63 | 9),
+            "the ordinal import's entry in the name table"
+        );
         // The delay IAT is its own table, not part of the eager IAT.
         let eager: Vec<_> = info
             .imports
