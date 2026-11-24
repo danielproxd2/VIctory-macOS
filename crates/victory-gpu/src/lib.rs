@@ -36,7 +36,6 @@ mod indirect;
 pub mod list;
 pub mod object;
 pub mod pipeline;
-#[cfg(windows)]
 mod primitive;
 pub mod query;
 pub mod queue;
@@ -49,6 +48,7 @@ pub mod shader_cache;
 #[cfg(windows)]
 mod shadow;
 pub mod signature;
+mod states;
 #[cfg(test)]
 mod testing;
 #[cfg(windows)]

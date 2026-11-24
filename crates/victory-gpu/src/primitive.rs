@@ -11,6 +11,13 @@
 //! [`components`] does not know keep the first vertex's value, and so do
 //! components past the end of the vertex (an element that reaches into the
 //! next one, which the layout allows).
+//!
+//! shortcut: integer inputs (UINT and SINT) get the same sum in integers,
+//! wrapping at their width, and signed normalized ones are clamped to
+//! -1..1 as the unsigned ones are to 0..1. What the hardware does when the
+//! fourth corner of such an input leaves its range has not been checked.
+// Its user, the draw path, is Windows-only.
+#![cfg_attr(not(windows), allow(dead_code))]
 
 /// Expands `rects` rectangles of `stride`-byte vertices from `src` into six
 /// vertices each in `dst`: `(v0, v1, v2)` and `(v0, v2, v3)`, so both
@@ -35,9 +42,25 @@ pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: 
             // next one.
             let inside = stride.saturating_sub(at) / kind.bytes();
             for c in 0..n.min(inside) {
-                let get = |i: usize| kind.read(&v(i)[at..], c);
-                let value = get(0) + get(2) - get(1);
-                kind.write(&mut fourth[at..], c, value);
+                match kind {
+                    Kind::Real(real) => {
+                        let get = |i: usize| real.read(&v(i)[at..], c);
+                        let value = get(0) + get(2) - get(1);
+                        real.write(&mut fourth[at..], c, value);
+                    }
+                    Kind::Int(size) => {
+                        let get = |i: usize| {
+                            let mut b = [0u8; 4];
+                            b[..size].copy_from_slice(&v(i)[at + c * size..][..size]);
+                            u32::from_le_bytes(b)
+                        };
+                        // The low bytes of a 32-bit wrapping sum are the
+                        // narrower type's wrapping sum, signed or not.
+                        let value = get(0).wrapping_add(get(2)).wrapping_sub(get(1));
+                        fourth[at + c * size..][..size]
+                            .copy_from_slice(&value.to_le_bytes()[..size]);
+                    }
+                }
             }
         }
     }
@@ -45,25 +68,52 @@ pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: 
 
 #[derive(Clone, Copy)]
 enum Kind {
+    /// Computed as a float.
+    Real(Real),
+    /// UINT or SINT of this many bytes (1, 2 or 4), computed as an integer.
+    Int(usize),
+}
+
+#[derive(Clone, Copy)]
+enum Real {
     F32,
     F16,
     Unorm8,
     Unorm16,
+    Snorm8,
+    Snorm16,
 }
 
 /// Component count and kind of the vertex formats rectangles use.
 fn components(format: u32) -> Option<(usize, Kind)> {
     Some(match format {
-        2 => (4, Kind::F32),
-        6 => (3, Kind::F32),
-        16 => (2, Kind::F32),
-        41 => (1, Kind::F32),
-        10 => (4, Kind::F16),
-        34 => (2, Kind::F16),
-        54 => (1, Kind::F16),
-        11 => (4, Kind::Unorm16),
-        35 => (2, Kind::Unorm16),
-        28 | 29 | 87 | 91 => (4, Kind::Unorm8),
+        2 => (4, Kind::Real(Real::F32)),
+        6 => (3, Kind::Real(Real::F32)),
+        16 => (2, Kind::Real(Real::F32)),
+        41 => (1, Kind::Real(Real::F32)),
+        10 => (4, Kind::Real(Real::F16)),
+        34 => (2, Kind::Real(Real::F16)),
+        54 => (1, Kind::Real(Real::F16)),
+        11 => (4, Kind::Real(Real::Unorm16)),
+        35 => (2, Kind::Real(Real::Unorm16)),
+        28 | 29 | 87 | 91 => (4, Kind::Real(Real::Unorm8)),
+        13 => (4, Kind::Real(Real::Snorm16)),
+        37 => (2, Kind::Real(Real::Snorm16)),
+        58 => (1, Kind::Real(Real::Snorm16)),
+        31 => (4, Kind::Real(Real::Snorm8)),
+        51 => (2, Kind::Real(Real::Snorm8)),
+        63 => (1, Kind::Real(Real::Snorm8)),
+        // UINT and SINT of 32, 16 and 8 bits.
+        3 | 4 => (4, Kind::Int(4)),
+        7 | 8 => (3, Kind::Int(4)),
+        17 | 18 => (2, Kind::Int(4)),
+        42 | 43 => (1, Kind::Int(4)),
+        12 | 14 => (4, Kind::Int(2)),
+        36 | 38 => (2, Kind::Int(2)),
+        57 | 59 => (1, Kind::Int(2)),
+        30 | 32 => (4, Kind::Int(1)),
+        50 | 52 => (2, Kind::Int(1)),
+        62 | 64 => (1, Kind::Int(1)),
         _ => return None,
     })
 }
@@ -71,19 +121,31 @@ fn components(format: u32) -> Option<(usize, Kind)> {
 impl Kind {
     fn bytes(self) -> usize {
         match self {
-            Kind::F32 => 4,
-            Kind::F16 | Kind::Unorm16 => 2,
-            Kind::Unorm8 => 1,
+            Kind::Real(real) => real.bytes(),
+            Kind::Int(size) => size,
+        }
+    }
+}
+
+impl Real {
+    fn bytes(self) -> usize {
+        match self {
+            Real::F32 => 4,
+            Real::F16 | Real::Unorm16 | Real::Snorm16 => 2,
+            Real::Unorm8 | Real::Snorm8 => 1,
         }
     }
 
     fn read(self, at: &[u8], c: usize) -> f32 {
         let b = &at[c * self.bytes()..];
         match self {
-            Kind::F32 => f32::from_le_bytes([b[0], b[1], b[2], b[3]]),
-            Kind::F16 => half_to_f32(u16::from_le_bytes([b[0], b[1]])),
-            Kind::Unorm16 => f32::from(u16::from_le_bytes([b[0], b[1]])) / 65535.0,
-            Kind::Unorm8 => f32::from(b[0]) / 255.0,
+            Real::F32 => f32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+            Real::F16 => half_to_f32(u16::from_le_bytes([b[0], b[1]])),
+            Real::Unorm16 => f32::from(u16::from_le_bytes([b[0], b[1]])) / 65535.0,
+            Real::Unorm8 => f32::from(b[0]) / 255.0,
+            // The most negative value is -1 too.
+            Real::Snorm16 => (f32::from(i16::from_le_bytes([b[0], b[1]])) / 32767.0).max(-1.0),
+            Real::Snorm8 => (f32::from(b[0] as i8) / 127.0).max(-1.0),
         }
     }
 
@@ -91,12 +153,16 @@ impl Kind {
         let n = self.bytes();
         let b = &mut at[c * n..(c + 1) * n];
         match self {
-            Kind::F32 => b.copy_from_slice(&v.to_le_bytes()),
-            Kind::F16 => b.copy_from_slice(&f32_to_half(v).to_le_bytes()),
-            Kind::Unorm16 => {
+            Real::F32 => b.copy_from_slice(&v.to_le_bytes()),
+            Real::F16 => b.copy_from_slice(&f32_to_half(v).to_le_bytes()),
+            Real::Unorm16 => {
                 b.copy_from_slice(&((v.clamp(0.0, 1.0) * 65535.0).round() as u16).to_le_bytes())
             }
-            Kind::Unorm8 => b[0] = (v.clamp(0.0, 1.0) * 255.0).round() as u8,
+            Real::Unorm8 => b[0] = (v.clamp(0.0, 1.0) * 255.0).round() as u8,
+            Real::Snorm16 => {
+                b.copy_from_slice(&((v.clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes())
+            }
+            Real::Snorm8 => b[0] = (v.clamp(-1.0, 1.0) * 127.0).round() as i8 as u8,
         }
     }
 }
@@ -210,6 +276,107 @@ mod tests {
         expand_rects(&src, &mut dst, 8, &[(0, 16), (4, 2), (8, 28)]);
         assert_eq!(dst[..40], [&src[..], &src[..8], &src[16..]].concat()[..]);
         assert_eq!(dst[40..], vertex(4.0, 6.0)[..]);
+    }
+
+    /// One element of each integer and signed normalized format, its
+    /// components taking the cases of its kind in turn. The fourth corner
+    /// is `v0 + v2 - v1`: integers wrap at their width, signed or not, and
+    /// signed normalized values are clamped to -1..1.
+    #[test]
+    fn integer_and_snorm_corners_are_computed() {
+        // (v0, v1, v2, fourth) per component, as the raw little-endian value.
+        type Cases = [[u32; 4]; 4];
+        const INT8: Cases = [
+            [10, 3, 20, 27],
+            [250, 1, 10, 3],       // 259 wraps
+            [0, 1, 0, 0xff],       // -1, or 255
+            [0x80, 0, 0x7f, 0xff], // -128 + 127 = -1
+        ];
+        const INT16: Cases = [
+            [1000, 1, 2000, 2999],
+            [0xfff0, 0, 0x20, 0x10],
+            [0, 1, 0, 0xffff],
+            [0x8000, 0x7fff, 0x7fff, 0x8000],
+        ];
+        const INT32: Cases = [
+            [100_000, 1, 200_000, 299_999],
+            [0xffff_fff0, 0, 0x20, 0x10],
+            [0, 1, 0, 0xffff_ffff],
+            [0x8000_0000, 0, 0x7fff_ffff, 0xffff_ffff],
+        ];
+        const SNORM8: Cases = [
+            [10, 20, 30, 20],
+            [0, 0x81, 0x7f, 0x7f],    // 0 + 1 - -1 = 2, clamped to 1
+            [0x40, 0x7f, 0x81, 0x81], // 64/127 - 1 - 1, clamped to -1
+            [0x80, 0, 0, 0x81],       // -128 is -1, written as -127
+        ];
+        const SNORM16: Cases = [
+            [1000, 2000, 3000, 2000],
+            [0, 0x8001, 0x7fff, 0x7fff],
+            [100, 0x7fff, 0x8001, 0x8001],
+            [0x8000, 0, 0, 0x8001],
+        ];
+        // (format, components, bytes per component, cases)
+        let formats: [(u32, usize, usize, &Cases); 26] = [
+            (3, 4, 4, &INT32),    // R32G32B32A32_UINT
+            (4, 4, 4, &INT32),    // R32G32B32A32_SINT
+            (7, 3, 4, &INT32),    // R32G32B32_UINT
+            (8, 3, 4, &INT32),    // R32G32B32_SINT
+            (17, 2, 4, &INT32),   // R32G32_UINT
+            (18, 2, 4, &INT32),   // R32G32_SINT
+            (42, 1, 4, &INT32),   // R32_UINT
+            (43, 1, 4, &INT32),   // R32_SINT
+            (12, 4, 2, &INT16),   // R16G16B16A16_UINT
+            (14, 4, 2, &INT16),   // R16G16B16A16_SINT
+            (36, 2, 2, &INT16),   // R16G16_UINT
+            (38, 2, 2, &INT16),   // R16G16_SINT
+            (57, 1, 2, &INT16),   // R16_UINT
+            (59, 1, 2, &INT16),   // R16_SINT
+            (30, 4, 1, &INT8),    // R8G8B8A8_UINT
+            (32, 4, 1, &INT8),    // R8G8B8A8_SINT
+            (50, 2, 1, &INT8),    // R8G8_UINT
+            (52, 2, 1, &INT8),    // R8G8_SINT
+            (62, 1, 1, &INT8),    // R8_UINT
+            (64, 1, 1, &INT8),    // R8_SINT
+            (13, 4, 2, &SNORM16), // R16G16B16A16_SNORM
+            (37, 2, 2, &SNORM16), // R16G16_SNORM
+            (58, 1, 2, &SNORM16), // R16_SNORM
+            (31, 4, 1, &SNORM8),  // R8G8B8A8_SNORM
+            (51, 2, 1, &SNORM8),  // R8G8_SNORM
+            (63, 1, 1, &SNORM8),  // R8_SNORM
+        ];
+        for (format, n, size, cases) in formats {
+            // Vertex `i` and the expected fourth one (`i` = 3).
+            let vertex = |i: usize| -> Vec<u8> {
+                cases[..n]
+                    .iter()
+                    .flat_map(|case| case[i].to_le_bytes()[..size].to_vec())
+                    .collect()
+            };
+            let stride = n * size;
+            let src = [vertex(0), vertex(1), vertex(2)].concat();
+            let mut dst = vec![0u8; 6 * stride];
+            expand_rects(&src, &mut dst, stride, &[(0, format)]);
+            assert_eq!(dst[..3 * stride], src[..], "format {format}");
+            assert_eq!(dst[5 * stride..], vertex(3)[..], "format {format}");
+        }
+        // With the later cases first in a one-component format, so that
+        // every case of a kind is computed in some format.
+        for (format, size, cases) in [
+            (42, 4, &INT32),
+            (57, 2, &INT16),
+            (62, 1, &INT8),
+            (58, 2, &SNORM16),
+            (63, 1, &SNORM8),
+        ] {
+            for case in cases {
+                let bytes = |i: usize| case[i].to_le_bytes()[..size].to_vec();
+                let src = [bytes(0), bytes(1), bytes(2)].concat();
+                let mut dst = vec![0u8; 6 * size];
+                expand_rects(&src, &mut dst, size, &[(0, format)]);
+                assert_eq!(dst[5 * size..], bytes(3)[..], "format {format} {case:x?}");
+            }
+        }
     }
 
     /// `half_to_f32` reads subnormals, so an f16 rectangle output must be

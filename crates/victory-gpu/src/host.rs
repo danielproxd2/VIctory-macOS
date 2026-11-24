@@ -17,19 +17,7 @@ use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObj
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
-/// Resource states without the console's own bits (compression hints from
-/// bit 25 up), which the host rejects.
-pub(crate) fn pc_state(state: u32) -> u32 {
-    state & 0x01ff_ffff
-}
-
-/// A console state as a host texture state: PC bits only, and none of the
-/// buffer-only ones the console allows on textures (vertex, constant and
-/// index buffer, stream out, indirect arguments, as in "generic read").
-pub(crate) fn texture_state(state: u32) -> u32 {
-    const BUFFER_ONLY: u32 = 0x1 | 0x2 | 0x100 | 0x200;
-    pc_state(state) & !BUFFER_ONLY
-}
+use crate::states::{for_pieces, legal_for};
 
 /// Render target views live only until their command is recorded, so a
 /// ring of host descriptors is enough.
@@ -1430,18 +1418,6 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     });
 }
 
-/// Calls `f` with the pieces of `[start, start + len)` cut at multiples of
-/// `step`.
-fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, usize)) {
-    let end = start + len;
-    let mut at = start;
-    while at < end {
-        let next = ((at / step + 1) * step).min(end);
-        f(at, next - at);
-        at = next;
-    }
-}
-
 impl Host {
     /// A buffer in the upload heap, mapped for writing.
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
@@ -1493,13 +1469,7 @@ impl Host {
 /// The swap chain formats a presented texture can be copied into: its own
 /// family's.
 fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
-    Some(match format.0 {
-        27..=32 => DXGI_FORMAT_R8G8B8A8_UNORM,
-        87 | 90 | 91 => DXGI_FORMAT_B8G8R8A8_UNORM,
-        23..=25 => DXGI_FORMAT_R10G10B10A2_UNORM,
-        9..=14 => DXGI_FORMAT_R16G16B16A16_FLOAT,
-        _ => return None,
-    })
+    crate::states::swap_format(format.0 as u32).map(|f| DXGI_FORMAT(f as i32))
 }
 
 const BUFFERS: u32 = 2;
@@ -1792,22 +1762,6 @@ fn title_window() -> Option<HWND> {
 pub(crate) fn legal_state(texture: &ID3D12Resource, state: u32) -> u32 {
     // SAFETY: a plain query.
     legal_for(unsafe { texture.GetDesc() }.Flags.0 as u32, state)
-}
-
-/// [`legal_state`] for a texture with resource flags `flags`.
-pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
-    // (flag, set or clear forbids, state bits): render target, unordered
-    // access, depth, denied shader resource.
-    const FORBIDDEN: [(u32, bool, u32); 4] = [
-        (0x1, false, 0x4),
-        (0x4, false, 0x8),
-        (0x2, false, 0x10 | 0x20),
-        (0x8, true, 0x40 | 0x80),
-    ];
-    FORBIDDEN
-        .iter()
-        .filter(|&&(flag, deny, _)| (flags & flag != 0) == deny)
-        .fold(state, |s, &(_, _, bits)| s & !bits)
 }
 
 impl Host {

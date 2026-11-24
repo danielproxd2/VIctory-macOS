@@ -304,7 +304,7 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             }
             // shortcut: whole resources, from the state the list tracked
             // (`HostList::transition`); subresources are not told apart.
-            let wanted = crate::host::texture_state(b.last as u32);
+            let wanted = crate::states::texture_state(b.last as u32);
             let (texture, before) = list.transition(b.first, wanted)?;
             Some(Barrier {
                 kind: 0,

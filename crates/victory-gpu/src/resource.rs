@@ -890,9 +890,10 @@ fn host_texture(
             &heap,
             D3D12_HEAP_FLAG_NONE,
             (&raw const d).cast(),
-            D3D12_RESOURCE_STATES(
-                crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
-            ),
+            D3D12_RESOURCE_STATES(crate::states::legal_for(
+                d.flags,
+                crate::states::texture_state(state),
+            ) as i32),
             // The same layout: format, then color or depth and stencil.
             clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
             &mut texture,
@@ -976,7 +977,7 @@ fn hand_out_resource(
         backing,
         #[cfg(windows)]
         host: host.map(|texture| {
-            let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
+            let state = crate::host::legal_state(&texture, crate::states::texture_state(state));
             std::sync::Arc::new(HostTexture {
                 texture,
                 state: state.into(),
