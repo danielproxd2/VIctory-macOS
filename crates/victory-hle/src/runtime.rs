@@ -139,11 +139,10 @@ impl Title {
 /// The text of a manifest file, if its bytes are text in its encoding.
 fn manifest_text(bytes: &[u8]) -> Option<String> {
     let utf16 = |bytes: &[u8], unit: fn([u8; 2]) -> u16| {
-        let units = bytes.chunks_exact(2);
-        if !units.remainder().is_empty() {
+        let (units, []) = bytes.as_chunks::<2>() else {
             return None;
-        }
-        let units: Vec<u16> = units.map(|u| unit([u[0], u[1]])).collect();
+        };
+        let units: Vec<u16> = units.iter().map(|u| unit(*u)).collect();
         String::from_utf16(&units).ok()
     };
     match bytes {
