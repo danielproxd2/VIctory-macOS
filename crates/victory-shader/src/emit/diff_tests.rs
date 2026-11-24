@@ -3,8 +3,9 @@
 //! dispatched) on the host GPU with the same inputs.
 //!
 //! Needs `VICTORY_CONSOLE_DXC` (the console SDK's `dxc.exe`) and a PC
-//! `dxc.exe` (`VICTORY_PC_DXC`, else the newest Windows SDK's); skipped
-//! without them. Set `VICTORY_WARP=1` to draw on WARP.
+//! `dxc.exe` (`VICTORY_PC_DXC`, else the newest Windows SDK's). Without
+//! them each test prints a `skipped:` line and passes, or fails with
+//! `VICTORY_REQUIRE_DIFF=1`. Set `VICTORY_WARP=1` to draw on WARP.
 
 use std::path::{Path, PathBuf};
 
@@ -651,7 +652,20 @@ const MS_CASES: &[(&str, u32, &str)] = &[
     ),
 ];
 
+/// The console compiler and the PC one. Without both the calling test is
+/// skipped with a printed line, or fails with `VICTORY_REQUIRE_DIFF=1`.
 fn tools() -> Option<(PathBuf, PathBuf)> {
+    let found = find_tools();
+    if found.is_none() {
+        crate::testing::skip_unless_required(
+            "VICTORY_REQUIRE_DIFF",
+            "no console compiler (VICTORY_CONSOLE_DXC) or no PC compiler (VICTORY_PC_DXC)",
+        );
+    }
+    found
+}
+
+fn find_tools() -> Option<(PathBuf, PathBuf)> {
     let console = PathBuf::from(std::env::var_os("VICTORY_CONSOLE_DXC")?);
     let pc = match std::env::var_os("VICTORY_PC_DXC") {
         Some(p) => PathBuf::from(p),
@@ -715,7 +729,6 @@ fn user_data(s: &HostShader, k: &[u32; 4]) -> Vec<u32> {
 #[test]
 fn translated_shaders_draw_as_pc_ones() {
     let Some((console, pc)) = tools() else {
-        eprintln!("no console or PC compiler; skipped");
         return;
     };
     let Some(host) = crate::testing::host(false) else {
@@ -865,7 +878,6 @@ fn translated_shaders_draw_as_pc_ones() {
 #[test]
 fn translated_mesh_shaders_draw_as_pc_ones() {
     let Some((console, pc)) = tools() else {
-        eprintln!("no console or PC compiler; skipped");
         return;
     };
     let Some(host) = crate::testing::host(false) else {
@@ -976,7 +988,6 @@ fn translated_mesh_shaders_draw_as_pc_ones() {
 fn float_semantics_are_the_consoles() {
     use super::host::{Dispatch, View};
     let Some((console, _)) = tools() else {
-        eprintln!("no console compiler; skipped");
         return;
     };
     let Some(host) = crate::testing::host(false) else {
@@ -1064,7 +1075,6 @@ fn close(a: u32, b: u32) -> bool {
 fn translated_compute_matches_pc() {
     use super::host::{Dispatch, Stride, View};
     let Some((console, pc)) = tools() else {
-        eprintln!("no console or PC compiler; skipped");
         return;
     };
     let Some(host) = crate::testing::host(false) else {
