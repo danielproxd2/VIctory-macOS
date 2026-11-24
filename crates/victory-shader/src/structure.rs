@@ -1235,4 +1235,54 @@ mod tests {
         assert_eq!(p.blocks[1].preds, [2]);
         assert!(structure(&p).is_ok());
     }
+
+    /// Two atoms born at reverse-postorder indexes 0 and 2.
+    fn two_atoms() -> (Bools, Bool, Bool) {
+        let mut b = Bools::new();
+        let x = b.atom(Atom::Constant(1), 0);
+        let y = b.atom(Atom::Constant(2), 2);
+        (b, x, y)
+    }
+
+    #[test]
+    fn meet_finds_a_lane_satisfying_every_condition() {
+        let (mut b, x, y) = two_atoms();
+        let and = b.and(x, y);
+        let or = b.or(x, y);
+        let xor = b.xor(x, y);
+        assert!(b.meet(&[(x, true), (y, false)]));
+        assert!(!b.meet(&[(x, true), (x, false)]));
+        assert!(!b.meet(&[(and, true), (x, false)]));
+        assert!(!b.meet(&[(or, false), (y, true)]));
+        assert!(!b.meet(&[(xor, true), (x, true), (y, true)]));
+        assert!(b.meet(&[(xor, true), (x, true), (y, false)]));
+        assert!(b.meet(&[]));
+        assert!(!b.meet(&[(Bool::FALSE, true)]));
+        assert!(!b.meet(&[(Bool::TRUE, false)]));
+    }
+
+    #[test]
+    fn forget_quantifies_atoms_born_from_an_index() {
+        let (mut b, x, y) = two_atoms();
+        let and = b.and(x, y);
+        let or = b.or(x, y);
+        assert_eq!(b.forget(and, 1, &mut Map::default()), x);
+        assert_eq!(b.forget(or, 1, &mut Map::default()), Bool::TRUE);
+        assert_eq!(b.forget(and, 3, &mut Map::default()), and);
+        assert_eq!(b.forget(and, 0, &mut Map::default()), Bool::TRUE);
+    }
+
+    #[test]
+    fn given_replaces_the_atoms_a_condition_decides() {
+        let (mut b, x, y) = two_atoms();
+        let nx = b.not(x);
+        let or = b.or(x, y);
+        let and = b.and(x, y);
+        let xor = b.xor(x, y);
+        assert_eq!(b.given(or, x), Bool::TRUE);
+        assert_eq!(b.given(and, nx), Bool::FALSE);
+        assert_eq!(b.given(xor, y), nx);
+        assert_eq!(b.given(and, Bool::TRUE), and);
+        assert!(b.implies(and, or) && !b.implies(or, and));
+    }
 }
