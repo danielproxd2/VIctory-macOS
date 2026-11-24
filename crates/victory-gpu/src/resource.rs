@@ -547,7 +547,25 @@ fn place<'a>(
             };
         };
         tracing::debug!(?desc, ?one, "allocation info");
-        let offset = total.size.next_multiple_of(one.alignment);
+        let Some((offset, end)) = total
+            .size
+            .checked_next_multiple_of(one.alignment)
+            .and_then(|offset| Some((offset, offset.checked_add(one.size)?)))
+        else {
+            tracing::warn!(?desc, "placement overflows");
+            each(
+                i,
+                AllocationInfo1 {
+                    offset: u64::MAX,
+                    alignment: 0,
+                    size: u64::MAX,
+                },
+            );
+            return AllocationInfo {
+                size: u64::MAX,
+                alignment: 0,
+            };
+        };
         each(
             i,
             AllocationInfo1 {
@@ -556,7 +574,7 @@ fn place<'a>(
                 size: one.size,
             },
         );
-        total.size = offset + one.size;
+        total.size = end;
         total.alignment = total.alignment.max(one.alignment);
     }
     total
@@ -1594,6 +1612,17 @@ mod tests {
         assert_eq!((r[0], s[0]), (16, 128));
         let (_, _, _, t) = footprints(&texture(64, 64, 71, 1), 1, 1);
         assert_eq!(t, u64::MAX, "no second subresource");
+    }
+
+    #[test]
+    fn placement_overflow_is_an_unknown_size() {
+        let half = buffer(1 << 63);
+        let mut info = AllocationInfo {
+            size: 0,
+            alignment: 0,
+        };
+        allocation_info(&mut info, std::ptr::null(), 0, 2, [half, half].as_ptr());
+        assert_eq!(info.size, u64::MAX);
     }
 
     /// A 4x4 texture filled from a title buffer through our list and queue,
