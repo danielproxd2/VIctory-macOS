@@ -279,7 +279,8 @@ mod tests {
 
     /// A synthetic PE32+ DLL with a TLS callback array and one base
     /// relocation block whose page RVA is `page`, holding a single DIR64
-    /// entry at offset 1.
+    /// entry at offset 0x18: the TLS directory's callbacks field when the
+    /// page is the directory's own.
     fn synthetic_tls_image(page: u32) -> Vec<u8> {
         let mut d = vec![0u8; 0x200];
         let put = |d: &mut Vec<u8>, at: usize, v: &[u8]| d[at..at + v.len()].copy_from_slice(v);
@@ -315,7 +316,7 @@ mod tests {
         body[0x100..0x108].copy_from_slice(&0x1_8000_1000u64.to_le_bytes());
         body[0x80..0x84].copy_from_slice(&page.to_le_bytes());
         body[0x84..0x88].copy_from_slice(&10u32.to_le_bytes());
-        body[0x88..0x8A].copy_from_slice(&0xA001u16.to_le_bytes());
+        body[0x88..0x8A].copy_from_slice(&0xA018u16.to_le_bytes());
         d.extend_from_slice(&body);
         d
     }
@@ -329,8 +330,12 @@ mod tests {
             prepared.info.tls.as_ref().unwrap().callbacks_va,
             0x1_8000_1100
         );
-        // A sane page still clears the callback relocation.
-        assert!(prepare(&synthetic_tls_image(0x1000)).is_ok());
+        // The entry is left alone: it names no field of the image.
+        assert_eq!(prepared.bytes[0x288..0x28A], 0xA018u16.to_le_bytes());
+        // On the directory's own page it is the callbacks field's
+        // relocation, and is turned into a no-op.
+        let prepared = prepare(&synthetic_tls_image(0x1000)).unwrap();
+        assert_eq!(prepared.bytes[0x288..0x28A], [0, 0]);
     }
 
     #[test]
