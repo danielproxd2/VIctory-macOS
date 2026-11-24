@@ -899,7 +899,7 @@ impl State {
             let from = v.address + u64::from(first) * stride;
             if v.address == 0
                 || stride == 0
-                || u64::from(first + count) * stride > u64::from(v.size)
+                || (u64::from(first) + u64::from(count)) * stride > u64::from(v.size)
                 || crate::shadow::find(from, rects * 3 * stride).is_none()
             {
                 once!(slot, "rectangle vertices outside their buffer");
