@@ -838,9 +838,11 @@ mod tests {
         }
     }
 
-    /// The signature parts are written here without the emitter's writer,
-    /// so the two readings of the format are checked against each other:
-    /// the emitter's writer produces the same rows for the same elements.
+    /// The signature parts are written here without the emitter's writer.
+    /// This test checks the writer's bytes against the offsets of the
+    /// format, spelled out below; the comparison with the emitter's own
+    /// writer is `the_testkit_and_the_emitter_write_the_same_signature`
+    /// in `emit`, which can reach both.
     #[test]
     fn signature_parts_carry_their_rows() {
         let elements = [

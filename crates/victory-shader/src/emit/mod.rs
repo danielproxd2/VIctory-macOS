@@ -779,8 +779,49 @@ mod tests {
     use crate::gfx10::asm;
     use crate::testkit;
 
-    /// Translates a synthetic console container; dxil.dll, where there is
-    /// one, checks the result.
+    /// The testkit writes signature parts with its own writer
+    /// (`testkit::signature_part`); the emitter's is `container::signature`.
+    /// For the same elements the two give the same bytes: the testkit's
+    /// part, read by the emitter's reader and written back by its writer.
+    /// As an input signature, that is: the reader keeps no usage, so the
+    /// writer's always-reads byte is 0 like the testkit's, where an output
+    /// signature's never-writes byte would be the whole mask.
+    #[test]
+    fn the_testkit_and_the_emitter_write_the_same_signature() {
+        let elements = [
+            testkit::Element::float("POSITION", 0, 0, 0xF),
+            testkit::Element {
+                name: "TEXCOORD",
+                index: 1,
+                system_value: 0,
+                component: 2,
+                register: 1,
+                mask: 0b0110,
+            },
+            testkit::Element {
+                name: "SV_InstanceID",
+                index: 0,
+                system_value: 8,
+                component: 1,
+                register: 2,
+                mask: 0b0001,
+            },
+        ];
+        let part = testkit::signature_part(&elements);
+        let read = super::signature(&part).unwrap();
+        assert_eq!(read.len(), elements.len());
+        for (r, e) in read.iter().zip(&elements) {
+            assert_eq!((r.name.as_str(), r.index), (e.name, e.index));
+            assert_eq!(r.row, Some(e.register), "{}", e.name);
+            assert_eq!(((1u8 << r.cols) - 1) << r.col, e.mask, "{}", e.name);
+        }
+        assert_eq!(container::signature(&read, true), part);
+    }
+
+    /// Translates a synthetic console container and has dxil.dll check
+    /// the result. Where the validator cannot be loaded that check is not
+    /// made (`crate::testing::dxil` prints the skip), and the tests using
+    /// this check structure only.
     fn translated(container: &[u8]) -> HostShader {
         let out = translate(container).unwrap();
         crate::testing::dxil(&out.dxil);
