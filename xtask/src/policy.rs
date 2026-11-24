@@ -48,6 +48,14 @@ const FORBIDDEN_MAGIC: &[(&[u8], &str)] = &[
     (b"\xD0\xCF\x11\xE0", "MSI/OLE"),
 ];
 
+/// Raster pictures allowed in docs/images: extensions and the signatures
+/// such a file starts with.
+const RASTER_SIGNATURES: &[(&[&str], &[&[u8]])] = &[
+    (&["png"], &[b"\x89PNG\r\n\x1a\n"]),
+    (&["jpg", "jpeg"], &[b"\xFF\xD8\xFF"]),
+    (&["gif"], &[b"GIF87a", b"GIF89a"]),
+];
+
 pub fn run(root: &Path, staged: bool) -> Result<()> {
     let files = list_files(root, staged)?;
     let mut violations = Vec::new();
@@ -185,9 +193,16 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
     // Our own pictures for the README (drawings and screenshots of the Mac
     // port, never game content), and only in docs/images.
-    let readme_art = path.starts_with("docs/images/")
-        && matches!(ext.as_deref(), Some("svg" | "png" | "jpg" | "jpeg" | "gif"));
-    let allowed = readme_art
+    let in_images = path.starts_with("docs/images/");
+    let raster = match ext.as_deref() {
+        Some(e) if in_images => RASTER_SIGNATURES
+            .iter()
+            .find(|(exts, _)| exts.contains(&e))
+            .map(|(_, signatures)| *signatures),
+        _ => None,
+    };
+    let allowed = raster.is_some()
+        || (in_images && ext.as_deref() == Some("svg"))
         || ALLOWED_NAMES.contains(&name)
         || ext
             .as_deref()
@@ -206,7 +221,13 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
             problems.push(format!("looks like a {what}"));
         }
     }
-    if content.contains(&0) {
+    if let Some(signatures) = raster {
+        // A picture is binary by nature, so the text checks say nothing
+        // about it. It must at least be the picture its name says it is.
+        if !signatures.iter().any(|s| content.starts_with(s)) {
+            problems.push("not the picture its name says it is".to_owned());
+        }
+    } else if content.contains(&0) {
         problems.push("binary content (NUL bytes)".to_owned());
     } else if let Some(run) = longest_encoded_run(content)
         && run > MAX_ENCODED_RUN
@@ -349,6 +370,61 @@ mod tests {
         assert!(check("crates/x/src/lib.rs", b"fn main() {}\n").is_empty());
         assert!(check(".gitignore", b"/target/\n").is_empty());
         assert!(check(".githooks/pre-commit", b"#!/bin/sh\n").is_empty());
+    }
+
+    /// The start of a PNG, assembled here: the signature and an IHDR chunk
+    /// header for a 1x1 picture. Its length field alone holds NUL bytes.
+    fn png_start() -> Vec<u8> {
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&1u32.to_be_bytes());
+        png.extend_from_slice(&1u32.to_be_bytes());
+        png.extend_from_slice(&[8, 6, 0, 0, 0]);
+        png
+    }
+
+    #[test]
+    fn readme_pictures_pass_only_in_docs_images() {
+        let png = png_start();
+        let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>\n";
+        assert_eq!(check("docs/images/x.png", &png), Vec::<String>::new());
+        assert_eq!(check("docs/images/x.svg", svg), Vec::<String>::new());
+        assert_eq!(
+            check("docs/images/x.gif", b"GIF89a\x01\0\x01\0"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            check("docs/images/x.JPG", b"\xFF\xD8\xFF\xE0\0\x10JFIF\0"),
+            Vec::<String>::new()
+        );
+        assert!(
+            !check("other/x.png", &png).is_empty(),
+            "a picture outside docs/images"
+        );
+        assert!(
+            !check("other/x.svg", svg).is_empty(),
+            "a drawing outside docs/images"
+        );
+        assert!(
+            !check("docs/images/x.svg", &png).is_empty(),
+            "a PNG named .svg"
+        );
+        assert!(
+            !check("docs/images/x.png", b"GIF89a\x01\0\x01\0").is_empty(),
+            "a GIF named .png"
+        );
+        assert!(
+            !check("docs/images/x.png", b"MZ\x90\0").is_empty(),
+            "an executable named .png"
+        );
+        assert!(
+            !check("docs/images/x.png", svg).is_empty(),
+            "text named .png"
+        );
+        let mut big = png;
+        big.resize(600 * 1024, 0);
+        assert!(!check("docs/images/x.png", &big).is_empty(), "too big");
     }
 
     #[test]
