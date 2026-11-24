@@ -17,10 +17,14 @@ unsafe extern "system" {
     fn VIctoryProbeNotImplemented(x: u64) -> u64;
 }
 
-// A DLL the "title" ships; the test supplies a renamed copy of version.dll.
-#[link(name = "victory-probe-title", kind = "raw-dylib")]
+// A DLL the "title" ships: tests/fixtures/title-a. One import by name, one by
+// ordinal only and one of data.
+#[link(name = "title_a", kind = "raw-dylib")]
 unsafe extern "system" {
-    fn GetFileVersionInfoSizeW(path: *const u16, handle: *mut u32) -> u32;
+    fn title_a_named() -> u32;
+    #[link_ordinal(7)]
+    fn title_a_by_ordinal() -> u32;
+    static TITLE_A_DATA: u32;
 }
 
 // Delay-loaded (see build.rs): bound through the delay-load table.
@@ -60,15 +64,22 @@ pub extern "system" fn probe_pid() -> u32 {
     unsafe { GetCurrentProcessId() }
 }
 
-/// An export of a title-shipped DLL: the version-info size of kernel32.dll.
+/// An export of a title-shipped DLL, imported by name.
 #[unsafe(no_mangle)]
 pub extern "system" fn probe_title() -> u32 {
-    let path: Vec<u16> = r"C:\Windows\System32\kernel32.dll"
-        .encode_utf16()
-        .chain(Some(0))
-        .collect();
-    let mut handle = 0;
-    unsafe { GetFileVersionInfoSizeW(path.as_ptr(), &mut handle) }
+    unsafe { title_a_named() }
+}
+
+/// An export of a title-shipped DLL that has an ordinal and no name.
+#[unsafe(no_mangle)]
+pub extern "system" fn probe_title_ordinal() -> u32 {
+    unsafe { title_a_by_ordinal() }
+}
+
+/// A data export of a title-shipped DLL: the import slot holds its address.
+#[unsafe(no_mangle)]
+pub extern "system" fn probe_title_data() -> u32 {
+    unsafe { TITLE_A_DATA }
 }
 
 /// A delay-loaded console API.

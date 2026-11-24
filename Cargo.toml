@@ -1,7 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "apps/*", "xtask"]
-# Fixtures are standalone crates built on demand by integration tests.
+# The fixtures are a workspace of their own (tests/fixtures/Cargo.toml),
+# built for Windows on demand by the integration tests.
 exclude = ["tests/fixtures"]
 
 [workspace.package]

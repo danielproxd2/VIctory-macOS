@@ -2,6 +2,9 @@
 //! current folder (e.g. a title's folder shipping its own `msvcp140_*.dll`).
 #![cfg(windows)]
 
+#[path = "../../victory-loader/tests/common/mod.rs"]
+mod common;
+
 use victory_hle::{HleResolver, HostPolicy};
 use victory_pe::ImportSymbol;
 
@@ -15,13 +18,13 @@ fn ignores_dlls_in_current_folder() {
     assert!(HostPolicy::default().allows("vcruntime140_1.dll"));
 
     let dir = tempfile::tempdir().unwrap();
-    // Any loadable DLL will do.
-    std::fs::copy(r"C:\Windows\System32\version.dll", dir.path().join(name)).unwrap();
+    // Any loadable DLL will do: this one is ours and needs no other.
+    std::fs::copy(common::fixture("title_quiet.dll"), dir.path().join(name)).unwrap();
     std::env::set_current_dir(dir.path()).unwrap();
 
     let symbol = ImportSymbol::Name {
         hint: 0,
-        name: "GetFileVersionInfoSizeW".into(),
+        name: "title_quiet_value".into(),
     };
     let found = HleResolver::default().classify(name, &symbol);
     std::env::set_current_dir(env!("CARGO_MANIFEST_DIR")).unwrap();

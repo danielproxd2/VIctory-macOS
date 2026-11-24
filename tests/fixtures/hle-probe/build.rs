@@ -13,7 +13,11 @@ fn main() {
         // library for the one delay-loaded DLL instead.
         let out = PathBuf::from(env::var("OUT_DIR").unwrap());
         let def = out.join("victory-probe-delayed.def");
-        std::fs::write(&def, "LIBRARY victory-probe-delayed.dll\nEXPORTS\nVIctoryProbeDelayed\n").unwrap();
+        std::fs::write(
+            &def,
+            "LIBRARY victory-probe-delayed.dll\nEXPORTS\nVIctoryProbeDelayed\n",
+        )
+        .unwrap();
         let status = Command::new("x86_64-w64-mingw32-dlltool")
             .arg("-d")
             .arg(&def)

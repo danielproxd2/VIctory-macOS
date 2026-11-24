@@ -9,7 +9,7 @@
 
 # Build output
 /target/
-/tests/fixtures/*/target/
+/tests/fixtures/target/
 
 # Local configuration (contains paths to YOUR files)
 /victory.toml

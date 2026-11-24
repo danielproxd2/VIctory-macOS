@@ -9,6 +9,9 @@
 # VICTORY_REQUIRE_GPU=1 makes the tests that need a host D3D12 device fail
 # where there is none; otherwise they pass, each printing
 # "skipped: no host D3D12 device".
+# The stand-in title and its DLLs (tests/fixtures) are built here, once, and
+# VICTORY_FIXTURE_DIR tells the tests where they are: cargo cannot be started
+# inside Wine.
 # Cargo splits the runner on spaces, so the runner is a wrapper script in a
 # temporary folder without spaces.
 set -e
@@ -44,8 +47,8 @@ export WINEDLLOVERRIDES="mscoree,mshtml=;winedbg.exe=d$D3DMETAL${WINEDLLOVERRIDE
 # Wine hands its environment to the tests; said here so that it stays so.
 [ -z "${VICTORY_REQUIRE_GPU:-}" ] || export VICTORY_REQUIRE_GPU
 export CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_RUNNER="$LINK"
-cargo build --quiet --manifest-path tests/fixtures/hle-probe/Cargo.toml \
+cargo build --quiet --locked --manifest-path tests/fixtures/Cargo.toml \
     --target-dir target/fixtures --target "$TARGET"
-VICTORY_HLE_PROBE="Z:$(printf '%s' "$ROOT" | tr / '\\')\\target\\fixtures\\$TARGET\\debug\\hle_probe.dll"
-export VICTORY_HLE_PROBE
+VICTORY_FIXTURE_DIR="Z:$(printf '%s' "$ROOT" | tr / '\\')\\target\\fixtures\\$TARGET\\debug"
+export VICTORY_FIXTURE_DIR
 cargo test --target "$TARGET" "$@"

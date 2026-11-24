@@ -1,0 +1,22 @@
+# Stand-ins for an Xbox title and the DLLs it ships, written by us and used
+# by the integration tests. This is a workspace of its own (the main one
+# excludes it): the tests need these built for Windows whatever the main
+# build targets, and one `cargo build` here makes all of them. Tests find the
+# DLLs through the locator in crates/victory-loader/tests/common/mod.rs.
+[workspace]
+resolver = "3"
+members = ["hle-probe", "title-a", "title-b", "title-quiet"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+# A stand-in title has no use for unwinding, and title-quiet has no runtime
+# to unwind with.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

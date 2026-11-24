@@ -28,6 +28,13 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Clippy, diagnostics build
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      # The stand-in title and the DLLs it ships: a workspace of their own,
+      # built here once for the loader's tests, which find them through
+      # VICTORY_FIXTURE_DIR.
+      - name: Fixtures
+        run: cargo build --locked --manifest-path tests/fixtures/Cargo.toml --target-dir target/fixtures
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
         run: cargo test --workspace --locked
+        env:
+          VICTORY_FIXTURE_DIR: ${{ github.workspace }}\target\fixtures\debug
