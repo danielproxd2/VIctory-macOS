@@ -62,7 +62,9 @@ pub const BLOB_NOT_FOUND: HRESULT = 0x8083_0008_u32 as i32;
 
 /// Per user and title, as documented.
 const QUOTA: u64 = 256 << 20;
-/// What one update may write in all, as documented.
+/// What one update may write in all, and so the most one blob may hold:
+/// the public documentation gives both the same limit, `GS_MAX_BLOB_SIZE`
+/// (16 MB), and `E_GS_UPDATE_TOO_BIG` as the error past it.
 const MAX_UPDATE: usize = 16 << 20;
 /// Plain COM failure, for a result that is not what we built.
 const E_FAIL: HRESULT = 0x8000_4005_u32 as i32;
@@ -1479,6 +1481,161 @@ mod tests {
         assert!(found.is_empty());
         close_container(this, container);
         close_provider(this, provider);
+    }
+
+    /// The manifest is length-prefixed strings with no count of its own:
+    /// anything that is not whole strings, at least the two names, is no
+    /// manifest.
+    #[test]
+    fn parse_manifest_rejects_corrupt_input() {
+        let strings = ["Slot", "Chapter \u{e9}", "a", "", "b"];
+        let good = manifest(strings[0], strings[1], &strings[2..]);
+        assert_eq!(
+            parse_manifest(&good).as_deref(),
+            Some(&strings.map(String::from)[..])
+        );
+
+        // Cut anywhere: whole strings and both names, or nothing.
+        let mut boundaries = vec![0];
+        for s in strings {
+            boundaries.push(boundaries.last().unwrap() + 4 + s.len());
+        }
+        for cut in 0..good.len() {
+            let whole = boundaries.iter().position(|b| *b == cut);
+            let expected = whole.filter(|n| *n >= 2).map(|n| strings[..n].to_vec());
+            let parsed = parse_manifest(&good[..cut]);
+            let parsed = parsed
+                .as_ref()
+                .map(|p| p.iter().map(String::as_str).collect());
+            assert_eq!(parsed, expected, "cut at {cut}");
+        }
+
+        let prefixed = |len: u32, bytes: &[u8]| [&len.to_le_bytes()[..], bytes].concat();
+        let name = prefixed(4, b"Slot");
+        for bad in [
+            Vec::new(),
+            name.clone(),                                          // one string
+            [&name[..], &[1, 0, 0][..]].concat(),                  // half a length
+            [&name[..], &prefixed(u32::MAX, b"one")[..]].concat(), // length past the end
+            [&name[..], &prefixed(4, b"one")[..]].concat(),
+            [&name[..], &prefixed(2, b"\xff\xfe")[..]].concat(), // not UTF-8
+            [&prefixed(1, b"\x80")[..], &name[..]].concat(),
+            vec![0xff; 64],
+        ] {
+            assert_eq!(parse_manifest(&bad), None, "{bad:?}");
+        }
+    }
+
+    fn other(root: &Path) -> Container {
+        Provider { root: root.into() }.container("Other")
+    }
+
+    /// A container whose manifest is damaged is not listed, counted or
+    /// read, cannot be written over, and takes nothing else with it; its
+    /// files stay as they are.
+    #[test]
+    fn a_corrupt_manifest_file_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(update(root, "one", &[("a", Some("kept"))]), S_OK);
+        let o = other(root);
+        let u = Update {
+            name: o.name.clone(),
+            dir: o.dir.clone(),
+            display: None,
+            changes: vec![("x".into(), Some(b"other".to_vec()))],
+        };
+        assert_eq!(u.submit(), S_OK);
+        let listed = |root: &Path| -> Vec<String> {
+            let _saves = saves_lock();
+            containers(root).into_iter().map(|c| c.0).collect()
+        };
+        assert_eq!(listed(root), ["Other", "Slot"]);
+        assert_eq!(used_bytes(root), 9);
+
+        let slot = Provider { root: root.into() }.container("Slot");
+        let file = slot.dir.join("v1").join(MANIFEST);
+        let good = std::fs::read(&file).unwrap();
+        for bad in [
+            &b""[..],
+            &good[..good.len() - 1],
+            &good[..5],
+            b"\x04\0\0\0Slot",
+            b"\x04\0\0\0Slot\x02\0\0\0\xff\xfe",
+            b"\xff\xff\xff\xff",
+        ] {
+            std::fs::write(&file, bad).unwrap();
+            assert_eq!(listed(root), ["Other"], "{bad:?}");
+            assert_eq!(used_bytes(root), 5, "{bad:?}");
+            assert_eq!(read(&slot, None), Err(NO_ACCESS), "{bad:?}");
+            assert_eq!(update(root, "two", &[("a", Some("new"))]), NO_ACCESS);
+            assert_eq!(delete(root, "Slot"), NO_ACCESS, "{bad:?}");
+            assert_eq!(
+                std::fs::read(slot.dir.join("v1").join("0")).unwrap(),
+                b"kept"
+            );
+            assert_eq!(read(&o, None).unwrap(), [("x".into(), b"other".to_vec())]);
+        }
+
+        // Without its manifest a version is no container at all.
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(listed(root), ["Other"]);
+        assert_eq!(read(&slot, None), Err(BLOB_NOT_FOUND));
+        assert_eq!(read(&o, None).unwrap(), [("x".into(), b"other".to_vec())]);
+
+        // Nothing was lost: with the manifest back, the container is.
+        std::fs::write(&file, &good).unwrap();
+        let kept = Some(("one".into(), vec![("a".into(), "kept".into())]));
+        assert_eq!(state(root), kept);
+        assert_eq!(listed(root), ["Other", "Slot"]);
+    }
+
+    /// One blob may hold what one update may, `GS_MAX_BLOB_SIZE` (16 MB),
+    /// and the error past either is `E_GS_UPDATE_TOO_BIG`, as the public
+    /// documentation has it. A blob past the limit is refused when it is
+    /// written, before it is copied; which of the two calls reports it on
+    /// the console is not documented.
+    #[test]
+    fn an_oversized_blob_is_refused() {
+        let this: This = &OBJECT;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let slot = Provider { root: root.into() }.container("Slot");
+        let new_update = || Update {
+            name: slot.name.clone(),
+            dir: slot.dir.clone(),
+            display: None,
+            changes: Vec::new(),
+        };
+        let data = vec![7u8; MAX_UPDATE + 1];
+
+        let mut u = new_update();
+        let write = |u: &mut Update, name: &std::ffi::CStr, size: usize| {
+            write_blob(this, u, name.as_ptr(), data.as_ptr(), size)
+        };
+        assert_eq!(write(&mut u, c"big", MAX_UPDATE + 1), UPDATE_TOO_BIG);
+        assert_eq!(write(&mut u, c"big", usize::MAX), UPDATE_TOO_BIG);
+        assert!(
+            u.changes.is_empty(),
+            "a refused blob is not part of the update"
+        );
+
+        // Blobs that each fit but not together: the update is refused as a
+        // whole and nothing of it is kept.
+        assert_eq!(write(&mut u, c"big", MAX_UPDATE), S_OK);
+        assert_eq!(write(&mut u, c"small", 1), S_OK);
+        assert_eq!(u.submit(), UPDATE_TOO_BIG);
+        assert_eq!(read(&slot, None), Err(BLOB_NOT_FOUND));
+        assert_eq!(used_bytes(root), 0);
+
+        // At the limit it is written, and read back whole.
+        let mut u = new_update();
+        assert_eq!(write(&mut u, c"big", MAX_UPDATE), S_OK);
+        assert_eq!(u.submit(), S_OK);
+        let blobs = read(&slot, None).unwrap();
+        assert_eq!(blobs.len(), 1);
+        assert_eq!(blobs[0].0, "big");
+        assert!(blobs[0].1 == data[..MAX_UPDATE], "the blob's bytes differ");
     }
 
     /// The public API states a blob's size in 32 bits; a size that does
