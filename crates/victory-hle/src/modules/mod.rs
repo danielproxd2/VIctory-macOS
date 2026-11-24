@@ -55,6 +55,11 @@ mod files {
 mod net {
     pub(crate) mod addr;
 }
+#[cfg(not(windows))]
+#[allow(dead_code)]
+mod xmem {
+    pub(crate) mod range;
+}
 
 use crate::HleModule;
 

@@ -7,6 +7,8 @@
 // API would trust.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+pub(crate) mod range;
+
 use std::alloc::{Layout, alloc, dealloc};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
@@ -30,6 +32,7 @@ use windows_sys::Win32::System::ProcessStatus::{
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::core::BOOL;
 
+use self::range::{ADDRESS_32BIT, PAGE, address_range};
 use crate::{HleModule, hle_export};
 
 const MIB: usize = 1 << 20;
@@ -63,26 +66,8 @@ const PAGES_64K: u32 = PAGES_2M | PAGES_64K_BIT;
 const HOST_PROTECTION: u32 = 0x1ff;
 /// XMem flags of memory both processors reach: all of ours.
 const GRAPHICS: u64 = 3;
-/// XMem flag bit of 32-bit graphics memory.
-const ADDRESS_32BIT: u64 = 4;
 /// The host's write watching (not in windows-sys' memory module).
 const MEM_WRITE_WATCH: u32 = 0x20_0000;
-
-/// The addresses XMem `flags` allow, first and last: the low 4 GiB for
-/// 32-bit memory; else from 4 GiB (kept for 32-bit requests, which the
-/// title's big pools would otherwise crowd out) up to 46 down to 40 bits
-/// from the field at bit 12, or 40 bits without one: the console keeps
-/// title memory there, and its ray-tracing structures must be (Grand Theft
-/// Auto VI's BVH builder refuses one above; the title asks for its GPU heap
-/// with no field). Decision 0001.
-fn address_range(flags: u64) -> (usize, usize) {
-    let bits = match (flags & ADDRESS_32BIT, flags >> 12 & 7) {
-        (0, 0) => 40,
-        (0, field) => 47 - field,
-        _ => return (0, u32::MAX as usize),
-    };
-    (1 << 32, (1 << bits) - 1)
-}
 
 pub extern "system" fn XMemVirtualAlloc(
     base: *mut c_void,
@@ -340,8 +325,6 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 // is a pagefile-backed section, its pages are 64 KiB slices of it, and a
 // mapping is a view of consecutive slices in place of a host placeholder.
 
-const PAGE: usize = 64 << 10;
-
 struct Section(HANDLE);
 
 // SAFETY: a section handle may be used from any thread.
@@ -514,23 +497,16 @@ impl Drop for View {
 /// title's own mapping calls share with every DirectStorage worker. `None`
 /// if a page is unknown or `pages` ends early.
 fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)>> {
-    let end = offset.checked_add(len)?;
-    let pages = pages.get(offset / PAGE..end.div_ceil(PAGE))?;
     let physical = physical();
-    let mut runs: Vec<(Slice, usize)> = Vec::new();
-    for page in pages {
-        let slice = physical.pages.get(page)?;
-        match runs.last_mut() {
-            Some((first, n))
-                if Arc::ptr_eq(&first.section, &slice.section)
-                    && slice.index == first.index + *n =>
-            {
-                *n += 1;
-            }
-            _ => runs.push((slice.clone(), 1)),
-        }
-    }
-    Some(runs)
+    range::runs(
+        pages,
+        offset,
+        len,
+        |page| physical.pages.get(page),
+        |first, n, slice| {
+            Arc::ptr_eq(&first.section, &slice.section) && slice.index == first.index + n
+        },
+    )
 }
 
 /// Copies `data` into physical pages, from `offset` bytes into the first,
