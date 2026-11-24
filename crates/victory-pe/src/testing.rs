@@ -110,6 +110,9 @@ pub struct SyntheticPe {
     pub bytes: Vec<u8>,
     /// RVA of `IMAGE_TLS_DIRECTORY64`, if the image has one.
     pub tls_directory_rva: Option<u32>,
+    /// RVA of the TLS callback array, if the image has one. The directory's
+    /// `AddressOfCallBacks` is the image base plus this.
+    pub tls_callbacks_rva: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -411,7 +414,9 @@ impl PeBuilder {
         }
         if let Some(callbacks) = &self.tls {
             out.tls_directory_rva = Some(placed.next_rva);
-            let data = self.tls_section(placed.next_rva, callbacks.as_deref(), &mut dirs)?;
+            let (data, array) =
+                self.tls_section(placed.next_rva, callbacks.as_deref(), &mut dirs)?;
+            out.tls_callbacks_rva = array;
             placed.add(".tls", scn::DATA, data)?;
         }
         if let Some(table) = &self.exports {
@@ -573,13 +578,13 @@ impl PeBuilder {
     }
 
     /// `IMAGE_TLS_DIRECTORY64`, the index, a 16-byte template and, if asked
-    /// for, the callback array.
+    /// for, the callback array, whose RVA is returned with the bytes.
     fn tls_section(
         &self,
         rva: u32,
         callbacks: Option<&[u32]>,
         dirs: &mut Dirs,
-    ) -> Result<Vec<u8>, BuildError> {
+    ) -> Result<(Vec<u8>, Option<u32>), BuildError> {
         const DIRECTORY: usize = 40;
         const TEMPLATE: usize = 16;
         let mut b = Blob::new(rva);
@@ -588,8 +593,11 @@ impl PeBuilder {
         let template = b.zeros(TEMPLATE)?;
         let template_end = b.here()?;
         let mut callbacks_va = 0;
+        let mut array = None;
         if let Some(rvas) = callbacks {
-            callbacks_va = self.va(b.here()?)?;
+            let at = b.here()?;
+            array = Some(at);
+            callbacks_va = self.va(at)?;
             for &callback in rvas {
                 b.push(&self.va(callback)?.to_le_bytes())?;
             }
@@ -603,7 +611,7 @@ impl PeBuilder {
         b.set(slot(directory, 2, 8)?, &self.va(index)?.to_le_bytes())?;
         b.set(slot(directory, 3, 8)?, &callbacks_va.to_le_bytes())?;
         dirs[dir::TLS] = (directory, DIRECTORY as u32);
-        Ok(b.bytes)
+        Ok((b.bytes, array))
     }
 }
 
@@ -927,6 +935,38 @@ mod tests {
         assert_eq!(built.bytes.len(), expected as usize);
     }
 
+    /// The RVA the builder reports for the callback array is the one the
+    /// directory's `AddressOfCallBacks` field holds, read from the file.
+    #[test]
+    fn the_reported_callback_array_is_the_one_in_the_directory() {
+        let base = 0x1_4000_0000;
+        let built = PeBuilder::new()
+            .image_base(base)
+            .section(".text", scn::CODE, &[0xC3; 0x40])
+            .tls_callbacks(&[0x1000, 0x1020])
+            .build()
+            .unwrap();
+        let directory = built.tls_directory_rva.unwrap();
+        let array = built.tls_callbacks_rva.unwrap();
+        // Directory (40 bytes), index (8) and template (16) come first.
+        assert_eq!(array, directory + 64);
+        let info = crate::ImageInfo::parse(&built.bytes).unwrap();
+        let at = info.rva_to_file_offset(directory).unwrap() as usize;
+        assert_eq!(
+            layout::read_u64(&built.bytes, at + layout::TLS64_ADDRESS_OF_CALLBACKS),
+            Some(base + u64::from(array))
+        );
+        let at = info.rva_to_file_offset(array).unwrap() as usize;
+        assert_eq!(layout::read_u64(&built.bytes, at), Some(base + 0x1000));
+        assert_eq!(layout::read_u64(&built.bytes, at + 8), Some(base + 0x1020));
+        assert_eq!(layout::read_u64(&built.bytes, at + 16), Some(0));
+
+        let none = PeBuilder::new().tls_without_callbacks().build().unwrap();
+        assert!(none.tls_directory_rva.is_some());
+        assert_eq!(none.tls_callbacks_rva, None);
+        assert_eq!(PeBuilder::new().build().unwrap().tls_callbacks_rva, None);
+    }
+
     #[test]
     fn adding_relocations_moves_nothing_else() {
         let base = PeBuilder::new()
@@ -938,6 +978,7 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(without.tls_directory_rva, with.tls_directory_rva);
+        assert_eq!(without.tls_callbacks_rva, with.tls_callbacks_rva);
         let (a, b) = (
             crate::ImageInfo::parse(&without.bytes).unwrap(),
             crate::ImageInfo::parse(&with.bytes).unwrap(),
