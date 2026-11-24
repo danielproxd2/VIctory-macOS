@@ -17,7 +17,8 @@ host = ["dep:windows"]
 # Debugging switches (emitted-module dumps and the like).
 diagnostics = []
 # Helpers for tests, here and in the crates that build on this one: the
-# GFX10 assembler (`gfx10::asm`). Never enabled in a shipped build.
+# GFX10 assembler (`gfx10::asm`) and the builders of synthetic console
+# containers (`testkit`). Never enabled in a shipped build.
 test-support = []
 
 [target.'cfg(windows)'.dependencies]

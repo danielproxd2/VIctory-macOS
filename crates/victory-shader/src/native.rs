@@ -71,16 +71,16 @@
 use crate::ShaderError::{self, Malformed};
 use crate::dxbc::{u32_at, u64_at};
 
-const XDAT_OFFSET: usize = 0x18;
-const MAX_XDAT_ENTRIES: usize = 64;
-const KIND_NATIVE: u32 = 0x0d;
-const XBCH_VERSION: u32 = 3;
-const XBCH_HEADER: usize = 0x18;
-const FSSM_VERSION: u32 = 0x101;
-const FSSM_HEADER: usize = 0x10;
-const GRAPHICS_SLOT_COUNT: u64 = 6;
+pub(crate) const XDAT_OFFSET: usize = 0x18;
+pub(crate) const MAX_XDAT_ENTRIES: usize = 64;
+pub(crate) const KIND_NATIVE: u32 = 0x0d;
+pub(crate) const XBCH_VERSION: u32 = 3;
+pub(crate) const XBCH_HEADER: usize = 0x18;
+pub(crate) const FSSM_VERSION: u32 = 0x101;
+pub(crate) const FSSM_HEADER: usize = 0x10;
+pub(crate) const GRAPHICS_SLOT_COUNT: u64 = 6;
 /// Where each stage's record offset sits in the FSSM payload.
-const SLOTS: [(HwStage, usize); 8] = [
+pub(crate) const SLOTS: [(HwStage, usize); 8] = [
     (HwStage::Ls, 0x08),
     (HwStage::Hs, 0x10),
     (HwStage::Es, 0x18),
@@ -90,38 +90,38 @@ const SLOTS: [(HwStage, usize); 8] = [
     (HwStage::Ms, 0x48),
     (HwStage::Cs, 0x60),
 ];
-const ABSENT: u64 = 0xDEAD_BEEF_DEAD_BEEF;
-const RECORD_SIZE: u64 = 0x54;
-const RECORD_FLAGS: usize = 0x14;
-const FLAG_WAVE32: u32 = 1 << 5;
-const RECORD_REGS: usize = 0x50;
-const RECORD_LAYOUT: usize = 0x28;
-const RECORD_USED: usize = 0x30;
-const RECORD_COUNTS: usize = 0x38;
-const ENTRY_SIZE: u64 = 20;
-const MAX_SEMANTICS: u32 = 32;
-const PS_INPUTS: usize = 0x24;
-const PS_INPUT_COUNT: usize = 0x124;
-const PS_INPUT_ADDR: usize = 0x134;
-const PS_DB_SHADER_CONTROL: usize = 0x138;
-const PS_PATCH_SIZE: usize = 0x148;
-const PS_PATCHES: usize = 0x14c;
-const PATCH_SLOT_DWORDS: usize = 10;
+pub(crate) const ABSENT: u64 = 0xDEAD_BEEF_DEAD_BEEF;
+pub(crate) const RECORD_SIZE: u64 = 0x54;
+pub(crate) const RECORD_FLAGS: usize = 0x14;
+pub(crate) const FLAG_WAVE32: u32 = 1 << 5;
+pub(crate) const RECORD_REGS: usize = 0x50;
+pub(crate) const RECORD_LAYOUT: usize = 0x28;
+pub(crate) const RECORD_USED: usize = 0x30;
+pub(crate) const RECORD_COUNTS: usize = 0x38;
+pub(crate) const ENTRY_SIZE: u64 = 20;
+pub(crate) const MAX_SEMANTICS: u32 = 32;
+pub(crate) const PS_INPUTS: usize = 0x24;
+pub(crate) const PS_INPUT_COUNT: usize = 0x124;
+pub(crate) const PS_INPUT_ADDR: usize = 0x134;
+pub(crate) const PS_DB_SHADER_CONTROL: usize = 0x138;
+pub(crate) const PS_PATCH_SIZE: usize = 0x148;
+pub(crate) const PS_PATCHES: usize = 0x14c;
+pub(crate) const PATCH_SLOT_DWORDS: usize = 10;
 /// The variant that exports every channel as a raw 32-bit value.
-const PATCH_FULL: usize = 9;
-const PATCH_BYTES: usize = 4 + 10 * PATCH_SLOT_DWORDS * 4;
-const MRTS: usize = 8;
-const VS_INPUTS: usize = 0x24;
-const VS_INPUT_COUNT: usize = 0xc4;
-const VS_OUTPUTS: usize = 0xc8;
-const VS_OUTPUT_COUNT: usize = 0x188;
-const CS_RSRC2: usize = 0x24;
-const CS_THREADS: usize = 0x28;
-const RECORD_LDS: usize = 0x4c;
-const MS_CLIP_CNTL: usize = 0x194;
-const MS_INFO: usize = 0x448;
+pub(crate) const PATCH_FULL: usize = 9;
+pub(crate) const PATCH_BYTES: usize = 4 + 10 * PATCH_SLOT_DWORDS * 4;
+pub(crate) const MRTS: usize = 8;
+pub(crate) const VS_INPUTS: usize = 0x24;
+pub(crate) const VS_INPUT_COUNT: usize = 0xc4;
+pub(crate) const VS_OUTPUTS: usize = 0xc8;
+pub(crate) const VS_OUTPUT_COUNT: usize = 0x188;
+pub(crate) const CS_RSRC2: usize = 0x24;
+pub(crate) const CS_THREADS: usize = 0x28;
+pub(crate) const RECORD_LDS: usize = 0x4c;
+pub(crate) const MS_CLIP_CNTL: usize = 0x194;
+pub(crate) const MS_INFO: usize = 0x448;
 /// Unpacked blobs are a few KiB; refuse to allocate for absurd sizes.
-const MAX_UNPACKED: u64 = 16 << 20;
+pub(crate) const MAX_UNPACKED: u64 = 16 << 20;
 
 /// Hardware shader stage a native program runs as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -671,91 +671,10 @@ fn bytes(data: &[u8], offset: u64, len: u64) -> Option<&[u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::{fssm, part, slot, stage_data_at, xbch};
 
     const VS_CODE: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
     const PS_CODE: [u8; 4] = [9, 10, 11, 12];
-    const VGPRS: u32 = 28;
-
-    fn slot(stage: HwStage) -> usize {
-        SLOTS.iter().find(|s| s.0 == stage).unwrap().1
-    }
-
-    /// Stage data: no semantics, and every export patch absent.
-    const STAGE_DATA: usize = PS_PATCHES + MRTS * PATCH_BYTES;
-
-    fn empty_stage_data() -> Vec<u8> {
-        let mut data = vec![0; STAGE_DATA];
-        for mrt in 0..MRTS {
-            let at = PS_PATCHES + mrt * PATCH_BYTES;
-            data[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
-        }
-        data
-    }
-
-    /// Where a one-program blob's stage data starts.
-    fn stage_data_at(blob: &[u8], stage: HwStage) -> usize {
-        FSSM_HEADER
-            + u64_at(blob, FSSM_HEADER + slot(stage)).unwrap() as usize
-            + RECORD_SIZE as usize
-    }
-
-    /// FSSM blob with `programs` as (stage, code) pairs.
-    fn fssm(programs: &[(HwStage, &[u8])]) -> Vec<u8> {
-        let mut payload = GRAPHICS_SLOT_COUNT.to_le_bytes().to_vec();
-        payload.resize(slot(HwStage::Cs) + 8, 0);
-        for (_, at) in SLOTS {
-            payload[at..at + 8].copy_from_slice(&ABSENT.to_le_bytes());
-        }
-        for &(stage, code) in programs {
-            let slot = slot(stage);
-            let record = payload.len() as u64;
-            payload[slot..slot + 8].copy_from_slice(&record.to_le_bytes());
-            let code_at = record + RECORD_SIZE + STAGE_DATA as u64;
-            payload.extend_from_slice(&code_at.to_le_bytes());
-            payload.extend_from_slice(&(code.len() as u64).to_le_bytes());
-            let flags = if stage == HwStage::Ps { FLAG_WAVE32 } else { 0 };
-            payload.extend_from_slice(&[0; 4]);
-            payload.extend_from_slice(&flags.to_le_bytes());
-            payload.resize(record as usize + RECORD_REGS, 0);
-            payload.extend_from_slice(&(VGPRS | 31 << 20).to_le_bytes());
-            payload.extend_from_slice(&empty_stage_data());
-            payload.extend_from_slice(code);
-        }
-        let mut out = b"FSSM".to_vec();
-        out.extend_from_slice(&FSSM_VERSION.to_le_bytes());
-        out.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-        out.extend_from_slice(&payload);
-        out
-    }
-
-    fn xbch(unpacked: &[u8]) -> Vec<u8> {
-        let stream = miniz_oxide::deflate::compress_to_vec_zlib(unpacked, 6);
-        let mut out = b"XBCH".to_vec();
-        out.extend_from_slice(&XBCH_VERSION.to_le_bytes());
-        out.extend_from_slice(&(stream.len() as u64).to_le_bytes());
-        out.extend_from_slice(&(unpacked.len() as u64).to_le_bytes());
-        out.extend_from_slice(&stream);
-        out
-    }
-
-    /// `DXIL` part data: program header, XDAT index, then the blobs.
-    fn part(blobs: &[(u32, &[u8])]) -> Vec<u8> {
-        let mut out = vec![0u8; XDAT_OFFSET];
-        out.extend_from_slice(b"XDAT");
-        out.extend_from_slice(&(blobs.len() as u32).to_le_bytes());
-        out.extend_from_slice(&0x24u32.to_le_bytes());
-        let mut offset = out.len() + 12 * blobs.len();
-        for (kind, blob) in blobs {
-            for v in [*kind, offset as u32, blob.len() as u32] {
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-            offset += blob.len();
-        }
-        for (_, blob) in blobs {
-            out.extend_from_slice(blob);
-        }
-        out
-    }
 
     #[test]
     fn finds_graphics_programs() {
