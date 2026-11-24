@@ -770,6 +770,10 @@ fn bc7<'a>(
         let mode = usize::from(ctrl & 7);
         let subsets = usize::from((ctrl & 0xff) >> 6);
         let prec = bc7_precision(ctrl);
+        // The p-bit is red's lowest bit: a mode with p-bits needs red bits.
+        if pbits(ctrl & 7) && prec[0] == 0 {
+            return Err(Error("invalid BC7 control code"));
+        }
         let three = subsets == 3;
         let or0 = |v: u8| if three { 0 } else { v };
         let if3 = |v: u8| if three { v } else { 0 };
@@ -1364,6 +1368,26 @@ mod tests {
         let mut no_tiling = tables();
         no_tiling[0] = 1;
         assert!(Tables::parse(&no_tiling).is_err());
+    }
+
+    /// A control code that rotates alpha into red on a mode with p-bits (and
+    /// no alpha) leaves red without bits to take the p-bit from: an error,
+    /// not a shift overflow.
+    #[test]
+    fn bc7_control_code_without_red_bits_is_an_error() {
+        let mut bytes = tables();
+        // Control word 0: mode 0, rotation 1, three subsets.
+        let ctrl7 = MODELS * BUCKETS * 2 + 256 + 64 + 256 + 64 + 64;
+        bytes[ctrl7..][..2].copy_from_slice(&0xc8u16.to_le_bytes());
+        let t = Tables::parse(&bytes).unwrap();
+        let widths = [3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4];
+        let src = stream(&t, &widths, 2, &[vec![0; 32]]);
+        let mut dst = [0u8; 16];
+        let result = std::panic::catch_unwind(move || decode(7, &src, &mut dst, &t));
+        assert_eq!(
+            result.expect("decoding panicked"),
+            Err(Error("invalid BC7 control code"))
+        );
     }
 
     #[test]
