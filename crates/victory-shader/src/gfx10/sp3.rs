@@ -314,7 +314,7 @@ fn operands(inst: &Instruction, name: &str, fields: &Fields) -> String {
                 0..=7 => format!("mrt{target}"),
                 8 => "mrtz".into(),
                 9 => "null".into(),
-                12..=15 => format!("pos{}", target - 12),
+                12..=16 => format!("pos{}", target - 12),
                 20 => "prim".into(),
                 32..=63 => format!("param{}", target - 32),
                 _ => format!("<target {target}>"),
@@ -760,6 +760,13 @@ mod tests {
             one(&[0xF800_1C0F, 0x0000_0302], true),
             "exp mrt0, v2, v2, v3, v3 done compr vm"
         );
+    }
+
+    #[test]
+    fn export_targets_pos0_to_pos4() {
+        // io.rs reads targets 12-16 as pos0-pos4 (pos4 carries the shading rate).
+        assert_eq!(one(&[0xF800_0101, 0], true), "exp pos4, v0, off, off, off");
+        assert_eq!(one(&[0xF800_00C1, 0], true), "exp pos0, v0, off, off, off");
     }
 
     #[test]
