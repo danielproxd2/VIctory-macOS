@@ -316,7 +316,9 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
     use crate::dxbc::u32_at;
     let count = u32_at(part, 0)? as usize;
     let base = u32_at(part, 4)? as usize;
-    let mut out = Vec::with_capacity(count);
+    // Each row is 32 bytes: a count past the part's size fails below, after
+    // reserving no more than the part can hold.
+    let mut out = Vec::with_capacity(count.min(part.len() / 32));
     for i in 0..count {
         let at = base + 32 * i;
         let name_at = u32_at(part, at + 4)? as usize;
@@ -418,6 +420,16 @@ mod tests {
             assert_eq!(parse_loop_limit(Some(bad)), LOOP_LIMIT, "{bad:?}");
         }
     }
+    /// A signature part that claims billions of rows is malformed, not a
+    /// request to reserve gigabytes up front.
+    #[test]
+    fn a_signature_with_a_huge_row_count_is_malformed() {
+        let mut part = Vec::new();
+        part.extend(u32::MAX.to_le_bytes());
+        part.extend(8u32.to_le_bytes());
+        assert!(super::signature(&part).is_err());
+    }
+
     use super::container::SigElement;
     use super::shader::Shader;
     use super::*;
