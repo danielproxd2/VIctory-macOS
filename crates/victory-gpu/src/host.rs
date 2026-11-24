@@ -246,16 +246,24 @@ mod tests {
 
     #[test]
     fn warp_adapter_accepts_only_software() {
-        // This probes DXGI without creating a D3D12 device or running a title.
+        // This probes DXGI without creating a D3D12 device or running a
+        // title. It is the host's DXGI all the same, which the device
+        // tests use: one at a time.
+        let _host = crate::testing::serial();
         // SAFETY: plain DXGI adapter queries.
         let raw = unsafe {
             let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             else {
+                crate::test_support::skipped("no host DXGI factory");
                 return;
             };
             factory.EnumWarpAdapter::<IDXGIAdapter>()
         };
-        let Ok(raw) = raw else { return };
+        let Ok(raw) = raw else {
+            // Not every host has one (a software adapter is optional).
+            crate::test_support::skipped("no WARP adapter");
+            return;
+        };
         // SAFETY: EnumWarpAdapter returns a DXGI adapter, which implements
         // IDXGIAdapter1; `raw` owns that interface.
         let desc = unsafe { raw.cast::<IDXGIAdapter1>().unwrap().GetDesc1().unwrap() };

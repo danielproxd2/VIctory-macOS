@@ -221,6 +221,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn host_serialized_blobs_create_root_signatures() {
+        // The host's d3d12.dll, as the device tests use: one at a time.
+        let _host = crate::testing::serial();
         use windows::Win32::Graphics::Direct3D12::{
             D3D12_ROOT_CONSTANTS, D3D12_ROOT_PARAMETER, D3D12_ROOT_PARAMETER_0,
             D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS, D3D12_SHADER_VISIBILITY_ALL,
@@ -263,6 +265,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn our_blobs_deserialize_on_the_host() {
+        // The host's d3d12.dll, as the device tests use: one at a time.
+        let _host = crate::testing::serial();
         use windows::Win32::Graphics::Direct3D12::ID3D12RootSignatureDeserializer;
         use windows::core::Interface;
         let desc = VersionedDesc {
@@ -301,6 +305,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn versioned_descriptions_serialize_on_the_host() {
+        // The host's d3d12.dll, as the device tests use: one at a time.
+        let _host = crate::testing::serial();
         let desc = VersionedDesc {
             version: 1,
             desc: Desc {

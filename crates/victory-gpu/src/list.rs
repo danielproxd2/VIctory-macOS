@@ -1447,7 +1447,12 @@ mod tests {
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {
-        // A list gets a host list where there is a host device.
+        // A list gets a host list where there is a host device, so this
+        // is a device test there; what the title sees of the list is the
+        // same without one.
+        #[cfg(windows)]
+        let (_gpu, device) = crate::testing::serial_with_device();
+        #[cfg(not(windows))]
         let _gpu = crate::testing::serial();
         let null = std::ptr::null();
         let mut allocator = null;
@@ -1458,6 +1463,8 @@ mod tests {
         let mut list = null;
         let hr = create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list);
         assert_eq!(hr, S_OK);
+        #[cfg(windows)]
+        assert_eq!(host_list(list).is_some(), device);
         // What the title's inline draw checks: put < draw limit.
         // SAFETY: the list is 0x560 bytes.
         let (put, draw_limit, api_limit) = unsafe {

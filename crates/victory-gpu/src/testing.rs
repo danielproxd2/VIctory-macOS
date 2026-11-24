@@ -18,6 +18,16 @@ pub(crate) fn gpu() -> Option<(Serial, &'static crate::host::Host)> {
     crate::host::host().map(|host| (guard, host))
 }
 
+/// For a test whose own assertions hold without a device but which
+/// reaches the device where there is one (it creates a command list): the
+/// lock, and whether there is a device for the test to assert the host
+/// half with. Without one the "skipped" line is printed for that half,
+/// and `VICTORY_REQUIRE_GPU=1` fails the test, as in [`gpu`].
+#[cfg(windows)]
+pub(crate) fn serial_with_device() -> (Serial, bool) {
+    crate::test_support::serial_with_device()
+}
+
 /// The list method that older lists have at `old_offset`, wherever
 /// `list`'s own layout has it. Lists are made in the layout the device was
 /// last created for (`device::newer`), which another test may switch for
