@@ -448,6 +448,16 @@ pub(crate) extern "system" fn create_stream(
             );
             break;
         };
+        // The subobject's data is read whole below: it must lie in the stream.
+        if size > desc.size - at {
+            tracing::warn!(
+                kind,
+                at,
+                size = desc.size,
+                "pipeline subobject runs past the end of the stream; the rest is ignored"
+            );
+            break;
+        }
         if let Some(stage) = stage {
             // SAFETY: a shader subobject has its bytecode at +8.
             let code = unsafe { &*desc.stream.add(at + 8).cast::<Bytecode>() };
@@ -623,5 +633,30 @@ mod tests {
                 (1, 28)
             );
         }
+    }
+
+    /// A stream that ends inside a subobject is not read past its end: the
+    /// description's size is the title's promise of how much memory there is.
+    #[test]
+    fn streams_stop_at_a_subobject_cut_short() {
+        let ps = [4u8; 5];
+        // A sample mask (8 bytes), then a pixel shader (24 bytes) at +8.
+        let words: [u64; 4] = [9 | 0xff << 32, 2, ps.as_ptr() as u64, ps.len() as u64];
+        let make = |size: usize| {
+            let desc = StreamDesc {
+                size,
+                stream: words.as_ptr().cast(),
+            };
+            let mut p = std::ptr::null();
+            assert_eq!(
+                create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p),
+                S_OK
+            );
+            shaders(p)
+        };
+        assert_eq!(make(32), [("pixel", ps.to_vec())]);
+        // Eight bytes short: the shader's bytecode is outside the stream.
+        assert_eq!(make(24), []);
+        assert_eq!(make(16), []);
     }
 }
