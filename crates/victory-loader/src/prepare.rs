@@ -336,7 +336,7 @@ mod tests {
         assert!(patched_tls.callback_rvas.is_empty());
         let field = directory_rva + layout::TLS64_ADDRESS_OF_CALLBACKS as u32;
         assert!(
-            dir64_relocations(&original, &prepared.info)
+            dir64_relocations(original, &prepared.info)
                 .iter()
                 .any(|&(_, target)| target == field),
             "the original relocates the callbacks field"
