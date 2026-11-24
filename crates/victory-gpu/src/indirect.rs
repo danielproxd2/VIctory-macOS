@@ -51,11 +51,17 @@ fn clamp() -> Option<&'static Clamp> {
         .as_ref()
 }
 
-/// FNV-1a of the shader source, which names the bytecode it was built into.
-pub(crate) fn source_hash() -> u64 {
-    SOURCE.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+/// FNV-1a, the same hash `cargo xtask embed-clamp` writes.
+fn fnv(data: &[u8]) -> u64 {
+    data.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
         (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
     })
+}
+
+/// The hash of the shader source, which names the bytecode it was built
+/// into.
+pub(crate) fn source_hash() -> u64 {
+    fnv(SOURCE.as_bytes())
 }
 
 fn make() -> windows::core::Result<Clamp> {
@@ -198,6 +204,22 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
 
 #[cfg(test)]
 mod tests {
+    /// The same vectors as xtask's `fnv_matches_the_gpu_crates_source_hash`
+    /// (the published ones for 64-bit FNV-1a): the two copies agree.
+    #[test]
+    fn fnv_matches_embed_clamp() {
+        assert_eq!(super::fnv(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(super::fnv(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(super::fnv(b"foobar"), 0x8594_4171_f739_67e8);
+    }
+
+    /// The prebuilt bytecode is the one in use: its hash names this source.
+    /// Otherwise the shader is compiled here, which Wine cannot do.
+    #[test]
+    fn prebuilt_clamp_names_this_source() {
+        assert_eq!(crate::clamp_bytecode::SOURCE_HASH, super::source_hash());
+    }
+
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
     fn argument_clamp_builds() {
