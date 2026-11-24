@@ -1379,7 +1379,7 @@ const MORE_METHODS: [(usize, *const ()); 9] = [
 /// Grand Theft Auto VI's call shapes: ExecuteIndirect 0x1e8, bottom-of-pipe
 /// writes 0x238/0x240, waits 0x248/0x250, depth bounds 0x230, shading rate
 /// 0x3f0/0x400, syncs 0x418/0x420, ResetX 0x458 (asserts on failure).
-const fn newer_slot(slot: usize) -> usize {
+pub(crate) const fn newer_slot(slot: usize) -> usize {
     if slot >= 59 { slot + 2 } else { slot }
 }
 
@@ -1420,6 +1420,26 @@ const fn list_table(newer: bool) -> [*const (); 160] {
 static LIST_FUNCTIONS: Table<160> = Table(list_table(false));
 static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 
+/// Whether `this` list has the newer layout, by its own table.
+#[cfg(test)]
+pub(crate) fn is_newer(this: This) -> bool {
+    // SAFETY: one of our lists; its first field is the table.
+    let table = unsafe { *this.cast::<*const *const ()>() };
+    table == NEWER_LIST_FUNCTIONS.0.as_ptr()
+}
+
+/// A bare object with the older or the newer list table, and where
+/// ExecuteIndirect is, for the tests of slot lookup.
+#[cfg(test)]
+pub(crate) fn test_layout(newer: bool) -> (Object, *const ()) {
+    let object = if newer {
+        Object::new(&NEWER_LIST_FUNCTIONS)
+    } else {
+        Object::new(&LIST_FUNCTIONS)
+    };
+    (object, execute_indirect as *const ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1427,6 +1447,8 @@ mod tests {
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {
+        // A list gets a host list where there is a host device.
+        let _gpu = crate::testing::serial();
         let null = std::ptr::null();
         let mut allocator = null;
         assert_eq!(

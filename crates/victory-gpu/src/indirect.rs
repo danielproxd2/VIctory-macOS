@@ -201,9 +201,9 @@ mod tests {
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
     fn argument_clamp_builds() {
-        if super::host().is_none() {
-            return; // no host GPU here
-        }
+        let Some(_gpu) = crate::testing::gpu() else {
+            return;
+        };
         assert!(super::clamp().is_some());
     }
 }

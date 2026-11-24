@@ -1249,8 +1249,8 @@ mod tests {
     /// bits are refused, not wrapped into range.
     #[test]
     fn rectangle_vertices_must_lie_inside_their_buffer() {
-        let Some(host) = crate::host::host() else {
-            return; // no host GPU here
+        let Some((_gpu, host)) = crate::testing::gpu() else {
+            return;
         };
         let list = host.new_list().unwrap();
         // A title buffer of float2 positions, 8 bytes each.

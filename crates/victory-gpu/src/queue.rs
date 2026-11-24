@@ -445,7 +445,7 @@ const METHODS: [(usize, *const ()); 15] = [
 /// value)`, timestamp frequency 0x90 (title+0x24841a6), suspend and resume
 /// 0xb8/0xc0, PresentX 0x100, the frame-token submission 0x118 `(count,
 /// lists, token, flags)` (title+0x24821dd).
-const fn newer_slot(slot: usize) -> usize {
+pub(crate) const fn newer_slot(slot: usize) -> usize {
     if slot >= 14 { slot + 2 } else { slot }
 }
 
@@ -463,23 +463,30 @@ const fn queue_table(newer: bool) -> [*const (); 36] {
 static FUNCTIONS: Table<36> = Table(queue_table(false));
 static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
 
+/// Whether `this` queue has the newer layout, by its own table.
+#[cfg(test)]
+pub(crate) fn is_newer(this: This) -> bool {
+    // SAFETY: one of our queues; its first field is the table.
+    let table = unsafe { *this.cast::<*const *const ()>() };
+    table == NEWER_FUNCTIONS.0.as_ptr()
+}
+
+/// A bare object with the older or the newer queue table, and where
+/// Signal is, for the tests of slot lookup.
+#[cfg(test)]
+pub(crate) fn test_layout(newer: bool) -> (Object, *const ()) {
+    let object = if newer {
+        Object::new(&NEWER_FUNCTIONS)
+    } else {
+        Object::new(&FUNCTIONS)
+    };
+    (object, signal as *const ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::object::slot;
-
-    /// Where a queue's signal is: newer layouts have it two slots later.
-    /// Another test may switch layouts while this one runs, so the queue's
-    /// own table decides.
-    fn signal_slot(q: This) -> usize {
-        // SAFETY: one of our queues; its first field is the table.
-        let table = unsafe { *q.cast::<*const *const ()>() };
-        if table == NEWER_FUNCTIONS.0.as_ptr() {
-            0x80
-        } else {
-            0x70
-        }
-    }
 
     #[test]
     fn queue_signals_complete_at_once() {
@@ -500,7 +507,9 @@ mod tests {
             crate::fence::create(null, 0, 0, fence_iid, &mut fence),
             S_OK
         );
-        let signal = slot::<extern "system" fn(This, This, u64) -> HRESULT>(q, signal_slot(q));
+        // Signal: newer layouts have it two slots later.
+        type Signal = extern "system" fn(This, This, u64) -> HRESULT;
+        let signal = crate::testing::queue_slot::<Signal>(q, 0x70);
         assert_eq!(signal(q, fence, 7), S_OK);
         assert_eq!(
             slot::<extern "system" fn(This) -> u64>(fence, 0x40)(fence),

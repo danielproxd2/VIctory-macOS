@@ -312,10 +312,10 @@ mod tests {
 
     #[test]
     fn a_rejected_blob_gives_an_empty_library() {
-        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok())
-        else {
-            return; // no host GPU here
+        let Some((_gpu, host)) = crate::testing::gpu() else {
+            return;
         };
+        let device: ID3D12Device1 = host.device.cast().expect("a device with libraries");
         // A damaged file is refused by the mark check before the host sees
         // it, because not every host checks the bytes itself.
         let blob = unseal(b"not a pipeline library".repeat(16)).unwrap_or_default();

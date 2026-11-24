@@ -482,8 +482,8 @@ mod tests {
         use windows::Win32::Graphics::Direct3D12::{
             D3D12_FENCE_FLAG_NONE, ID3D12Device5, ID3D12Fence,
         };
-        let Some(host) = crate::host::host() else {
-            return; // no host GPU here
+        let Some((_gpu, host)) = crate::testing::gpu() else {
+            return;
         };
         // SAFETY: plain calls on the host device and its fence.
         unsafe {

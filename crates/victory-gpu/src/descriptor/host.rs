@@ -977,12 +977,10 @@ mod tests {
     /// A null 3D UAV made on the real device leaves it alive.
     #[test]
     fn null_3d_uav_is_accepted_by_the_device() {
-        let Some(host) = host() else {
-            return; // no host GPU
-        };
-        let Some(heap) = HostHeap::new(false, 4) else {
+        let Some((_gpu, host)) = crate::testing::gpu() else {
             return;
         };
+        let heap = HostHeap::new(false, 4).expect("a host heap");
         let view = View::Unordered(0, 0, Some([28, 8, 0, 0, 0, 0, 0, 0, 0, 0]));
         null_for(&view, heap.cpu(0));
         // SAFETY: a plain device query.
@@ -992,9 +990,10 @@ mod tests {
     /// Dynamic slots stay taken until given back, and runs do not wrap.
     #[test]
     fn dynamic_slots_are_held_until_released() {
-        let Some(heap) = HostHeap::new(false, 4) else {
-            return; // no host GPU
+        let Some(_gpu) = crate::testing::gpu() else {
+            return;
         };
+        let heap = HostHeap::new(false, 4).expect("a host heap");
         let a = heap.dynamic(heap.dynamic - 100).unwrap();
         let b = heap.dynamic(60).unwrap();
         assert_eq!((a, b), (4, 4 + heap.dynamic - 100));
