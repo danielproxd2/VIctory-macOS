@@ -19,12 +19,15 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 #![allow(clippy::too_many_arguments)]
 
+pub(crate) mod addr;
+
 use std::ffi::{CStr, c_char, c_void};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
 
 use windows_sys::Win32::Foundation::SetLastError;
 
+use self::addr::{loopback, loopback_name, raw_ip, socket_addr};
 use crate::modules::files::host;
 use crate::{HleExport, HleModule, hle_export};
 
@@ -37,8 +40,6 @@ const WSASERVICE_NOT_FOUND: i32 = 10108;
 const WSAHOST_NOT_FOUND: i32 = 11001;
 const ERROR_WINHTTP_CANNOT_CONNECT: u32 = 12029;
 const ERROR_WINHTTP_AUTODETECTION_FAILED: u32 = 12180;
-const AF_INET: u16 = 2;
-const AF_INET6: u16 = 23;
 const NI_NUMERICHOST: i32 = 0x02;
 const NI_NAMEREQD: i32 = 0x04;
 const SIO_GET_EXTENSION_FUNCTION_POINTER: u32 = 0xC800_0006;
@@ -95,47 +96,6 @@ fn wide(text: *const u16) -> Option<String> {
         let len = (0..).take_while(|&i| *text.add(i) != 0).count();
         String::from_utf16_lossy(std::slice::from_raw_parts(text, len))
     })
-}
-
-/// An IPv4 or IPv6 `sockaddr` of `len` bytes.
-fn socket_addr(addr: *const u8, len: i32) -> Option<SocketAddr> {
-    let len = usize::try_from(len).ok()?;
-    if addr.is_null() || len < 4 {
-        return None;
-    }
-    // SAFETY: the title passes `len` readable bytes.
-    let b = unsafe { std::slice::from_raw_parts(addr, len) };
-    let port = u16::from_be_bytes([b[2], b[3]]);
-    match u16::from_le_bytes([b[0], b[1]]) {
-        AF_INET if len >= 16 => Some((<[u8; 4]>::try_from(&b[4..8]).ok()?, port).into()),
-        AF_INET6 if len >= 28 => Some((<[u8; 16]>::try_from(&b[8..24]).ok()?, port).into()),
-        _ => None,
-    }
-}
-
-/// A raw address of family `kind` (`gethostbyaddr` style).
-fn raw_ip(addr: *const c_char, len: i32, kind: i32) -> Option<IpAddr> {
-    let len = usize::try_from(len).ok()?;
-    if addr.is_null() {
-        return None;
-    }
-    // SAFETY: the title passes `len` readable bytes.
-    let b = unsafe { std::slice::from_raw_parts(addr.cast::<u8>(), len) };
-    match (u16::try_from(kind).ok()?, len) {
-        (AF_INET, 4..) => Some(<[u8; 4]>::try_from(&b[..4]).ok()?.into()),
-        (AF_INET6, 16..) => Some(<[u8; 16]>::try_from(&b[..16]).ok()?.into()),
-        _ => None,
-    }
-}
-
-fn loopback(ip: IpAddr) -> bool {
-    ip.to_canonical().is_loopback()
-}
-
-/// `localhost` or a loopback literal (bracketed IPv6 too).
-fn loopback_name(name: &str) -> bool {
-    let bare = name.trim_start_matches('[').trim_end_matches(']');
-    bare.eq_ignore_ascii_case("localhost") || bare.parse().is_ok_and(loopback)
 }
 
 fn shown(addr: Option<impl ToString>) -> String {
@@ -891,6 +851,7 @@ pub(crate) fn module() -> HleModule {
 
 #[cfg(test)]
 mod tests {
+    use super::addr::AF_INET;
     use super::*;
     use victory_pe::ImportSymbol;
 

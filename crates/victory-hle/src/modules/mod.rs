@@ -42,6 +42,15 @@ pub mod xstore;
 pub mod xsystem;
 pub mod xuser;
 
+// The parts of the Windows-only modules that call nothing on the host:
+// built everywhere, so their tests run on every machine. On Windows the
+// modules declare them themselves, at the same paths.
+#[cfg(not(windows))]
+#[allow(dead_code)]
+mod net {
+    pub(crate) mod addr;
+}
+
 use crate::HleModule;
 
 pub(crate) fn all() -> Vec<HleModule> {
