@@ -60,14 +60,16 @@ pub fn run(root: &Path, staged: bool) -> Result<()> {
                 .args(["show", &format!(":{path}")])
                 .current_dir(root)
                 .output()?;
-            if !out.status.success() {
-                continue; // deleted in the index
-            }
+            // `--diff-filter=ACMR` lists no deletions, so a failure here
+            // is an error, never a reason to skip the file unchecked.
+            anyhow::ensure!(out.status.success(), "git cannot read staged file {path:?}");
             out.stdout
         } else {
             match std::fs::read(root.join(path)) {
                 Ok(c) => c,
-                Err(_) => continue,
+                // Listed by git but deleted in the working tree.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e).with_context(|| format!("reading {path}")),
             }
         };
         for problem in check(path, &content) {
@@ -98,13 +100,18 @@ fn list_files(root: &Path, staged: bool) -> Result<Vec<String>> {
         if !out.status.success() {
             return Ok(None);
         }
-        Ok(Some(
-            out.stdout
-                .split(|&b| b == 0)
-                .filter(|s| !s.is_empty())
-                .map(|s| String::from_utf8_lossy(s).replace('\\', "/"))
-                .collect(),
-        ))
+        // Git prints '/' separators on every platform, so names are kept
+        // verbatim: rewriting a backslash that is part of a name would make
+        // the file unreadable under that name and let it skip the check.
+        out.stdout
+            .split(|&b| b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                String::from_utf8(s.to_vec())
+                    .with_context(|| format!("file name {:?} is not valid UTF-8", s))
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(Some)
     };
     if staged {
         return git(&[
@@ -189,6 +196,30 @@ fn longest_encoded_run(content: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::check;
+
+    #[test]
+    #[cfg(unix)]
+    fn staged_file_with_backslash_in_name_is_checked() {
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let st = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {args:?}");
+        };
+        let dir = std::env::temp_dir().join(format!("victory-xtask-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        std::fs::write(dir.join("evil\\x.bin"), b"MZ\x90\0").unwrap();
+        git(&dir, &["add", "-A"]);
+        let staged = super::run(&dir, true);
+        let tracked = super::run(&dir, false);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(staged.is_err(), "staged file passed the policy");
+        assert!(tracked.is_err(), "tracked file passed the policy");
+    }
 
     /// Enforces the policy wherever tests run, even in clones without the hook.
     #[test]
