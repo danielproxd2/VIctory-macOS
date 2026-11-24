@@ -12,6 +12,9 @@ use anyhow::{Context, Result, bail};
 
 const MAX_FILE_SIZE: usize = 512 * 1024;
 const MAX_ENCODED_RUN: usize = 512;
+/// The longest list of numeric literals a file may hold. Our largest
+/// hand-written table has a few hundred entries.
+const MAX_LITERAL_RUN: usize = 1024;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
     "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
@@ -43,12 +46,20 @@ pub(crate) struct Exception {
 /// Paths explicitly exempted, with a reason. Keep this empty if at all
 /// possible. An entry names one exact file: anything else at its path
 /// fails.
-const EXCEPTIONS: &[Exception] = &[Exception {
-    path: "crates/victory-formats/src/bcpack-tables.bin",
-    reason: "the BCPack format's constant tables: nothing decodes without them and they cannot be derived (owner's decision, 2026-11-23; docs/asset-policy.md)",
-    len: 77982,
-    fnv: 0x4808703315eae4f0,
-}];
+const EXCEPTIONS: &[Exception] = &[
+    Exception {
+        path: "crates/victory-formats/src/bcpack-tables.bin",
+        reason: "the BCPack format's constant tables: nothing decodes without them and they cannot be derived (owner's decision, 2026-11-23; docs/asset-policy.md)",
+        len: 77982,
+        fnv: 0x4808703315eae4f0,
+    },
+    Exception {
+        path: "crates/victory-gpu/src/clamp_bytecode.rs",
+        reason: "our own clamp.hlsl compiled by Microsoft's compilers, which Wine cannot run; written by `cargo xtask embed-clamp`, which prints this entry's numbers",
+        len: 40191,
+        fnv: 0xc6be13f15270dfea,
+    },
+];
 
 /// Signatures of formats that must never be committed.
 const FORBIDDEN_MAGIC: &[(&[u8], &str)] = &[
@@ -275,6 +286,11 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
         && run > MAX_ENCODED_RUN
     {
         problems.push(format!("{run}-character hex/base64 run (embedded data?)"));
+    } else {
+        let run = longest_literal_run(content);
+        if run > MAX_LITERAL_RUN {
+            problems.push(format!("{run}-literal byte-array run (embedded data?)"));
+        }
     }
     problems
 }
@@ -283,6 +299,51 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
 fn longest_encoded_run(content: &[u8]) -> Option<usize> {
     let is_payload = |b: &u8| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=');
     content.split(|b| !is_payload(b)).map(<[u8]>::len).max()
+}
+
+/// Longest list of numeric literals separated by commas: `0x4d, 0x5a,` or
+/// `77, 90,`, of any width, with or without a type suffix. A file converted
+/// to an array looks like this, and breaks the encoded run at every comma.
+fn longest_literal_run(content: &[u8]) -> usize {
+    let (mut best, mut run, mut i) = (0, 0, 0);
+    let word = |b: &u8| b.is_ascii_alphanumeric() || *b == b'_';
+    let skip_space = |mut i: usize| {
+        while content.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        i
+    };
+    while i < content.len() {
+        i = skip_space(i);
+        let start = i;
+        if content.get(i) == Some(&b'-') {
+            i += 1;
+        }
+        let digits = i;
+        if content.get(i).is_some_and(u8::is_ascii_digit) {
+            // Digits, hex digits, `x`, underscores and a suffix alike.
+            while content.get(i).is_some_and(word) {
+                i += 1;
+            }
+        }
+        let end = skip_space(i);
+        if i > digits && content.get(end) == Some(&b',') {
+            run += 1;
+            best = best.max(run);
+            i = end + 1;
+        } else {
+            run = 0;
+            // Whatever stands here is not part of a list. Step over all of
+            // it, so that the `1` of a name like `x1` starts nothing.
+            i = i.max(start + 1);
+            if content.get(start).is_some_and(word) {
+                while content.get(i).is_some_and(word) {
+                    i += 1;
+                }
+            }
+        }
+    }
+    best
 }
 
 #[cfg(test)]
@@ -445,6 +506,78 @@ mod tests {
         assert!(same_length[0].contains("hash"), "{same_length:?}");
         let longer = super::check_exception(&exception, b"abcd");
         assert!(longer.iter().any(|p| p.contains("bytes")), "{longer:?}");
+    }
+
+    /// A file converted to an array of literals is data, whatever the
+    /// literals' width or base, and the hex/base64 check cannot see it.
+    #[test]
+    fn rejects_data_smuggled_as_a_byte_array() {
+        use std::fmt::Write as _;
+        let array = |literal: &dyn Fn(usize) -> String, count: usize| {
+            let mut text = String::from("pub const DATA: &[u8] = &[\n");
+            for i in 0..count {
+                let _ = write!(text, "{}", literal(i));
+                text.push_str(if i % 16 == 15 { ",\n" } else { ", " });
+            }
+            text.push_str("];\n");
+            text
+        };
+        let named = |problems: Vec<String>| problems.iter().any(|p| p.contains("byte-array run"));
+        let hex = array(&|i| format!("0x{:02x}", i % 256), 4096);
+        assert!(named(check("src/blob.rs", hex.as_bytes())), "hex bytes");
+        let decimal = array(&|i| format!("{}", i % 256), 4096);
+        assert!(named(check("src/blob.rs", decimal.as_bytes())), "decimal");
+        let words = array(&|i| format!("0x{:08X}u32", i * 0x0101_0101), 2048);
+        assert!(named(check("src/blob.rs", words.as_bytes())), "words");
+        let signed = array(&|i| format!("-{}", i % 128), 2048);
+        assert!(named(check("data.json", signed.as_bytes())), "signed");
+        let packed = array(&|i| format!("{}", i % 10), 4096).replace([' ', '\n'], "");
+        assert!(named(check("src/blob.rs", packed.as_bytes())), "no spaces");
+
+        // The limit is on one list, not on a file's total.
+        let at_limit = array(&|i| format!("0x{:02x}", i % 256), super::MAX_LITERAL_RUN);
+        assert_eq!(super::longest_literal_run(at_limit.as_bytes()), 1024);
+        assert_eq!(
+            check("src/table.rs", at_limit.as_bytes()),
+            Vec::<String>::new()
+        );
+        let two = format!("{at_limit}{at_limit}");
+        assert_eq!(check("src/table.rs", two.as_bytes()), Vec::<String>::new());
+
+        // Ordinary source with a few constants.
+        let source = b"const MASK: u32 = 0xffff_0000;\n\
+            const SIZES: [u8; 4] = [1, 2, 4, 8];\n\
+            fn f(a: u32, b: u32) -> u32 {\n    g(a, 0x10, b, 3, -1, v2, 7)\n}\n";
+        assert_eq!(super::longest_literal_run(source), 3);
+        assert_eq!(check("src/lib.rs", source), Vec::<String>::new());
+        assert_eq!(super::longest_literal_run(b""), 0);
+        assert_eq!(super::longest_literal_run(b"1, 2 \n"), 1);
+        assert_eq!(super::longest_literal_run(b"1, 2, -"), 2);
+        assert_eq!(super::longest_literal_run(b"-, -, x1, 0x"), 0);
+    }
+
+    /// The embedded clamp bytecode is such an array. It passes as the one
+    /// file its exception pins, and as nothing else.
+    #[test]
+    fn clamp_bytecode_passes_only_through_its_exception() {
+        let path = "crates/victory-gpu/src/clamp_bytecode.rs";
+        let content = std::fs::read(crate::workspace_root().join(path)).unwrap();
+        // A checkout that rewrote line ends would differ from the pin.
+        assert!(!content.contains(&b'\r'), "line ends were rewritten");
+        let problems = check(path, &content);
+        assert!(
+            problems.iter().any(|p| p.contains("byte-array run")),
+            "{problems:?}"
+        );
+        let exception = super::EXCEPTIONS
+            .iter()
+            .find(|e| e.path == path)
+            .expect("an entry for the clamp bytecode");
+        assert_eq!(
+            super::check_exception(exception, &content),
+            Vec::<String>::new(),
+            "run `cargo xtask embed-clamp` again and enter the numbers it prints"
+        );
     }
 
     /// Enforces the policy wherever tests run, even in clones without the hook.

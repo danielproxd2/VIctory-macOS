@@ -37,6 +37,11 @@ accepted.
 The entry pins the file's length and hash, so anything else at that path
 fails the check.
 
+`crates/victory-gpu/src/clamp_bytecode.rs` has an entry too, for a
+different reason. It is our own shader, `clamp.hlsl`, compiled by
+Microsoft's compilers and written as an array of bytes, which is the shape
+the check refuses. It holds nothing from a game.
+
 ## Where data lives
 
 Outside the repository, configured in `victory.toml`: `game_dir` (the
@@ -49,7 +54,8 @@ user's dump), `test_titles`, and `cache_dir` for everything derived
 2. `cargo xtask policy` (run by the pre-commit hook; install with
    `cargo xtask install-hooks`) is an allowlist: files must have an allowed
    type, be under 512 KiB, contain no binary data or known binary
-   signatures, and hold no long hex/base64 runs. Pictures of our own in
+   signatures, and hold no long hex/base64 runs or long lists of numeric
+   literals. Pictures of our own in
    `docs/images` are the only binary type. Exceptions need an entry in
    `xtask/src/policy.rs` with a reason and the file's length and hash.
 3. At runtime, everything that writes derived data calls
