@@ -49,6 +49,7 @@ pub mod shader_cache;
 mod shadow;
 pub mod signature;
 mod states;
+pub mod test_support;
 #[cfg(test)]
 mod testing;
 #[cfg(windows)]
@@ -60,3 +61,18 @@ mod watch;
 pub use host::on_failure;
 #[cfg(windows)]
 pub use watch::{title_memory_remapped, writing as kernel_will_write};
+
+/// Whether there is a host D3D12 device for command lists to run on. The
+/// first call makes the device, as the first use by a title would; where
+/// the host has no D3D12 at all (any system but Windows or Wine) there is
+/// none. Tests that need the device ask through [`test_support::gpu`].
+pub fn host_available() -> bool {
+    #[cfg(windows)]
+    {
+        host::host().is_some()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
