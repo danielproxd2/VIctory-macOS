@@ -333,6 +333,11 @@ impl PeBuilder {
 
     /// Adds an export directory. Slot `i` of `slots` has the ordinal
     /// `ordinal_base + i`.
+    ///
+    /// An ordinal is a 16-bit number. The ordinal base and the last slot's
+    /// ordinal may each be at most 65535: a larger base, or
+    /// `ordinal_base + slots.len()` above 65536, is a [`BuildError`],
+    /// whatever the slots hold. An ordinal base of 0 allows 65536 slots.
     pub fn exports(mut self, dll: &str, ordinal_base: u32, slots: Vec<Export>) -> Self {
         self.exports = Some(ExportTable {
             dll: dll.to_owned(),
@@ -627,9 +632,22 @@ const DIRECTORY_COUNT: usize = 16;
 
 type Dirs = [(u32, u32); DIRECTORY_COUNT];
 
+/// One past the largest export ordinal.
+const EXPORT_ORDINAL_END: u64 = 0x1_0000;
+const TOO_MANY_EXPORTS: BuildError = BuildError("an export ordinal does not fit in 16 bits");
+
 /// The export directory, its three tables and its strings. Forwarder
 /// strings must lie inside the directory, so the directory covers it all.
 fn export_section(rva: u32, table: &ExportTable, dirs: &mut Dirs) -> Result<Vec<u8>, BuildError> {
+    // Every slot has an ordinal, named or not, and an ordinal is 16 bits,
+    // as is the base they count from.
+    let fits = u64::try_from(table.slots.len())
+        .ok()
+        .and_then(|n| n.checked_add(u64::from(table.ordinal_base)))
+        .is_some_and(|end| end <= EXPORT_ORDINAL_END);
+    if !fits || u64::from(table.ordinal_base) >= EXPORT_ORDINAL_END {
+        return Err(TOO_MANY_EXPORTS);
+    }
     let mut b = Blob::new(rva);
     let directory = b.zeros(40)?;
     let functions = b.zeros(table_bytes(table.slots.len(), 4)?)?;
@@ -647,7 +665,7 @@ fn export_section(rva: u32, table: &ExportTable, dirs: &mut Dirs) -> Result<Vec<
     for (k, &(name, index)) in named.iter().enumerate() {
         let at = b.cstr(name)?;
         b.set(slot(names, k, 4)?, &at.to_le_bytes())?;
-        let index = u16::try_from(index).map_err(|_| BuildError("too many exports"))?;
+        let index = u16::try_from(index).map_err(|_| TOO_MANY_EXPORTS)?;
         b.set(slot(ordinals, k, 2)?, &index.to_le_bytes())?;
     }
     for (i, e) in table.slots.iter().enumerate() {
@@ -658,7 +676,7 @@ fn export_section(rva: u32, table: &ExportTable, dirs: &mut Dirs) -> Result<Vec<
         };
         b.set(slot(functions, i, 4)?, &address.to_le_bytes())?;
     }
-    let count = |n: usize| u32::try_from(n).map_err(|_| BuildError("too many exports"));
+    let count = |n: usize| u32::try_from(n).map_err(|_| TOO_MANY_EXPORTS);
     b.set_u32(directory, 12, dll)?;
     b.set_u32(directory, 16, table.ordinal_base)?;
     b.set_u32(directory, 20, count(table.slots.len())?)?;
@@ -1028,5 +1046,60 @@ mod tests {
             .collect();
         let too_many = PeBuilder::new().exports("t.dll", 1, exports);
         assert!(too_many.build().is_err());
+    }
+
+    /// The limit on export slots is the documented one, the 16-bit ordinal,
+    /// for slots of every kind and not only for named ones.
+    #[test]
+    fn export_slots_are_limited_by_the_ordinal() {
+        let build = |base: u32, slots: Vec<Export>| {
+            // `.text` takes RVA 0x1000, so that address is not inside the
+            // export directory, where it would be read as a forwarder.
+            let built = PeBuilder::new()
+                .section(".text", scn::CODE, &[0xC3; 0x10])
+                .exports("t.dll", base, slots)
+                .build()?;
+            let info = crate::ImageInfo::parse(&built.bytes).unwrap();
+            Ok::<Vec<u16>, BuildError>(info.exports.iter().map(|e| e.ordinal).collect())
+        };
+        let refused = Err(TOO_MANY_EXPORTS);
+        let kinds = [
+            Export::unused(),
+            Export::ordinal_only(0x1000),
+            Export::named("f", 0x1000),
+        ];
+
+        // Base 0: 65536 slots fit, of any kind, and one more does not.
+        for kind in &kinds[..2] {
+            let exports = build(0, vec![kind.clone(); 0x1_0000]).unwrap();
+            assert_eq!(exports.first().copied().unwrap_or(0), 0);
+            let used = usize::from(*kind != Export::unused()) * 0x1_0000;
+            assert_eq!(exports.len(), used);
+            assert!(exports.last().is_none_or(|&ordinal| ordinal == 0xFFFF));
+            assert_eq!(build(0, vec![kind.clone(); 0x1_0001]), refused);
+        }
+        // The last slot is the one whose ordinal is largest.
+        for kind in &kinds {
+            let mut slots = vec![Export::unused(); 0xFFFF];
+            slots.push(kind.clone());
+            let mut over = slots.clone();
+            over.insert(0, Export::unused());
+            let exports = build(0, slots.clone()).unwrap();
+            assert!(exports.last().is_none_or(|&ordinal| ordinal == 0xFFFF));
+            assert_eq!(exports.len(), usize::from(*kind != Export::unused()));
+            assert_eq!(build(0, over), refused);
+            // The same slots one ordinal higher.
+            assert_eq!(build(1, slots), refused);
+        }
+        // The base counts: ordinal 65535 is the last there is.
+        let one = build(0xFFFF, vec![Export::named("f", 0x1000)]).unwrap();
+        assert_eq!(one, [0xFFFF]);
+        assert_eq!(build(0x1_0000, vec![Export::named("f", 0x1000)]), refused);
+        assert_eq!(build(0xFFFF, vec![Export::unused(); 2]), refused);
+        assert_eq!(build(u32::MAX, vec![Export::ordinal_only(0x1000)]), refused);
+        // The base is an ordinal too, even with no slots to number.
+        assert_eq!(build(0xFFFF, Vec::new()), Ok(Vec::new()));
+        assert_eq!(build(0x1_0000, Vec::new()), refused);
+        assert_eq!(build(0x1_0001, Vec::new()), refused);
     }
 }
