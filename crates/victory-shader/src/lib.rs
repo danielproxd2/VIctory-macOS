@@ -15,6 +15,8 @@ pub mod ir;
 pub mod native;
 pub mod resource;
 pub mod structure;
+#[cfg(test)]
+mod testing;
 #[cfg(any(test, feature = "test-support"))]
 pub mod testkit;
 

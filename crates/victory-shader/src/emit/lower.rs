@@ -6990,7 +6990,14 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
         })
-        .map(|_| ())
+        .map(|l| drop(validated(l)))
+    }
+
+    /// `lowered`, after dxil.dll has checked its container (a printed skip
+    /// where the validator cannot be loaded, `crate::testing::dxil`).
+    fn validated(lowered: Lowered) -> Lowered {
+        crate::testing::dxil(&lowered.dxil);
+        lowered
     }
 
     /// Lowers a compute program with the root parameters `layout` (in user
@@ -7040,6 +7047,7 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
         })
+        .map(validated)
     }
 
     /// Root parameter `slot` in user SGPRs from `user_data` on.

@@ -83,12 +83,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
     };
-    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        v.validate(&mut shader.dxil.clone())
-            .expect("DXIL validation failed");
-    } else {
-        eprintln!("no dxil.dll; validation skipped");
-    }
+    validator::check(&shader.dxil);
     shader
 }
 

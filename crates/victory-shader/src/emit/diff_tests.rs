@@ -796,13 +796,8 @@ fn translated_shaders_draw_as_pc_ones() {
             .unwrap();
             std::fs::write(format!("{out}/{stem}.ps.dxil"), &ps_c.dxil).unwrap();
         }
-        if let Ok(mut v) = super::validator::Validator::load(
-            super::validator::Validator::default_path().as_deref(),
-        ) {
-            for s in [&vs_c, &ps_c] {
-                v.validate(&mut s.dxil.clone())
-                    .unwrap_or_else(|e| panic!("{name}: {e}"));
-            }
+        for s in [&vs_c, &ps_c] {
+            super::validator::check(&s.dxil);
         }
         let (root_t, pso_t) = host.pipeline(&vs_c, &ps_c).unwrap();
         let ours = host
@@ -910,12 +905,7 @@ fn translated_mesh_shaders_draw_as_pc_ones() {
             std::fs::write(format!("{out}/{stem}.ms.cdxil"), &console_ms).unwrap();
             std::fs::write(format!("{out}/{stem}.ms.dxil"), &ms_c.dxil).unwrap();
         }
-        if let Ok(mut v) = super::validator::Validator::load(
-            super::validator::Validator::default_path().as_deref(),
-        ) {
-            v.validate(&mut ms_c.dxil.clone())
-                .unwrap_or_else(|e| panic!("{name}: {e}"));
-        }
+        super::validator::check(&ms_c.dxil);
         let (root_t, pso_t) = host.mesh_pipeline(&ms_c, &ps_c).unwrap();
         let ours = host
             .draw(
@@ -1196,12 +1186,7 @@ fn translated_compute_matches_pc() {
             let stem = name.replace([' ', ','], "_");
             std::fs::write(format!("{out}/{stem}.cs.dxil"), &cs_c.dxil).unwrap();
         }
-        if let Ok(mut v) = super::validator::Validator::load(
-            super::validator::Validator::default_path().as_deref(),
-        ) {
-            v.validate(&mut cs_c.dxil.clone())
-                .unwrap_or_else(|e| panic!("{name}: {e}"));
-        }
+        super::validator::check(&cs_c.dxil);
         let (root_t, pso_t) = match host.compute_pipeline(&cs_c) {
             Ok(p) => p,
             // WARP runs no fixed wave size of 64.

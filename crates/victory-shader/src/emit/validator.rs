@@ -145,7 +145,9 @@ impl Validator {
         unsafe {
             let module = LoadLibraryW(name.as_ptr());
             if module.is_null() {
-                return Err(format!("cannot load {}", String::from_utf16_lossy(&name)));
+                // Without the terminating NUL.
+                let shown = String::from_utf16_lossy(&name[..name.len() - 1]);
+                return Err(format!("cannot load {shown}"));
             }
             let create = GetProcAddress(module, c"DxcCreateInstance".as_ptr().cast())
                 .ok_or("dxil.dll lacks DxcCreateInstance")?;
@@ -217,5 +219,74 @@ impl Drop for Validator {
     fn drop(&mut self) {
         // SAFETY: we own one reference.
         unsafe { release(self.object) };
+    }
+}
+
+/// Has `dxil.dll` validate a copy of an emitted container, and checks that
+/// the hash we wrote is the one the validator signs it with. Where the
+/// validator cannot be loaded this prints a skip line and returns; with
+/// `VICTORY_REQUIRE_DXIL=1` it fails the test instead.
+#[cfg(test)]
+pub(crate) fn check(dxil: &[u8]) {
+    let path = Validator::default_path();
+    let mut validator = match Validator::load(path.as_deref()) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::testing::skip_unless_required(
+                "VICTORY_REQUIRE_DXIL",
+                &format!("DXIL validation: {e}"),
+            );
+            return;
+        }
+    };
+    let mut copy = dxil.to_vec();
+    if let Err(e) = validator.validate(&mut copy) {
+        panic!("DXIL validation failed: {e}");
+    }
+    assert_eq!(
+        copy.get(4..20),
+        dxil.get(4..20),
+        "our container hash differs from the validator's"
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Validator;
+    use crate::dxbc::{Container, FourCC};
+
+    /// The validator is not a rubber stamp: it takes a module we emit and
+    /// refuses the same container with one byte of the bitcode flipped.
+    /// Without `dxil.dll` this is a printed skip (a failure with
+    /// `VICTORY_REQUIRE_DXIL=1`).
+    #[test]
+    fn validator_accepts_an_emitted_module_and_rejects_a_corrupted_one() {
+        let good = crate::emit::translate(&crate::testkit::cs_store_root_constant())
+            .unwrap()
+            .dxil;
+        let path = Validator::default_path();
+        let mut validator = match Validator::load(path.as_deref()) {
+            Ok(v) => v,
+            Err(e) => {
+                crate::testing::skip_unless_required(
+                    "VICTORY_REQUIRE_DXIL",
+                    &format!("DXIL validation: {e}"),
+                );
+                return;
+            }
+        };
+        assert_eq!(validator.validate(&mut good.clone()), Ok(()));
+        // The middle of the bitcode: the DXIL part's data is a program
+        // header (24 bytes), then the bitcode.
+        let part = Container::parse(&good)
+            .unwrap()
+            .part(FourCC::DXIL)
+            .unwrap()
+            .data;
+        let start = part.as_ptr() as usize - good.as_ptr() as usize;
+        let mut bad = good.clone();
+        bad[start + 24 + (part.len() - 24) / 2] ^= 0xFF;
+        let refused = validator.validate(&mut bad);
+        assert!(refused.is_err(), "a corrupted module was accepted");
     }
 }

@@ -138,12 +138,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         root_srvs: lowered.root_srvs,
     };
 
-    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        let mut copy = shader.dxil.clone();
-        let ours = copy[4..20].to_vec();
-        v.validate(&mut copy).expect("DXIL validation failed");
-        assert_eq!(copy[4..20], ours[..], "container hash mismatch");
-    }
+    validator::check(&shader.dxil);
 
     shader
 }

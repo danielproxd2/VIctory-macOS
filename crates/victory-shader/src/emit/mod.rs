@@ -99,6 +99,15 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use sampler::StaticSampler;
 pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 
+/// Whether a `VICTORY_REQUIRE_*` switch with the value `var` is on: only
+/// `1` is. The tests read these switches (`crate::testing`): on, a test
+/// that would be skipped for want of a device, of `dxil.dll` or of a
+/// compiler fails instead.
+#[cfg(test)]
+pub(crate) fn require(var: Option<&str>) -> bool {
+    var.is_some_and(|v| v.trim() == "1")
+}
+
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 
@@ -410,6 +419,24 @@ mod tests {
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
 
+    /// `VICTORY_REQUIRE_GPU`, `_WARP`, `_DXIL` and `_DIFF`: `1` requires,
+    /// anything else (unset, empty, `0`, `true`) does not.
+    #[test]
+    fn the_require_switch_reads_one_as_required() {
+        assert!(super::require(Some("1")));
+        assert!(super::require(Some(" 1\n")));
+        for other in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("true"),
+            Some("yes"),
+            Some("11"),
+        ] {
+            assert!(!super::require(other), "{other:?}");
+        }
+    }
+
     #[test]
     fn the_loop_limit_switch_parses_or_falls_back() {
         assert_eq!(parse_loop_limit(None), LOOP_LIMIT);
@@ -484,13 +511,9 @@ mod tests {
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
         let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
-        // dxil.dll, where there is one, checks the flags against the module.
-        #[cfg(windows)]
-        if let Ok(mut v) = super::validator::Validator::load(
-            super::validator::Validator::default_path().as_deref(),
-        ) {
-            v.validate(&mut out.dxil.clone()).unwrap();
-        }
+        // dxil.dll checks the flags against the module (a visible skip
+        // where it cannot be loaded).
+        crate::testing::dxil(&out.dxil);
         let host = Container::parse(&out.dxil).unwrap();
         let sfi0 = host.part(FourCC::SFI0).unwrap().data;
         let features = u64::from_le_bytes(sfi0.try_into().unwrap());
@@ -592,11 +615,7 @@ mod tests {
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
         let vs = file("VICTORY_REF_VS", crate::HwStage::Vs)
             .unwrap_or_else(|| super::host::stub_vs(&ps).unwrap());
-        if let Ok(mut v) = super::validator::Validator::load(
-            super::validator::Validator::default_path().as_deref(),
-        ) {
-            v.validate(&mut vs.dxil.clone()).unwrap();
-        }
+        crate::testing::dxil(&vs.dxil);
         host.pipeline(&vs, &ps).unwrap();
         // The runtime checks the container hash: no hash or a wrong one is
         // refused. (Recent runtimes also take sixteen 0x01 bytes, a bypass
@@ -627,15 +646,8 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn constant_color_validates() {
-        let mut c = constant_color();
-        let path = super::validator::Validator::default_path();
-        let Ok(mut v) = super::validator::Validator::load(path.as_deref()) else {
-            eprintln!("no dxil.dll; skipped");
-            return;
-        };
-        let ours = c[4..20].to_vec();
-        v.validate(&mut c).unwrap();
-        assert_eq!(c[4..20], ours[..], "our hash differs from the validator's");
+        // Validates, and compares our hash with the validator's.
+        crate::testing::dxil(&constant_color());
     }
 
     /// A pixel shader interpolating at sample positions (PERSP_SAMPLE
@@ -697,13 +709,9 @@ mod tests {
             let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
             let io = crate::io::raise(&p, &native).unwrap();
             let out = super::emit(&c, &native, &p, &st, &io, &res).unwrap();
-            // dxil.dll, where there is one, checks PSV0 against the module.
-            #[cfg(windows)]
-            if let Ok(mut v) = super::validator::Validator::load(
-                super::validator::Validator::default_path().as_deref(),
-            ) {
-                v.validate(&mut out.dxil.clone()).unwrap();
-            }
+            // dxil.dll checks PSV0 against the module (a visible skip where
+            // it cannot be loaded).
+            crate::testing::dxil(&out.dxil);
             let host = super::Container::parse(&out.dxil).unwrap();
             host.part(super::FourCC::PSV0).unwrap().data.to_vec()
         };
@@ -776,12 +784,7 @@ mod tests {
     /// one, checks the result.
     fn translated(container: &[u8]) -> HostShader {
         let out = translate(container).unwrap();
-        #[cfg(windows)]
-        if let Ok(mut v) = super::validator::Validator::load(
-            super::validator::Validator::default_path().as_deref(),
-        ) {
-            v.validate(&mut out.dxil.clone()).unwrap();
-        }
+        crate::testing::dxil(&out.dxil);
         out
     }
 
