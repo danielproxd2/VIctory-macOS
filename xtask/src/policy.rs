@@ -301,22 +301,73 @@ fn longest_encoded_run(content: &[u8]) -> Option<usize> {
     content.split(|b| !is_payload(b)).map(<[u8]>::len).max()
 }
 
-/// Longest list of numeric literals separated by commas: `0x4d, 0x5a,` or
-/// `77, 90,`, of any width, with or without a type suffix. A file converted
-/// to an array looks like this, and breaks the encoded run at every comma.
+/// Longest list of numeric literals: `0x4d, 0x5a,` or `77, 90,`, of any
+/// width, with or without a type suffix. A file converted to an array
+/// looks like this, and breaks the encoded run at every comma.
+///
+/// A literal counts when a comma or a closing bracket follows it. The list
+/// goes on across commas, brackets of all three kinds, line breaks and
+/// comments, so rows (`[1, 2], [3, 4]`), tuples (`(1, 2), (3, 4)`) and a
+/// comment between two rows are all one list. Anything else ends it: a
+/// name, a string, an operator, a semicolon. A number with a decimal point
+/// is not counted.
+///
+/// Comments are read both ways and the longer list is taken: once as
+/// nothing at all, so that they cannot split a list, and once as ordinary
+/// text, so that a list cannot hide inside them.
 fn longest_literal_run(content: &[u8]) -> usize {
+    literal_run(content, true).max(literal_run(content, false))
+}
+
+/// [`longest_literal_run`] with comments either stepped over
+/// (`skip_comments`) or read as text whose markers end no list.
+fn literal_run(content: &[u8], skip_comments: bool) -> usize {
     let (mut best, mut run, mut i) = (0, 0, 0);
     let word = |b: &u8| b.is_ascii_alphanumeric() || *b == b'_';
-    let skip_space = |mut i: usize| {
-        while content.get(i).is_some_and(u8::is_ascii_whitespace) {
-            i += 1;
-        }
-        i
+    let line_end = |from: usize| {
+        content[from..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(content.len(), |n| from + n)
     };
-    while i < content.len() {
-        i = skip_space(i);
+    // The end of the comment that starts at `i`, if one does: `//` and `#`
+    // to the end of the line, `/*` to its `*/`.
+    let comment = |i: usize| -> Option<usize> {
+        let rest = &content[i..];
+        if rest.starts_with(b"//") || rest.starts_with(b"#") {
+            Some(line_end(i))
+        } else if rest.starts_with(b"/*") {
+            let close = rest[2..].windows(2).position(|w| w == b"*/")?;
+            Some(i + 2 + close + 2)
+        } else {
+            None
+        }
+    };
+    // Steps over what neither belongs to a list nor ends one.
+    let skip = |mut i: usize| {
+        loop {
+            match content.get(i) {
+                Some(b) if b.is_ascii_whitespace() => i += 1,
+                Some(b'/' | b'*' | b'#') if !skip_comments => i += 1,
+                Some(b'/' | b'#') if skip_comments => match comment(i) {
+                    Some(end) => i = end,
+                    None => return i,
+                },
+                _ => return i,
+            }
+        }
+    };
+    loop {
+        i = skip(i);
         let start = i;
-        if content.get(i) == Some(&b'-') {
+        let Some(first) = content.get(i) else {
+            return best;
+        };
+        if matches!(first, b',' | b'[' | b']' | b'(' | b')' | b'{' | b'}') {
+            i += 1;
+            continue;
+        }
+        if *first == b'-' {
             i += 1;
         }
         let digits = i;
@@ -326,8 +377,8 @@ fn longest_literal_run(content: &[u8]) -> usize {
                 i += 1;
             }
         }
-        let end = skip_space(i);
-        if i > digits && content.get(end) == Some(&b',') {
+        let end = skip(i);
+        if i > digits && matches!(content.get(end), Some(b',' | b']' | b')' | b'}')) {
             run += 1;
             best = best.max(run);
             i = end + 1;
@@ -336,14 +387,13 @@ fn longest_literal_run(content: &[u8]) -> usize {
             // Whatever stands here is not part of a list. Step over all of
             // it, so that the `1` of a name like `x1` starts nothing.
             i = i.max(start + 1);
-            if content.get(start).is_some_and(word) {
+            if word(first) {
                 while content.get(i).is_some_and(word) {
                     i += 1;
                 }
             }
         }
     }
-    best
 }
 
 #[cfg(test)]
@@ -548,12 +598,85 @@ mod tests {
         let source = b"const MASK: u32 = 0xffff_0000;\n\
             const SIZES: [u8; 4] = [1, 2, 4, 8];\n\
             fn f(a: u32, b: u32) -> u32 {\n    g(a, 0x10, b, 3, -1, v2, 7)\n}\n";
-        assert_eq!(super::longest_literal_run(source), 3);
+        // `[1, 2, 4, 8]`: the bracket closes the list after its last entry.
+        assert_eq!(super::longest_literal_run(source), 4);
         assert_eq!(check("src/lib.rs", source), Vec::<String>::new());
         assert_eq!(super::longest_literal_run(b""), 0);
         assert_eq!(super::longest_literal_run(b"1, 2 \n"), 1);
         assert_eq!(super::longest_literal_run(b"1, 2, -"), 2);
         assert_eq!(super::longest_literal_run(b"-, -, x1, 0x"), 0);
+    }
+
+    /// Rows, tuples and comments do not split a list: a blob written
+    /// sixteen to a row inside inner brackets is as long as it is.
+    #[test]
+    fn a_list_goes_on_across_brackets_and_comments() {
+        use std::fmt::Write as _;
+        let run = |text: &str| super::longest_literal_run(text.as_bytes());
+        let named = |text: &str| {
+            check("src/blob.rs", text.as_bytes())
+                .iter()
+                .any(|p| p.contains("byte-array run"))
+        };
+        // `count` literals, `per` to a group, each group between `open`
+        // and `close` and followed by `between`.
+        let grouped = |count: usize, per: usize, open: &str, close: &str, between: &str| {
+            let mut text = String::from("pub const DATA: &[[u8; 16]] = &[\n");
+            for group in 0..count / per {
+                text.push_str(open);
+                for i in 0..per {
+                    let sep = if i + 1 == per { "" } else { ", " };
+                    let _ = write!(text, "0x{:02x}{sep}", (group * per + i) % 256);
+                }
+                text.push_str(close);
+                text.push_str(between);
+            }
+            text.push_str("];\n");
+            text
+        };
+
+        assert_eq!(run("[[1, 2], [3, 4]]"), 4);
+        assert_eq!(run("[(1, 2), (3, 4)]"), 4);
+        assert_eq!(run("[[[1, 2], [3]], [[4, 5, 6]]]"), 6);
+        assert_eq!(run("{ 1, 2 }, { 3, 4 },"), 4);
+        assert_eq!(run("[1, 2],\n// the second row\n[3, 4],\n"), 4);
+        assert_eq!(run("[1, 2],\n# the second row\n[3, 4],\n"), 4);
+        assert_eq!(run("[1, 2], /* the second\n row */ [3, 4]"), 4);
+        assert_eq!(run("1 /* a */, 2 /* b */, 3 // c\n, 4,"), 4);
+        // A list inside comments is still a list.
+        assert_eq!(run("// 1, 2, 3,\n// 4, 5, 6,\n"), 6);
+        assert_eq!(run("/* 1, 2,\n * 3, 4,\n */"), 4);
+        assert_eq!(run("# 1, 2,\n# 3, 4,\n"), 4);
+        // What opens no comment hides nothing: a glob, and a `/*` that is
+        // closed far away.
+        assert_eq!(run("\"src/*.rs\" 1, 2, 3,"), 3);
+        assert_eq!(run("\"a/*\" 1, 2, 3, \"*/b\""), 3);
+        // Names, strings, operators and semicolons end a list.
+        assert_eq!(run("[1, 2]; [3, 4]"), 2);
+        assert_eq!(run("[1, 2] + [3, 4, 5]"), 3);
+        assert_eq!(run("[1, 2], x, [3, 4, 5]"), 3);
+        assert_eq!(run("(1, \"a\"), (2, \"b\"), (3, \"c\")"), 1);
+        // Numbers with a decimal point are not counted.
+        assert_eq!(run("[1.5, 2.5, 3.5, 4.5]"), 1);
+        assert_eq!(run("[[0.0, 1.0], [2.0, 3.0]]"), 1);
+
+        let rows = grouped(4096, 16, "    [", "],", "\n");
+        assert_eq!(run(&rows), 4096);
+        assert!(named(&rows), "rows of sixteen");
+        let tuples = grouped(4096, 2, "(", "),", " ");
+        assert_eq!(run(&tuples), 4096);
+        assert!(named(&tuples), "pairs");
+        let commented = grouped(4096, 16, "    [", "],", "\n    // next\n");
+        assert_eq!(run(&commented), 4096);
+        assert!(named(&commented), "a comment after every row");
+        let in_comments = grouped(4096, 16, "// ", ",", "\n");
+        assert_eq!(run(&in_comments), 4096);
+        assert!(named(&in_comments), "rows that are comments");
+
+        // The same shapes at the limit pass.
+        let at_limit = grouped(super::MAX_LITERAL_RUN, 16, "    [", "],", "\n");
+        assert_eq!(run(&at_limit), super::MAX_LITERAL_RUN);
+        assert!(!named(&at_limit), "rows at the limit");
     }
 
     /// The embedded clamp bytecode is such an array. It passes as the one

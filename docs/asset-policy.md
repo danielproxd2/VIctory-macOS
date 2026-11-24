@@ -55,13 +55,40 @@ user's dump), `test_titles`, and `cache_dir` for everything derived
    `cargo xtask install-hooks`) is an allowlist: files must have an allowed
    type, be under 512 KiB, contain no binary data or known binary
    signatures, and hold no long hex/base64 runs or long lists of numeric
-   literals. Pictures of our own in
+   literals (see below). Pictures of our own in
    `docs/images` are the only binary type. Exceptions need an entry in
    `xtask/src/policy.rs` with a reason and the file's length and hash.
 3. At runtime, everything that writes derived data calls
    `victory_core::ensure_outside_repo`.
 4. Tests that need real files take their paths from environment variables
    and skip when unset. They assert on properties, never on snapshots.
+
+### What counts as a list of numeric literals
+
+A file may hold no list of more than 1024 numeric literals. The check
+reads every text file the same way, whatever its type:
+
+* A literal is an optional `-`, a digit, and the letters, digits and
+  underscores that follow: `77`, `-3`, `0x4d`, `0xFFFF_0000u32`, `1e5`.
+  It counts when a comma or a closing `]`, `)` or `}` follows it.
+* The list goes on across commas, brackets of all three kinds, spaces and
+  line breaks. Rows (`[1, 2], [3, 4]`) and tuples (`(1, 2), (3, 4)`) are
+  one list of four.
+* Comments do not split a list: `//` and `#` to the end of the line, and
+  `/* ... */`. A list written inside comments is counted too.
+* Anything else ends the list: a name, a string, an operator, a
+  semicolon. The limit is on one list, not on a file's total.
+
+Not counted, so not caught by this rule:
+
+* numbers with a decimal point (`1.5`): only the digits after the point
+  can count, so a list of them is a list of one;
+* numbers inside strings, or with a name or string between every two of
+  them (`(1, "a"), (2, "b")`);
+* lists split by a comment form of another language (`rem`, `<# ... #>`).
+
+The size limit and the hex/base64 rule still apply to all of these, and
+review is what stands behind the check.
 
 ## If something slips through
 
