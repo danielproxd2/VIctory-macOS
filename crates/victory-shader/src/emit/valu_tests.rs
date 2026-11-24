@@ -940,3 +940,16 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+/// A console container assembled by the testkit goes the whole way on a
+/// device: `translate`, a compute pipeline on the hardware adapter and on
+/// WARP, and a dispatch that stores root constant 0 where the program says.
+#[test]
+fn a_translated_console_container_creates_a_compute_pipeline() {
+    let shader = super::translate(&crate::testkit::cs_store_root_constant()).expect("translate");
+    assert_eq!(shader.stage, HwStage::Cs);
+    let cases = [[0x1234_5678, 1, 2, 3], [0xFFFF_FFFF, 0, 0, 0], [0; 4]];
+    run_cases(&shader, &cases, |backend, _, inputs, got| {
+        assert_eq!(got, inputs[0], "{backend}: {inputs:08x?}");
+    });
+}

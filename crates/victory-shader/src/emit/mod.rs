@@ -768,4 +768,280 @@ mod tests {
         // Translated or refused with a reason; it must not panic.
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
     }
+
+    use crate::gfx10::asm;
+    use crate::testkit;
+
+    /// Translates a synthetic console container; dxil.dll, where there is
+    /// one, checks the result.
+    fn translated(container: &[u8]) -> HostShader {
+        let out = translate(container).unwrap();
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut out.dxil.clone()).unwrap();
+        }
+        out
+    }
+
+    /// The compute programs of the feature tests: `body`, then a store of v0
+    /// to the UAV.
+    fn compute(body: &[Vec<u32>]) -> Vec<u8> {
+        let mut words = body.concat();
+        words.extend(testkit::store_dword(0, 0));
+        testkit::container(&testkit::compute_with_uav(&words), &[], &[])
+    }
+
+    /// The whole path a title's shader takes, on containers assembled here:
+    /// container, `DXIL` part, XDAT index, packed blob, stage record, code,
+    /// signatures, and out comes a host shader that binds what the program
+    /// reads.
+    #[test]
+    fn a_synthetic_console_container_translates() {
+        let user = |index, slot, root, dword| UserData {
+            index,
+            slot,
+            root,
+            dword,
+        };
+        let constants: Vec<UserData> = (0..4).map(|i| user(i, 0, RootType::Constants, i)).collect();
+        let table = user(4, 1, RootType::Table, 0);
+        let cases: [(&str, Vec<u8>, HwStage, Vec<UserData>); 6] = [
+            (
+                "vs_fullscreen_triangle",
+                testkit::vs_fullscreen_triangle(),
+                HwStage::Vs,
+                vec![],
+            ),
+            (
+                "vs_position_buffer",
+                testkit::vs_position_buffer(),
+                HwStage::Vs,
+                vec![],
+            ),
+            (
+                "ps_constant",
+                testkit::ps_constant([1.0, 0.5, 0.25, 1.0]),
+                HwStage::Ps,
+                vec![],
+            ),
+            (
+                "ps_root_constants",
+                testkit::ps_root_constants(),
+                HwStage::Ps,
+                constants.clone(),
+            ),
+            (
+                "cs_store_root_constant",
+                testkit::cs_store_root_constant(),
+                HwStage::Cs,
+                vec![constants[0], table],
+            ),
+            (
+                "cs_store_words",
+                testkit::cs_store_words(&[1, 2, 3]),
+                HwStage::Cs,
+                vec![table],
+            ),
+        ];
+        for (name, container, stage, user_data) in cases {
+            let out = translated(&container);
+            assert_eq!(out.stage, stage, "{name}");
+            assert_eq!(out.user_data, user_data, "{name}");
+            assert!(out.samplers.is_empty() && out.static_samplers.is_empty());
+            assert!(out.root_cbvs.is_empty() && out.root_srvs.is_empty());
+            let host = Container::parse(&out.dxil).unwrap();
+            assert!(host.part(FourCC::DXIL).is_some(), "{name}");
+            // The input signature is the title's, plus the vertex id a
+            // program reads (the console signature leaves it out).
+            let isg1 = host.part(FourCC::ISG1).unwrap().data;
+            let names = |needle: &[u8]| isg1.windows(needle.len()).any(|w| w == needle);
+            assert_eq!(names(b"POSITION\0"), name == "vs_position_buffer", "{name}");
+            assert_eq!(
+                names(b"SV_VertexID\0"),
+                name == "vs_fullscreen_triangle",
+                "{name}"
+            );
+        }
+        // A container whose only program is a hull, domain or geometry one
+        // is refused by name, not translated as something else.
+        for stage in [HwStage::Ls, HwStage::Hs, HwStage::Es, HwStage::Gs] {
+            let c = testkit::console_container(stage, &[asm::S_ENDPGM], &[], &[]);
+            let Err(ShaderError::Unsupported { what, .. }) = translate(&c) else {
+                panic!("{stage:?} translated");
+            };
+            assert!(what.contains("without a vertex, pixel, compute"), "{what}");
+        }
+    }
+
+    /// What the host runtime reads before the bitcode: the parts in the
+    /// order validator 1.6 writes them, the stage in `PSV0` and in the
+    /// program header, and a hash over everything after it.
+    #[test]
+    fn emitted_containers_carry_the_parts_each_stage_needs() {
+        // A mesh program whose every lane exports a primitive with all
+        // indices 0: enough to be a mesh shader.
+        let mesh = {
+            let words = [
+                asm::vop1("v_mov_b32", 0, asm::imm(0)),
+                asm::exp(
+                    asm::target::PRIM,
+                    1,
+                    [0; 4],
+                    asm::ExpFlags {
+                        done: true,
+                        ..asm::ExpFlags::default()
+                    },
+                ),
+                vec![asm::S_ENDPGM],
+            ]
+            .concat();
+            let program = NativeProgram {
+                wave64: false,
+                vgprs: 8,
+                io: StageIo::Ms(crate::native::MeshIo {
+                    outputs: vec![],
+                    clip_cntl: 0,
+                    threads: 32,
+                    max_vertices: 24,
+                    max_primitives: 16,
+                    topology: 2,
+                    lds_bytes: 0,
+                }),
+                ..testkit::bare_program(HwStage::Ms, &asm::bytes(&words))
+            };
+            testkit::container(&program, &[], &[testkit::SV_POSITION])
+        };
+        // (container, the kind PSV0 and the program header name)
+        let cases = [
+            (testkit::ps_constant([0.0; 4]), 0u8),
+            (testkit::vs_fullscreen_triangle(), 1),
+            (testkit::cs_store_root_constant(), 5),
+            (mesh, 13),
+        ];
+        for (container, kind) in cases {
+            let out = translated(&container);
+            let host = Container::parse(&out.dxil).unwrap();
+            let parts: Vec<String> = host.parts.iter().map(|p| p.fourcc.to_string()).collect();
+            let mut want = vec!["SFI0", "ISG1", "OSG1", "PSV0", "HASH", "DXIL"];
+            if kind == 13 {
+                want.insert(3, "PSG1");
+            }
+            assert_eq!(parts, want, "kind {kind}");
+            assert_eq!(host.digest, container::hash(&out.dxil[20..]), "kind {kind}");
+            assert_eq!(host.part(FourCC::SFI0).unwrap().data.len(), 8);
+
+            // PSV0: the runtime info's size, then the info (version 2).
+            let psv = host.part(FourCC::PSV0).unwrap().data;
+            let info = &psv[4..];
+            let u32_at =
+                |d: &[u8], at: usize| u32::from_le_bytes(d[at..at + 4].try_into().unwrap());
+            assert_eq!(u32_at(psv, 0), 48, "kind {kind}");
+            assert_eq!(info[24], kind, "PSV0 shader stage");
+            match kind {
+                // Vertex: OutputPositionPresent.
+                1 => assert_eq!(info[0], 1),
+                // Compute: the thread-group size.
+                5 => assert_eq!([36, 40, 44].map(|at| u32_at(info, at)), [1, 1, 1]),
+                // Mesh: maximum vertices and primitives, the topology.
+                13 => {
+                    assert_eq!(info[12..16], [24, 0, 16, 0]);
+                    assert_eq!(info[27], 2);
+                    assert_eq!(u32_at(info, 36), 32);
+                }
+                _ => assert_eq!(info[..2], [0, 0], "no depth output, per pixel"),
+            }
+            // Signature counts in PSV0 match the signature parts.
+            let rows = |fourcc| u32_at(host.part(fourcc).unwrap().data, 0) as u8;
+            assert_eq!(
+                [info[28], info[29]],
+                [rows(FourCC::ISG1), rows(FourCC::OSG1)],
+                "kind {kind}"
+            );
+
+            // The program header: kind and shader model 6.6, the size in
+            // dwords, then the bitcode header.
+            let dxil = host.part(FourCC::DXIL).unwrap().data;
+            assert_eq!(u32_at(dxil, 0), u32::from(kind) << 16 | 0x66);
+            assert_eq!(u32_at(dxil, 4) as usize * 4, dxil.len());
+            assert_eq!(&dxil[8..12], b"DXIL");
+            assert_eq!(u32_at(dxil, 20) as usize, dxil.len() - 24);
+            assert_eq!(&dxil[24..28], b"BC\xC0\xDE");
+        }
+    }
+
+    /// `SFI0` names the optional features the module uses, and only those:
+    /// the runtime refuses a shader that uses one it does not declare, and
+    /// a device without a declared one refuses the shader.
+    #[test]
+    fn feature_bits_follow_what_the_program_uses() {
+        const TYPED_UAV_LOADS: u64 = 0x800;
+        const WAVE_OPS: u64 = 0x4000;
+        const INT64: u64 = 0x8000;
+        const RESOURCE_HEAP: u64 = 0x200_0000;
+        const SAMPLER_HEAP: u64 = 0x400_0000;
+        let none = asm::Vop3Mods::default();
+        let (v, s) = (asm::vgpr, asm::sgpr);
+        let cases: [(&str, Vec<u8>, u64); 7] = [
+            ("no resources", testkit::ps_constant([0.0; 4]), 0),
+            ("root constants only", testkit::ps_root_constants(), 0),
+            ("vertex id", testkit::vs_fullscreen_triangle(), 0),
+            // The UAV comes from the descriptor heap.
+            (
+                "a raw store",
+                testkit::cs_store_root_constant(),
+                RESOURCE_HEAP,
+            ),
+            (
+                "a 32 x 32 high product",
+                compute(&[
+                    asm::vop1("v_mov_b32", 1, s(0)),
+                    asm::vop1("v_mov_b32", 2, s(1)),
+                    asm::vop3("v_mul_hi_u32", 0, &[v(1), v(2)], none),
+                ]),
+                RESOURCE_HEAP | INT64,
+            ),
+            (
+                "another lane's value",
+                compute(&[
+                    asm::vop1("v_mov_b32", 1, s(0)),
+                    asm::vop3("v_readlane_b32", 6, &[v(1), asm::imm(0)], none),
+                    asm::vop1("v_mov_b32", 0, s(6)),
+                ]),
+                RESOURCE_HEAP | WAVE_OPS,
+            ),
+            (
+                "a typed load from a UAV",
+                testkit::container(
+                    &testkit::compute_with_uav(
+                        &[
+                            asm::vop1("v_mov_b32", 1, asm::imm(0)),
+                            asm::mubuf(
+                                "buffer_load_format_x",
+                                asm::Buffer {
+                                    vaddr: 1,
+                                    srsrc: 8,
+                                    idxen: true,
+                                    ..asm::Buffer::default()
+                                },
+                            ),
+                        ]
+                        .concat(),
+                    ),
+                    &[],
+                    &[],
+                ),
+                RESOURCE_HEAP | TYPED_UAV_LOADS,
+            ),
+        ];
+        for (name, container, want) in cases {
+            let out = translated(&container);
+            let host = Container::parse(&out.dxil).unwrap();
+            let sfi0 = host.part(FourCC::SFI0).unwrap().data;
+            let features = u64::from_le_bytes(sfi0.try_into().unwrap());
+            assert_eq!(features, want, "{name}: {features:#x}");
+            assert_eq!(features & SAMPLER_HEAP, 0, "{name}: no program samples");
+        }
+    }
 }
