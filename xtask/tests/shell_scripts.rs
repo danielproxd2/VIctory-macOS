@@ -1,6 +1,6 @@
 //! The shell scripts in tools/macos: that they parse, and the parts of
-//! gnullvm-cc.sh that can run without a compiler, with stand-ins for the
-//! programs it starts.
+//! test-wine.sh and gnullvm-cc.sh that can run without Wine or a compiler,
+//! with stand-ins for the programs they start.
 #![cfg(unix)]
 
 use std::fs;
@@ -118,4 +118,129 @@ fn gnullvm_cc_says_when_mingw_is_missing() {
         said.contains("mingw-w64") && said.contains("MINGW_PREFIX"),
         "{said}"
     );
+}
+
+/// Runs test-wine.sh with stand-ins for wine, rustc and cargo. The stand-in
+/// rustc answers the question about the target's library folder with
+/// `libdir`; the stand-in cargo writes what it was started with to the file
+/// the returned path names.
+fn test_wine(name: &str, libdir: &Path, args: &[&str]) -> (Output, PathBuf) {
+    let dir = scratch(name);
+    let log = dir.join("cargo.log");
+    script(&dir.join("bin/wine"), "exit 0");
+    script(
+        &dir.join("bin/rustc"),
+        &format!("echo '{}'", libdir.display()),
+    );
+    script(
+        &dir.join("bin/cargo"),
+        r#"{
+    printf '%s\n' "cargo $*"
+    printf '%s\n' "fixtures $VICTORY_FIXTURE_DIR"
+    printf '%s\n' "runner $CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_RUNNER"
+    [ ! -x "$CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_RUNNER" ] || echo "wrapper present"
+} >> "$STAND_IN_LOG""#,
+    );
+    let out = Command::new(root().join("tools/macos/test-wine.sh"))
+        .args(args)
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", dir.join("bin").display()),
+        )
+        .env("WINE", dir.join("bin/wine"))
+        .env("STAND_IN_LOG", &log)
+        .env_remove("WINEDLLOVERRIDES")
+        .output()
+        .unwrap();
+    (out, log)
+}
+
+/// The lines of the stand-in cargo's log that start with `key`, without it.
+fn logged(log: &Path, key: &str) -> Vec<String> {
+    let text = fs::read_to_string(log).unwrap();
+    text.lines()
+        .filter_map(|line| line.strip_prefix(key))
+        .map(|rest| rest.trim().to_owned())
+        .collect()
+}
+
+#[test]
+fn test_wine_says_when_the_rust_target_is_missing() {
+    let nowhere = scratch("test-wine-no-target-libdir").join("absent");
+    let (out, log) = test_wine("test-wine-no-target", &nowhere, &["-p", "victory-pe"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    let said = text(&out.stderr);
+    assert!(
+        said.contains("rustup target add x86_64-pc-windows-gnullvm"),
+        "{said}"
+    );
+    assert!(!log.exists(), "cargo must not be started");
+}
+
+/// The fixtures workspace is built once, in the tests' profile, the tests
+/// are told where it is in Wine's spelling, and the wrapper script is gone
+/// afterwards.
+#[test]
+fn test_wine_builds_the_fixtures_and_removes_its_wrapper() {
+    let libdir = scratch("test-wine-libdir");
+    let target = "x86_64-pc-windows-gnullvm";
+    let fixtures = format!(
+        "Z:{}\\target\\fixtures\\{target}",
+        root().display().to_string().replace('/', "\\")
+    );
+    for (name, args, profile) in [
+        ("test-wine-debug", &["-p", "victory-pe"][..], "debug"),
+        (
+            "test-wine-release",
+            &["--release", "-p", "victory-pe"][..],
+            "release",
+        ),
+        // After `--` the arguments are the test program's, not cargo's.
+        (
+            "test-wine-after-dashes",
+            &["-p", "victory-pe", "--", "--release"][..],
+            "debug",
+        ),
+    ] {
+        let (out, log) = test_wine(name, &libdir, args);
+        assert!(out.status.success(), "{name}: {}", text(&out.stderr));
+        let cargo = logged(&log, "cargo ");
+        assert_eq!(cargo.len(), 2, "{name}: {cargo:?}");
+        assert!(
+            cargo[0].starts_with("build ")
+                && cargo[0].contains("--manifest-path tests/fixtures/Cargo.toml")
+                && cargo[0].contains(&format!("--target {target}")),
+            "{name}: {cargo:?}"
+        );
+        assert_eq!(
+            cargo[0].contains("--release"),
+            profile == "release",
+            "{name}: {cargo:?}"
+        );
+        assert_eq!(
+            cargo[1],
+            format!("test --target {target} {}", args.join(" ")),
+            "{name}"
+        );
+        // Known to the test run; the fixture build comes before it.
+        let dirs = logged(&log, "fixtures ");
+        assert_eq!(dirs[1], format!("{fixtures}\\{profile}"), "{name}");
+        let runners = logged(&log, "runner ");
+        let runner = Path::new(&runners[1]);
+        assert_eq!(
+            logged(&log, "wrapper present").len(),
+            2,
+            "{name}: no wrapper"
+        );
+        assert!(
+            !runner.exists(),
+            "{name}: {} was left behind",
+            runner.display()
+        );
+        assert!(
+            !runner.parent().unwrap().exists(),
+            "{name}: {} was left behind",
+            runner.parent().unwrap().display()
+        );
+    }
 }

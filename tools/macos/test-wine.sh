@@ -9,11 +9,11 @@
 # VICTORY_REQUIRE_GPU=1 makes the tests that need a host D3D12 device fail
 # where there is none; otherwise they pass, each printing
 # "skipped: no host D3D12 device".
-# The stand-in title and its DLLs (tests/fixtures) are built here, once, and
-# VICTORY_FIXTURE_DIR tells the tests where they are: cargo cannot be started
-# inside Wine.
+# The stand-in title and its DLLs (tests/fixtures) are built here, once, in
+# the profile the tests are built in, and VICTORY_FIXTURE_DIR tells the tests
+# where they are: cargo cannot be started inside Wine.
 # Cargo splits the runner on spaces, so the runner is a wrapper script in a
-# temporary folder without spaces.
+# temporary folder without spaces, removed when this script ends.
 set -e
 cd "$(dirname "$0")/../.."
 ROOT="$PWD"
@@ -33,10 +33,29 @@ case "${WINEDLLOVERRIDES:-}" in
     *) [ ! -d "$(dirname "$WINE")/../lib/external/D3DMetal.framework" ] || D3DMETAL=";d3d12,d3d12core,dxgi=b" ;;
 esac
 TARGET=x86_64-pc-windows-gnullvm
-mkdir -p target/macos
+# Without the target's standard library the build fails on "can't find crate
+# for `core`", which does not say what to do.
+[ -d "$(rustc --print target-libdir --target "$TARGET" 2> /dev/null)" ] || {
+    echo "test-wine.sh: the Rust target $TARGET is not installed; run: rustup target add $TARGET" >&2
+    exit 1
+}
+# The fixtures follow the tests' profile.
+PROFILE=debug
+FIXTURE_PROFILE=
+for a in "$@"; do
+    case "$a" in
+        --) break ;;
+        --release | -r) PROFILE=release FIXTURE_PROFILE=--release ;;
+    esac
+done
 # A wrapper rather than a symlink: some Wine builds find their loader next
 # to the path they were started from.
-LINK="$(mktemp -d /tmp/victory-wine.XXXXXX)/wine"
+WRAPPER_DIR="$(mktemp -d /tmp/victory-wine.XXXXXX)"
+trap 'rm -rf "$WRAPPER_DIR"' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+LINK="$WRAPPER_DIR/wine"
 printf '#!/bin/sh\nexec "%s" "$@"\n' "$WINE" > "$LINK"
 chmod +x "$LINK"
 export WINEPREFIX="${WINEPREFIX:-$ROOT/target/wineprefix}"
@@ -48,7 +67,7 @@ export WINEDLLOVERRIDES="mscoree,mshtml=;winedbg.exe=d$D3DMETAL${WINEDLLOVERRIDE
 [ -z "${VICTORY_REQUIRE_GPU:-}" ] || export VICTORY_REQUIRE_GPU
 export CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_RUNNER="$LINK"
 cargo build --quiet --locked --manifest-path tests/fixtures/Cargo.toml \
-    --target-dir target/fixtures --target "$TARGET"
-VICTORY_FIXTURE_DIR="Z:$(printf '%s' "$ROOT" | tr / '\\')\\target\\fixtures\\$TARGET\\debug"
+    --target-dir target/fixtures --target "$TARGET" $FIXTURE_PROFILE
+VICTORY_FIXTURE_DIR="Z:$(printf '%s' "$ROOT" | tr / '\\')\\target\\fixtures\\$TARGET\\$PROFILE"
 export VICTORY_FIXTURE_DIR
 cargo test --target "$TARGET" "$@"
