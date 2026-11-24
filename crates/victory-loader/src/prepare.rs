@@ -178,9 +178,63 @@ fn write(bytes: &mut [u8], at: usize, v: &[u8]) -> Result<(), PrepareError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use victory_pe::ImportSymbol;
+    use victory_pe::testing::{PeBuilder, reloc, scn};
 
+    fn by_name(name: &str) -> ImportSymbol {
+        ImportSymbol::Name {
+            hint: 0,
+            name: name.to_owned(),
+        }
+    }
+
+    /// A signed-looking executable with code, imports from two DLLs and an
+    /// entry point; `.text` is at RVA 0x1000.
+    fn title() -> PeBuilder {
+        PeBuilder::new()
+            .entry_rva(0x1010)
+            .dll_characteristics(
+                dll_flags::DYNAMIC_BASE | dll_flags::NX_COMPAT | dll_flags::FORCE_INTEGRITY,
+            )
+            .section(".text", scn::CODE, &[0xC3; 0x40])
+            .import("alpha.dll", &[by_name("First"), ImportSymbol::Ordinal(7)])
+            .import("beta.dll", &[by_name("Second")])
+    }
+
+    /// [`title`] with two TLS callbacks and, if `page` is given, one base
+    /// relocation block with that page RVA holding a single DIR64 entry at
+    /// offset 0x18: the TLS directory's callbacks field when the page is
+    /// the directory's own. Returns the image and the directory's RVA.
+    fn tls_title(page: Option<u32>) -> (Vec<u8>, u32) {
+        let mut builder = title().tls_callbacks(&[0x1000, 0x1020]);
+        if let Some(page) = page {
+            builder = builder.reloc_block(
+                page,
+                &[(reloc::DIR64, layout::TLS64_ADDRESS_OF_CALLBACKS as u16)],
+            );
+        }
+        let built = builder.build().unwrap();
+        (built.bytes, built.tls_directory_rva.unwrap())
+    }
+
+    /// Page RVA of the TLS directory of [`tls_title`]. The builder places
+    /// base relocations last, so adding a block does not move the directory.
+    fn tls_directory_page() -> u32 {
+        let (_, directory_rva) = tls_title(None);
+        assert_eq!(directory_rva & 0xFFF, 0, "the directory starts its page");
+        directory_rva
+    }
+
+    /// File offset of the first entry of the first base relocation block.
+    fn first_relocation_entry(bytes: &[u8]) -> usize {
+        let directory = layout::data_directory_offset(bytes, dir::BASERELOC).unwrap();
+        let rva = layout::read_u32(bytes, directory).unwrap();
+        let info = ImageInfo::parse(bytes).unwrap();
+        info.rva_to_file_offset(rva).unwrap() as usize + 8
+    }
+
+    #[cfg(windows)]
     #[test]
-    #[cfg_attr(not(windows), ignore = "reads its own test binary as a PE file")]
     fn patches_own_test_binary() {
         let original = std::fs::read(std::env::current_exe().unwrap()).unwrap();
         let prepared = prepare(&original).unwrap();
@@ -208,9 +262,99 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(not(windows), ignore = "reads its own test binary as a PE file")]
+    fn patches_synthetic_image() {
+        let mut original = title().build().unwrap().bytes;
+        let opt = layout::optional_header_offset(&original).unwrap();
+        write_u32(&mut original, opt + layout::OPT_CHECKSUM, 0x1234_5678).unwrap();
+        // Stale bound-import data must not survive either.
+        let bound = layout::data_directory_offset(&original, dir::BOUND_IMPORT).unwrap();
+        write_u32(&mut original, bound, 0x1000).unwrap();
+        write_u32(&mut original, bound + 4, 8).unwrap();
+
+        let prepared = prepare(&original).unwrap();
+        assert!(!prepared.info.is_dll(), "info describes the original");
+        assert_eq!(prepared.info.entry_rva, 0x1010);
+        assert_eq!(prepared.info.import_count(), 3);
+        assert_eq!(prepared.original_hash, blake3::hash(&original));
+
+        let patched = ImageInfo::parse(&prepared.bytes).unwrap();
+        assert!(patched.is_dll());
+        assert_eq!(patched.entry_rva, 0);
+        assert!(patched.imports.is_empty());
+        assert_eq!(patched.dll_characteristics & dll_flags::FORCE_INTEGRITY, 0);
+        assert_eq!(
+            patched.dll_characteristics,
+            dll_flags::DYNAMIC_BASE | dll_flags::NX_COMPAT,
+            "the other flags are kept"
+        );
+        assert_eq!(
+            layout::read_u32(&prepared.bytes, opt + layout::OPT_CHECKSUM),
+            Some(0)
+        );
+        assert_eq!(layout::read_u64(&prepared.bytes, bound), Some(0));
+        // Nothing else moved: same sections, same size.
+        assert_eq!(patched.sections.len(), prepared.info.sections.len());
+        assert_eq!(patched.size_of_image, prepared.info.size_of_image);
+        assert_eq!(prepared.bytes.len(), original.len());
+    }
+
+    #[test]
+    fn an_image_without_imports_or_tls_is_still_prepared() {
+        let original = PeBuilder::new()
+            .entry_rva(0x1000)
+            .section(".text", scn::CODE, &[0xC3; 0x10])
+            .build()
+            .unwrap()
+            .bytes;
+        let prepared = prepare(&original).unwrap();
+        let patched = ImageInfo::parse(&prepared.bytes).unwrap();
+        assert!(patched.is_dll());
+        assert_eq!(patched.entry_rva, 0);
+        let directory = layout::data_directory_offset(&original, dir::IMPORT).unwrap();
+        assert_eq!(layout::read_u64(&prepared.bytes, directory), Some(0));
+    }
+
+    #[test]
+    fn synthetic_tls_callbacks_are_neutralised() {
+        let (original, directory_rva) = tls_title(Some(tls_directory_page()));
+
+        let prepared = prepare(&original).unwrap();
+        let tls = prepared.info.tls.as_ref().expect("info keeps the TLS data");
+        assert_eq!(tls.callback_rvas, [0x1000, 0x1020]);
+        assert_ne!(tls.callbacks_va, 0);
+
+        let patched = ImageInfo::parse(&prepared.bytes).unwrap();
+        let patched_tls = patched.tls.as_ref().expect("the directory stays");
+        assert_eq!(patched_tls.directory_rva, directory_rva);
+        assert_eq!(patched_tls.callbacks_va, 0);
+        assert!(patched_tls.callback_rvas.is_empty());
+        let field = directory_rva + layout::TLS64_ADDRESS_OF_CALLBACKS as u32;
+        assert!(
+            dir64_relocations(&original, &prepared.info)
+                .iter()
+                .any(|&(_, target)| target == field),
+            "the original relocates the callbacks field"
+        );
+        assert!(
+            dir64_relocations(&prepared.bytes, &patched)
+                .iter()
+                .all(|&(_, target)| target != field),
+            "the cleared callback pointer must not be relocated"
+        );
+        // The callback array itself is left in place; only the pointer to
+        // it is gone.
+        let array = u32::try_from(tls.callbacks_va - prepared.info.image_base).unwrap();
+        let at = patched.rva_to_file_offset(array).unwrap() as usize;
+        assert_eq!(
+            layout::read_u64(&prepared.bytes, at),
+            Some(prepared.info.image_base + 0x1000)
+        );
+        assert_eq!(prepared.bytes.len(), original.len());
+    }
+
+    #[test]
     fn keeps_iat_slots_when_import_size_excludes_the_terminator() {
-        let mut original = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let mut original = title().build().unwrap().bytes;
         let info = ImageInfo::parse(&original).unwrap();
         let directory = layout::data_directory_offset(&original, dir::IMPORT).unwrap();
         // This linker layout counts the descriptors for real modules only.
@@ -232,6 +376,7 @@ mod tests {
             &[0; 20]
         );
         let iat = layout::data_directory_offset(&original, dir::IAT).unwrap();
+        assert_ne!(layout::read_u64(&original, iat), Some(0));
         assert_eq!(
             &prepared.bytes[iat..iat + layout::DATA_DIRECTORY_SIZE],
             &original[iat..iat + layout::DATA_DIRECTORY_SIZE]
@@ -240,6 +385,7 @@ mod tests {
         for module in &prepared.info.imports {
             for entry in &module.entries {
                 let at = info.rva_to_file_offset(entry.iat_slot_rva).unwrap() as usize;
+                assert_ne!(layout::read_u64(&original, at), Some(0));
                 assert_eq!(&prepared.bytes[at..at + 8], &original[at..at + 8]);
             }
         }
@@ -277,73 +423,35 @@ mod tests {
         );
     }
 
-    /// A synthetic PE32+ DLL with a TLS callback array and one base
-    /// relocation block whose page RVA is `page`, holding a single DIR64
-    /// entry at offset 0x18: the TLS directory's callbacks field when the
-    /// page is the directory's own.
-    fn synthetic_tls_image(page: u32) -> Vec<u8> {
-        let mut d = vec![0u8; 0x200];
-        let put = |d: &mut Vec<u8>, at: usize, v: &[u8]| d[at..at + v.len()].copy_from_slice(v);
-        put(&mut d, 0, b"MZ");
-        put(&mut d, 0x3C, &0x40u32.to_le_bytes());
-        put(&mut d, 0x40, b"PE\0\0");
-        put(&mut d, 0x44, &0x8664u16.to_le_bytes());
-        put(&mut d, 0x46, &1u16.to_le_bytes());
-        put(&mut d, 0x54, &240u16.to_le_bytes());
-        put(&mut d, 0x56, &0x2022u16.to_le_bytes());
-        let opt = 0x58;
-        put(&mut d, opt, &0x20Bu16.to_le_bytes());
-        put(&mut d, opt + 24, &0x1_8000_0000u64.to_le_bytes());
-        put(&mut d, opt + 32, &0x1000u32.to_le_bytes());
-        put(&mut d, opt + 36, &0x200u32.to_le_bytes());
-        put(&mut d, opt + 56, &0x2000u32.to_le_bytes());
-        put(&mut d, opt + 60, &0x200u32.to_le_bytes());
-        put(&mut d, opt + 108, &16u32.to_le_bytes());
-        let dirs = opt + 112;
-        put(&mut d, dirs + 5 * 8, &0x1080u32.to_le_bytes()); // base relocations
-        put(&mut d, dirs + 5 * 8 + 4, &10u32.to_le_bytes());
-        put(&mut d, dirs + 9 * 8, &0x1000u32.to_le_bytes()); // TLS
-        put(&mut d, dirs + 9 * 8 + 4, &40u32.to_le_bytes());
-        let sec = opt + 240;
-        put(&mut d, sec, b".data");
-        put(&mut d, sec + 8, &0x200u32.to_le_bytes());
-        put(&mut d, sec + 12, &0x1000u32.to_le_bytes());
-        put(&mut d, sec + 16, &0x200u32.to_le_bytes());
-        put(&mut d, sec + 20, &0x200u32.to_le_bytes());
-        let mut body = vec![0u8; 0x200];
-        // TLS directory: callbacks at VA base + 0x1100, then a null entry.
-        body[24..32].copy_from_slice(&0x1_8000_1100u64.to_le_bytes());
-        body[0x100..0x108].copy_from_slice(&0x1_8000_1000u64.to_le_bytes());
-        body[0x80..0x84].copy_from_slice(&page.to_le_bytes());
-        body[0x84..0x88].copy_from_slice(&10u32.to_le_bytes());
-        body[0x88..0x8A].copy_from_slice(&0xA018u16.to_le_bytes());
-        d.extend_from_slice(&body);
-        d
-    }
-
     #[test]
     fn a_relocation_page_near_4_gib_does_not_overflow() {
         // Header values are untrusted: page + offset used to overflow u32.
-        let original = synthetic_tls_image(0xFFFF_FFFF);
+        let (original, _) = tls_title(Some(0xFFFF_FFFF));
+        let entry = first_relocation_entry(&original);
+        let dir64 = (u16::from(reloc::DIR64) << 12 | 0x18).to_le_bytes();
+        assert_eq!(original[entry..entry + 2], dir64);
         let prepared = prepare(&original).expect("prepare must not panic");
-        assert_eq!(
-            prepared.info.tls.as_ref().unwrap().callbacks_va,
-            0x1_8000_1100
-        );
+        assert_ne!(prepared.info.tls.as_ref().unwrap().callbacks_va, 0);
         // The entry is left alone: it names no field of the image.
-        assert_eq!(prepared.bytes[0x288..0x28A], 0xA018u16.to_le_bytes());
+        assert_eq!(prepared.bytes[entry..entry + 2], dir64);
         // On the directory's own page it is the callbacks field's
         // relocation, and is turned into a no-op.
-        let prepared = prepare(&synthetic_tls_image(0x1000)).unwrap();
-        assert_eq!(prepared.bytes[0x288..0x28A], [0, 0]);
+        let (original, _) = tls_title(Some(tls_directory_page()));
+        assert_eq!(first_relocation_entry(&original), entry);
+        let prepared = prepare(&original).unwrap();
+        assert_eq!(prepared.bytes[entry..entry + 2], [0, 0]);
     }
 
     #[test]
-    #[cfg_attr(not(windows), ignore = "reads its own test binary as a PE file")]
     fn file_name_is_stable_per_build() {
-        let original = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let original = title().build().unwrap().bytes;
         let a = prepare(&original).unwrap();
         let b = prepare(&original).unwrap();
         assert_eq!(a.file_name(), b.file_name());
+        assert!(a.file_name().starts_with("victory-image-"));
+        assert!(a.file_name().ends_with(".dll"));
+        // Another build gets another name.
+        let other = title().timestamp(1).build().unwrap().bytes;
+        assert_ne!(prepare(&other).unwrap().file_name(), a.file_name());
     }
 }
