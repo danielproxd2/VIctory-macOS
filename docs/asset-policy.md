@@ -34,6 +34,9 @@ by the project owner's decision (2026-11-23), entered as an exception in
 repository's licence does not cover them. Nothing else of this kind is
 accepted.
 
+The entry pins the file's length and hash, so anything else at that path
+fails the check.
+
 ## Where data lives
 
 Outside the repository, configured in `victory.toml`: `game_dir` (the
@@ -46,8 +49,9 @@ user's dump), `test_titles`, and `cache_dir` for everything derived
 2. `cargo xtask policy` (run by the pre-commit hook; install with
    `cargo xtask install-hooks`) is an allowlist: files must have an allowed
    type, be under 512 KiB, contain no binary data or known binary
-   signatures, and hold no long hex/base64 runs. Exceptions need an entry
-   with a reason in `xtask/src/policy.rs`.
+   signatures, and hold no long hex/base64 runs. Pictures of our own in
+   `docs/images` are the only binary type. Exceptions need an entry in
+   `xtask/src/policy.rs` with a reason and the file's length and hash.
 3. At runtime, everything that writes derived data calls
    `victory_core::ensure_outside_repo`.
 4. Tests that need real files take their paths from environment variables

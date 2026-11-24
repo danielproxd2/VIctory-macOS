@@ -27,11 +27,28 @@ const ALLOWED_NAMES: &[&str] = &[
     "LICENSE-APACHE",
 ];
 
-/// Paths explicitly exempted, with a reason. Keep this empty if at all possible.
-const EXCEPTIONS: &[(&str, &str)] = &[(
-    "crates/victory-formats/src/bcpack-tables.bin",
-    "the BCPack format's constant tables: nothing decodes without them and they cannot be derived (owner's decision, 2026-11-23; docs/asset-policy.md)",
-)];
+/// A path exempted from the checks, as one exact file.
+pub(crate) struct Exception {
+    pub path: &'static str,
+    /// Why the file is here. Read by people, not by the check.
+    #[allow(dead_code)]
+    pub reason: &'static str,
+    /// The file's length in bytes.
+    pub len: usize,
+    /// FNV-1a of the file, as `embed_clamp::fnv` computes it. It pins the
+    /// content against a slip, not against an attacker.
+    pub fnv: u64,
+}
+
+/// Paths explicitly exempted, with a reason. Keep this empty if at all
+/// possible. An entry names one exact file: anything else at its path
+/// fails.
+const EXCEPTIONS: &[Exception] = &[Exception {
+    path: "crates/victory-formats/src/bcpack-tables.bin",
+    reason: "the BCPack format's constant tables: nothing decodes without them and they cannot be derived (owner's decision, 2026-11-23; docs/asset-policy.md)",
+    len: 77982,
+    fnv: 0x4808703315eae4f0,
+}];
 
 /// Signatures of formats that must never be committed.
 const FORBIDDEN_MAGIC: &[(&[u8], &str)] = &[
@@ -57,12 +74,13 @@ const RASTER_SIGNATURES: &[(&[&str], &[&[u8]])] = &[
 ];
 
 pub fn run(root: &Path, staged: bool) -> Result<()> {
+    run_with(root, staged, EXCEPTIONS)
+}
+
+fn run_with(root: &Path, staged: bool, exceptions: &[Exception]) -> Result<()> {
     let files = list_files(root, staged)?;
     let mut violations = Vec::new();
     for path in &files {
-        if EXCEPTIONS.iter().any(|(p, _)| p == path) {
-            continue;
-        }
         let content = if staged {
             let out = Command::new("git")
                 .args(["show", &format!(":{path}")])
@@ -91,7 +109,11 @@ pub fn run(root: &Path, staged: bool) -> Result<()> {
                 Err(e) => return Err(e).with_context(|| format!("reading {path}")),
             }
         };
-        for problem in check(path, &content) {
+        let problems = match exceptions.iter().find(|e| e.path == path) {
+            Some(exception) => check_exception(exception, &content),
+            None => check(path, &content),
+        };
+        for problem in problems {
             violations.push(format!("{path}: {problem}"));
         }
     }
@@ -184,6 +206,26 @@ fn list_files(root: &Path, staged: bool) -> Result<Vec<String>> {
             })
         })
         .collect())
+}
+
+/// An exempted path passes only as the file its entry pins.
+fn check_exception(exception: &Exception, content: &[u8]) -> Vec<String> {
+    let mut problems = Vec::new();
+    if content.len() != exception.len {
+        problems.push(format!(
+            "exception pinned at {} bytes, found {}",
+            exception.len,
+            content.len()
+        ));
+    }
+    let found = crate::embed_clamp::fnv(content);
+    if found != exception.fnv {
+        problems.push(format!(
+            "exception pinned at hash 0x{:016x}, found 0x{found:016x}",
+            exception.fnv
+        ));
+    }
+    problems
 }
 
 /// All problems with one file. Pure, for testing.
@@ -347,6 +389,62 @@ mod tests {
         untracked.expect("an untracked nested repository");
         staged.expect("a staged link to a nested repository");
         tracked.expect("a tracked link to a nested repository");
+    }
+
+    /// An exception is one exact file: the same path with other content,
+    /// or with more of it, fails, staged or not.
+    #[test]
+    #[cfg(unix)]
+    fn an_exception_is_pinned_to_its_length_and_hash() {
+        let pinned = b"\0tables\0".to_vec();
+        let exceptions = [super::Exception {
+            path: "data/tables.bin",
+            reason: "a test",
+            len: pinned.len(),
+            fnv: crate::embed_clamp::fnv(&pinned),
+        }];
+        let mut modified = pinned.clone();
+        modified[3] ^= 1;
+        let mut grown = pinned.clone();
+        grown.push(0);
+        let mut results = Vec::new();
+        for content in [&pinned, &modified, &grown] {
+            let dir = scratch("pinned");
+            git(&dir, &["init", "-q"]);
+            std::fs::create_dir_all(dir.join("data")).unwrap();
+            std::fs::write(dir.join("data/tables.bin"), content).unwrap();
+            let untracked = super::run_with(&dir, false, &exceptions);
+            git(&dir, &["add", "-A"]);
+            let staged = super::run_with(&dir, true, &exceptions);
+            let _ = std::fs::remove_dir_all(&dir);
+            results.push((untracked.is_ok(), staged.is_ok()));
+        }
+        assert_eq!(results[0], (true, true), "the pinned file");
+        assert_eq!(results[1], (false, false), "a modified file");
+        assert_eq!(results[2], (false, false), "a grown file");
+        // Without its entry the same file is an ordinary violation.
+        let dir = scratch("unpinned");
+        std::fs::write(dir.join("tables.bin"), &pinned).unwrap();
+        let unlisted = super::run_with(&dir, false, &exceptions);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(unlisted.is_err(), "the file at another path");
+    }
+
+    /// The length and hash checks report separately.
+    #[test]
+    fn an_exception_reports_what_differs() {
+        let exception = super::Exception {
+            path: "x.bin",
+            reason: "a test",
+            len: 3,
+            fnv: crate::embed_clamp::fnv(b"abc"),
+        };
+        assert!(super::check_exception(&exception, b"abc").is_empty());
+        let same_length = super::check_exception(&exception, b"abd");
+        assert_eq!(same_length.len(), 1, "{same_length:?}");
+        assert!(same_length[0].contains("hash"), "{same_length:?}");
+        let longer = super::check_exception(&exception, b"abcd");
+        assert!(longer.iter().any(|p| p.contains("bytes")), "{longer:?}");
     }
 
     /// Enforces the policy wherever tests run, even in clones without the hook.
