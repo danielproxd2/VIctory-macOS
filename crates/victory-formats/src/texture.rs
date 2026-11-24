@@ -984,6 +984,56 @@ mod tests {
         }
     }
 
+    /// Tiny and odd sizes, below the block and below the tail, in every
+    /// addressable mode, as 1D, 2D arrays and 3D, plain and block-compressed:
+    /// every element still gets its own address inside the texture.
+    #[test]
+    fn edge_sizes_keep_addresses_distinct() {
+        let sizes = [1u32, 3, 4, 17, 33];
+        for swizzle in [1u32, 2, 5, 6, 9, 10] {
+            for dimension in [Dimension::Tex1d, Dimension::Tex2d, Dimension::Tex3d] {
+                if dimension == Dimension::Tex3d && !matches!(swizzle, 5 | 9) {
+                    continue;
+                }
+                for (w, h) in sizes.into_iter().flat_map(|w| sizes.map(|h| (w, h))) {
+                    for (bytes, block) in [(1, 1), (4, 1), (16, 1), (8, 4), (16, 4)] {
+                        let d = Desc {
+                            dimension,
+                            width: w,
+                            height: if dimension == Dimension::Tex1d { 1 } else { h },
+                            depth: if dimension == Dimension::Tex1d { 1 } else { 3 },
+                            mips: 7,
+                            element_bytes: bytes,
+                            block,
+                            samples: 1,
+                            swizzle: Swizzle(swizzle),
+                        };
+                        let l = Layout::new(&d).unwrap();
+                        let mut seen = vec![false; l.size as usize];
+                        let slices = if dimension == Dimension::Tex3d { 1 } else { 3 };
+                        for slice in 0..slices.min(d.depth) {
+                            for mip in 0..d.mips {
+                                let m = l.mips[mip as usize];
+                                for (z, y, x) in (0..m.depth).flat_map(|z| {
+                                    (0..m.height)
+                                        .flat_map(move |y| (0..m.width).map(move |x| (z, y, x)))
+                                }) {
+                                    let at = l.offset(mip, x, y, slice + z).unwrap() as usize;
+                                    let n = bytes as usize;
+                                    assert!(at + n <= seen.len(), "{d:?} mip {mip} outside");
+                                    for b in &mut seen[at..at + n] {
+                                        assert!(!*b, "{d:?} mip {mip} ({x},{y},{z}) overlaps");
+                                        *b = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Hand-checked: in a 64 KiB `D` block of 4-byte elements, x bits go to
     /// address bits 2, 3, 6, 9, 11, 13, 15 and y bits to 4, 5, 7, 8, 10, 12,
     /// 14; a 4 KiB `S` block of 16-byte elements is 16x16 with y first.
