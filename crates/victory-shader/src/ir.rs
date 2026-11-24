@@ -823,6 +823,10 @@ fn effects(
             if name.starts_with("v_interp_") || src_indexed || dst_indexed {
                 r.push(Reg::S(M0));
             }
+            // The per-lane select is VCC, which the encoding does not name.
+            if matches!(name, "v_div_fmas_f32" | "v_div_fmas_f64") {
+                r.extend(mask(VCC));
+            }
         }
         Fields::Vintrp { dst, src, .. } => {
             regs(src, &mut r)?;
@@ -1191,6 +1195,20 @@ mod tests {
                 what: "s_movrels_b32"
             })
         );
+    }
+
+    #[test]
+    fn div_fmas_reads_vcc_as_its_lane_select() {
+        // v_div_fmas_f32 v0, v1, v2, v3: lanes whose VCC bit is set scale the result.
+        for (wave64, lanes) in [(false, 1), (true, 2)] {
+            let p = build_words(&[0xD56F_0000, 0x040C_0501, S_ENDPGM], wave64);
+            let fmas = &p.blocks[0].insts[0];
+            assert_eq!(fmas.name(), "v_div_fmas_f32");
+            for i in 0..lanes {
+                assert!(fmas.read(Reg::S(VCC + i)).is_some(), "vcc dword {i}");
+            }
+            assert_eq!(fmas.read(Reg::S(VCC + lanes)), None);
+        }
     }
 
     #[test]
