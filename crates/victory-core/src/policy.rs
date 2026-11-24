@@ -65,6 +65,10 @@ pub fn ensure_outside_repo(path: &Path) -> Result<(), PolicyError> {
 /// Canonicalizes the longest existing prefix of `path` and re-appends the
 /// rest, so that paths which do not exist yet can still be compared.
 fn resolve(path: &Path) -> Result<PathBuf, PolicyError> {
+    resolve_at(path, 0)
+}
+
+fn resolve_at(path: &Path, depth: u32) -> Result<PathBuf, PolicyError> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -89,6 +93,21 @@ fn resolve(path: &Path) -> Result<PathBuf, PolicyError> {
             }
             Err(source) => match (existing.parent(), existing.file_name()) {
                 (Some(parent), Some(name)) => {
+                    // A dangling symlink does not canonicalize, yet creating
+                    // a file through it creates the file at its target.
+                    if let Ok(target) = std::fs::read_link(existing) {
+                        if depth >= 40 {
+                            return Err(PolicyError::Io {
+                                path: path.to_path_buf(),
+                                source,
+                            });
+                        }
+                        let mut out = resolve_at(&parent.join(target), depth + 1)?;
+                        for component in rest.iter().rev() {
+                            out.push(component);
+                        }
+                        return Ok(normalize(&out));
+                    }
                     rest.push(name.to_os_string());
                     existing = parent;
                 }
@@ -149,6 +168,25 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join(ROOT_MARKER), "").unwrap();
         assert!(ensure_outside_repo(&tmp.path().join("cache")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_dangling_symlink_into_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = compiled_workspace_root()
+            .join("not-yet-created")
+            .join("out");
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(matches!(
+            ensure_outside_repo(&link),
+            Err(PolicyError::InsideRepo { .. })
+        ));
+        assert!(matches!(
+            ensure_outside_repo(&link.join("sub")),
+            Err(PolicyError::InsideRepo { .. })
+        ));
     }
 
     #[test]
