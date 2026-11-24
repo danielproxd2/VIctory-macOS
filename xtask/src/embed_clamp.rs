@@ -230,8 +230,10 @@ mod tests {
         );
     }
 
-    /// The same FNV-1a as `victory-gpu`'s `indirect::fnv`, whose test holds
-    /// these vectors too (the published ones for the 64-bit hash).
+    /// The same FNV-1a as `victory-gpu`'s `indirect::fnv`. That crate's
+    /// `indirect::tests::fnv_matches_embed_clamp` holds these vectors too
+    /// (the published ones for the 64-bit hash), so the two cannot drift
+    /// apart without one of the tests failing.
     #[test]
     fn fnv_matches_the_gpu_crates_source_hash() {
         assert_eq!(fnv(b""), 0xcbf2_9ce4_8422_2325);
