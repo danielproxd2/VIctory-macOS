@@ -854,6 +854,8 @@ fn effects(
                 r.push(Reg::S(M0));
             }
         }
+        // `buffer_gl*_inv`: no operands, their descriptor fields are zero.
+        Fields::Buffer { .. } if name.ends_with("_inv") => {}
         Fields::Buffer {
             data,
             addr,
@@ -1209,6 +1211,18 @@ mod tests {
             }
             assert_eq!(fmas.read(Reg::S(VCC + lanes)), None);
         }
+    }
+
+    #[test]
+    fn cache_invalidates_read_no_resource() {
+        // buffer_gl0_inv has no operands: its descriptor fields are zero, not s0-s3.
+        let p = build_words(&[0xE1C4_0000, 0, S_ENDPGM], false);
+        assert_eq!(p.blocks[0].insts[0].name(), "buffer_gl0_inv");
+        assert!(
+            !p.inputs.iter().any(|i| matches!(i.0, Reg::S(0..=3))),
+            "{:?}",
+            p.inputs
+        );
     }
 
     #[test]
