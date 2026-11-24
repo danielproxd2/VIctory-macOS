@@ -5,10 +5,14 @@
 # against the Homebrew mingw-w64 runtime, and MinGW's libgcc_eh stands in for
 # LLVM's libunwind (both export the same _Unwind_* functions).
 M="${MINGW_PREFIX:-/opt/homebrew/opt/mingw-w64/toolchain-x86_64}"
-GCC_LIB="$(ls -d "$M"/lib/gcc/x86_64-w64-mingw32/* | tail -n 1)"
+# The newest GCC's folder, by version: 15.2.0 comes after 9.3.0.
+GCC_LIB="$(ls -d "$M"/lib/gcc/x86_64-w64-mingw32/* 2> /dev/null | sort -V | tail -n 1)"
+[ -d "$GCC_LIB" ] || {
+    echo "gnullvm-cc.sh: no MinGW runtime under $M (install it with: brew install mingw-w64, or set MINGW_PREFIX)" >&2
+    exit 1
+}
 LLVM="${LLVM_PREFIX:-/opt/homebrew/opt/llvm}"
 LLD="${LLD_PREFIX:-/opt/homebrew/opt/lld}"
-args=""
 for a in "$@"; do
     case "$a" in
         -lunwind) set -- "$@" -lgcc_eh -lgcc ;;
