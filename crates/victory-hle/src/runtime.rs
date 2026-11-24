@@ -101,7 +101,7 @@ impl Title {
             id: id.unwrap_or(0),
             store_id: get("Game/StoreId").unwrap_or_default().to_owned(),
             storage: PathBuf::new(),
-            storage_bytes: storage_mb.unwrap_or(0) << 20,
+            storage_bytes: storage_mb.map_or(0, |mb: u64| mb.saturating_mul(1 << 20)),
         }
     }
 
@@ -228,5 +228,13 @@ mod tests {
         assert_eq!((t.id, t.storage_bytes), (0x639A_A8DD, 1024 << 20));
         assert_eq!(t.store_id, "9&C");
         assert_eq!(Title::from_manifest("").storage_bytes, 0);
+    }
+
+    #[test]
+    fn a_huge_storage_quota_does_not_wrap() {
+        // 2^44 MiB is 2^64 bytes: a plain shift wraps to 0 ("no quota").
+        let text = "<Game><PersistentLocalStorage><SizeMB>17592186044416</SizeMB>\
+                    </PersistentLocalStorage></Game>";
+        assert_eq!(Title::from_manifest(text).storage_bytes, u64::MAX);
     }
 }
