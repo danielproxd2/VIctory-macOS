@@ -21,7 +21,7 @@ use windows::core::Interface;
 
 use crate::host::HostList;
 use crate::object::This;
-use crate::pipeline::host::HostPipeline;
+use crate::pipeline::host::{HostPipeline, Input};
 
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
@@ -883,10 +883,14 @@ impl State {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return false;
         };
+        self.rectangles_of(list, &p.inputs, count, first)
+    }
+
+    /// As [`State::rectangles`], for a pipeline reading `inputs`.
+    fn rectangles_of(&self, list: &HostList, inputs: &[Input], count: u32, first: u32) -> bool {
         let rects = u64::from(count / 3);
         for slot in 0..32 {
-            let elements: Vec<(u32, u32)> = p
-                .inputs
+            let elements: Vec<(u32, u32)> = inputs
                 .iter()
                 .filter(|e| e.slot == slot && !e.per_instance)
                 .map(|e| (e.offset, e.format))
@@ -1233,4 +1237,90 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Rectangle draws are taken only when their vertices lie inside the
+    /// bound buffer. The title's first vertex, count and stride are 32 bits
+    /// each and its buffer address 64: sums and products that pass 32 or 64
+    /// bits are refused, not wrapped into range.
+    #[test]
+    fn rectangle_vertices_must_lie_inside_their_buffer() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let list = host.new_list().unwrap();
+        // A title buffer of float2 positions, 8 bytes each.
+        let memory = vec![0u8; 4096];
+        let address = memory.as_ptr() as u64;
+        let resource = address as usize;
+        crate::shadow::register(resource, address, 4096);
+        let inputs = [Input {
+            slot: 0,
+            offset: 0,
+            format: 16,
+            per_instance: false,
+        }];
+        let ran = |view: VertexView, count: u32, first: u32| {
+            let mut state = State::default();
+            state.vertex[0] = view;
+            // A slot the pipeline does not read is never looked at.
+            state.vertex[1] = VertexView {
+                address: 1,
+                size: u32::MAX,
+                stride: u32::MAX,
+            };
+            state.rectangles_of(&list, &inputs, count, first)
+        };
+        let view = |size| VertexView {
+            address,
+            size,
+            stride: 8,
+        };
+
+        assert!(ran(view(4096), 6, 3));
+        assert!(ran(view(72), 6, 3), "the last vertex ends the buffer");
+        assert!(!ran(view(71), 6, 3), "the last vertex is cut short");
+        assert!(!ran(view(4096), 6, 510), "past the end");
+
+        // first + count wraps to 3 in 32 bits.
+        assert!(!ran(view(4096), 6, u32::MAX - 2));
+        // (first + count) * stride passes 64 bits.
+        let huge = VertexView {
+            address,
+            size: u32::MAX,
+            stride: u32::MAX,
+        };
+        assert!(!ran(huge, u32::MAX, u32::MAX));
+        // address + first * stride passes 64 bits.
+        let high = VertexView {
+            address: u64::MAX - 8,
+            size: 4096,
+            stride: 8,
+        };
+        assert!(!ran(high, 3, 2));
+
+        assert!(!ran(
+            VertexView {
+                address: 0,
+                ..view(4096)
+            },
+            6,
+            3
+        ));
+        assert!(!ran(
+            VertexView {
+                stride: 0,
+                ..view(4096)
+            },
+            6,
+            3
+        ));
+
+        drop(list);
+        crate::shadow::unregister(resource, address);
+    }
 }
