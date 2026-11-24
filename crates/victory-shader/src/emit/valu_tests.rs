@@ -12,49 +12,30 @@ use crate::native::{
 };
 use crate::{io, ir, resource, structure};
 
-const S_ENDPGM: u32 = 0xBF81_0000;
+use crate::gfx10::Encoding;
+use crate::gfx10::asm::{self, Buffer, NULL, S_ENDPGM, Src, Vop3Mods, imm};
 
-/// SOP1 `s_mov_b32 sdst, src0`.
-const fn s_mov_b32(sdst: u8, src0: u8) -> u32 {
-    0xBE80_0000 | (sdst as u32) << 16 | 0x03 << 8 | src0 as u32
-}
+// The encoders the tests below call with opcode numbers: thin wrappers over
+// the shared assembler, which takes names.
 
 /// SOP2 `op sdst, src0, src1`.
-const fn sop2(op: u8, sdst: u8, src0: u8, src1: u8) -> u32 {
-    0x8000_0000
-        | (op as u32 & 0x7F) << 23
-        | (sdst as u32 & 0x7F) << 16
-        | (src1 as u32) << 8
-        | src0 as u32
-}
-
-/// SMEM `s_load_dwordx4 s[dst:dst+3], s[base:base+1], 0` (soffset = null).
-const fn s_load_dwordx4(dst: u8, base: u8) -> [u32; 2] {
-    [
-        0x3D << 26 | 0x02 << 18 | (dst as u32) << 6 | (base as u32 >> 1),
-        125 << 25,
-    ]
+fn sop2(op: u8, sdst: u8, src0: u8, src1: u8) -> u32 {
+    let name = asm::mnemonic(Encoding::Sop2, op.into());
+    asm::sop2(name, sdst, Src::code(src0.into()), Src::code(src1.into()))[0]
 }
 
 /// VOP1 `op vdst, src0` (`src0`: 0..105 = SGPR, 256..511 = VGPR).
-const fn vop1(op: u16, vdst: u8, src0: u16) -> u32 {
-    0x7E00_0000 | (vdst as u32) << 17 | (op as u32) << 9 | (src0 as u32 & 0x1FF)
+fn vop1(op: u16, vdst: u8, src0: u16) -> u32 {
+    asm::vop1(asm::mnemonic(Encoding::Vop1, op), vdst, Src::code(src0))[0]
 }
 
 /// VOP3 `op vdst, src0, src1, src2` (no modifiers).
-const fn vop3(op: u16, vdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
-    [
-        0x35 << 26 | (op as u32 & 0x3FF) << 16 | vdst as u32,
-        (src0 as u32 & 0x1FF) | (src1 as u32 & 0x1FF) << 9 | (src2 as u32 & 0x1FF) << 18,
-    ]
-}
-
-/// MUBUF `buffer_store_dword vdata, off, s[srsrc:srsrc+3], 0 offset:byte_off`.
-const fn buffer_store_dword(vdata: u8, srsrc: u8, byte_off: u16) -> [u32; 2] {
-    [
-        0x38 << 26 | 0x1C << 18 | (byte_off as u32 & 0xFFF),
-        0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8,
-    ]
+fn vop3(op: u16, vdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
+    let name = asm::mnemonic(Encoding::Vop3, op);
+    let srcs = [src0, src1, src2].map(Src::code);
+    asm::vop3(name, vdst, &srcs, Vop3Mods::default())
+        .try_into()
+        .expect("no literal")
 }
 
 const fn sgpr(n: u8) -> u16 {
@@ -71,18 +52,25 @@ const fn vgpr(n: u8) -> u16 {
 fn build_valu_cs(body: &[u32]) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
-    words.push(s_mov_b32(5, 0x80)); // inline constant 0
-    words.extend_from_slice(&s_load_dwordx4(8, 4));
+    words.extend(asm::sop1("s_mov_b32", 5, imm(0)));
+    words.extend(asm::smem("s_load_dwordx4", 8, 4, 0, NULL));
     // Copy root constants s0..s3 into v1..v4 so VALU instructions operate on
     // VGPRs just as they do in real shaders.
     for i in 0..4u8 {
-        words.push(vop1(0x001, i + 1, sgpr(i))); // v_mov_b32
+        words.extend(asm::vop1("v_mov_b32", i + 1, asm::sgpr(i)));
     }
     words.extend_from_slice(body);
-    words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+    // buffer_store_dword v0, off, s[8:11], 0
+    words.extend(asm::mubuf(
+        "buffer_store_dword",
+        Buffer {
+            srsrc: 8,
+            ..Buffer::default()
+        },
+    ));
     words.push(S_ENDPGM);
 
-    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let code = asm::bytes(&words);
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
