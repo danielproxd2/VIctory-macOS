@@ -896,15 +896,17 @@ impl State {
             }
             let v = self.vertex[slot as usize];
             let stride = u64::from(v.stride);
-            let from = v.address + u64::from(first) * stride;
-            if v.address == 0
-                || stride == 0
-                || (u64::from(first) + u64::from(count)) * stride > u64::from(v.size)
-                || crate::shadow::find(from, rects * 3 * stride).is_none()
-            {
+            // The title's first vertex, count and stride are each 32 bits:
+            // their sum and products are checked, never wrapped.
+            let from = (u64::from(first) + u64::from(count))
+                .checked_mul(stride)
+                .filter(|end| v.address != 0 && stride != 0 && *end <= u64::from(v.size))
+                .and_then(|_| v.address.checked_add(u64::from(first) * stride))
+                .filter(|from| crate::shadow::find(*from, rects * 3 * stride).is_some());
+            let Some(from) = from else {
                 once!(slot, "rectangle vertices outside their buffer");
                 return false;
-            }
+            };
             let Some((gpu, to)) = list.scratch(rects * 6 * stride) else {
                 return false;
             };
