@@ -186,7 +186,7 @@ pub(crate) fn pipeline(
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let (Some(dir), Some(library)) = (DIR.get(), library()) else {
+    let Some((dir, library)) = save_target(DIR.get(), library) else {
         return;
     };
     {
@@ -275,6 +275,18 @@ pub(crate) fn wanted_early(key: &str) -> bool {
     used().as_ref().is_some_and(|s| s.contains(key))
 }
 
+/// Where a save goes and what it saves. Without a cache folder there is
+/// nothing to save, and the library is not asked for: asking opens it,
+/// which makes the host device, and the workers save after every pipeline,
+/// also one that needed no device.
+fn save_target<L>(
+    dir: Option<&PathBuf>,
+    library: impl FnOnce() -> Option<L>,
+) -> Option<(&PathBuf, L)> {
+    let dir = dir?;
+    Some((dir, library()?))
+}
+
 /// The title pipeline with `key` was drawn or dispatched with.
 pub(crate) fn note_used(key: &str) {
     let mut used = used();
@@ -308,6 +320,24 @@ mod tests {
         file[20] ^= 1;
         assert_eq!(unseal(file), None);
         assert_eq!(unseal(b"short".to_vec()), None);
+    }
+
+    /// A save without a cache folder must not open the library (and with
+    /// it the host device): `pipeline::make`'s workers save after every
+    /// pipeline, on their own threads, whatever test or title queued it.
+    #[test]
+    fn saving_without_a_cache_folder_opens_no_library() {
+        let opened = std::cell::Cell::new(0);
+        let open = || {
+            opened.set(opened.get() + 1);
+            Some("library")
+        };
+        assert_eq!(save_target(None, open), None);
+        assert_eq!(opened.get(), 0);
+        let dir = PathBuf::from("cache");
+        assert_eq!(save_target(Some(&dir), open), Some((&dir, "library")));
+        assert_eq!(opened.get(), 1);
+        assert_eq!(save_target(Some(&dir), || None::<&str>), None);
     }
 
     #[test]
