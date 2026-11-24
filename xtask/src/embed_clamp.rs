@@ -288,6 +288,29 @@ mod tests {
         let mut far = dxil.clone();
         far[36..40].copy_from_slice(&u32::MAX.to_le_bytes());
         assert_eq!(embed("far", Some(&far), Some(&dxbc)), (false, None));
+        // Whole containers but for the four bytes that say so. Nothing else
+        // about them is wrong, so only the signature check refuses them.
+        for (name, signature) in [("lower", b"dxbc"), ("zero", &[0; 4]), ("pe", b"MZ\x90\0")] {
+            let mut unsigned = dxil.clone();
+            unsigned[..4].copy_from_slice(signature);
+            assert_eq!(
+                parts(&unsigned).unwrap_err().to_string(),
+                "does not start with `DXBC`",
+                "{name}"
+            );
+            assert_eq!(
+                embed(name, Some(&unsigned), Some(&dxbc)),
+                (false, None),
+                "{name}"
+            );
+            let mut unsigned = dxbc.clone();
+            unsigned[..4].copy_from_slice(signature);
+            assert_eq!(
+                embed(name, Some(&dxil), Some(&unsigned)),
+                (false, None),
+                "{name} as clamp.dxbc"
+            );
+        }
 
         let (ok, written) = embed("good", Some(&dxil), Some(&dxbc));
         assert!(ok, "two containers of the right kinds");
