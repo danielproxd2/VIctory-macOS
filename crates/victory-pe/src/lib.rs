@@ -8,6 +8,8 @@
 mod image;
 pub mod implib;
 pub mod layout;
+#[cfg(any(test, feature = "test-support"))]
+pub mod testing;
 
 pub use image::{
     CodeViewInfo, ExportInfo, ImageInfo, ImportEntry, ImportModule, ImportSymbol, SectionInfo,

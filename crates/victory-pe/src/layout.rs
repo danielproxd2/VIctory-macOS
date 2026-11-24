@@ -32,12 +32,16 @@ pub const TLS64_ADDRESS_OF_CALLBACKS: usize = 24;
 
 /// Data directory indices.
 pub mod dir {
+    pub const EXPORT: usize = 0;
     pub const IMPORT: usize = 1;
     pub const EXCEPTION: usize = 3;
     pub const BASERELOC: usize = 5;
+    pub const DEBUG: usize = 6;
+    pub const TLS: usize = 9;
     pub const LOAD_CONFIG: usize = 10;
     pub const BOUND_IMPORT: usize = 11;
     pub const IAT: usize = 12;
+    pub const DELAY_IMPORT: usize = 13;
 }
 
 /// `IMAGE_FILE_HEADER::Characteristics` flags.

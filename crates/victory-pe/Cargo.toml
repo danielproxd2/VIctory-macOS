@@ -11,5 +11,10 @@ publish.workspace = true
 object.workspace = true
 thiserror.workspace = true
 
+[features]
+# Exposes `victory_pe::testing` (synthetic PE32+ images assembled in code) to
+# other crates' tests. Enable it under [dev-dependencies] only.
+test-support = []
+
 [lints]
 workspace = true
