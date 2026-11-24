@@ -14,6 +14,8 @@
 //! 111000 MUBUF   111010 MTBUF  111100 MIMG  111101 SMEM  111110 EXP
 //! ```
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod asm;
 mod fields;
 mod opcodes;
 mod sp3;

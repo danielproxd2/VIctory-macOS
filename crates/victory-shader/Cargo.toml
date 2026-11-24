@@ -16,6 +16,9 @@ miniz_oxide.workspace = true
 host = ["dep:windows"]
 # Debugging switches (emitted-module dumps and the like).
 diagnostics = []
+# Helpers for tests, here and in the crates that build on this one: the
+# GFX10 assembler (`gfx10::asm`). Never enabled in a shipped build.
+test-support = []
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_System_LibraryLoader"] }
