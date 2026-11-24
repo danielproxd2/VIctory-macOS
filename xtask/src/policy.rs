@@ -316,20 +316,35 @@ fn longest_encoded_run(content: &[u8]) -> Option<usize> {
 /// nothing at all, so that they cannot split a list, and once as ordinary
 /// text, so that a list cannot hide inside them.
 fn longest_literal_run(content: &[u8]) -> usize {
-    literal_run(content, true).max(literal_run(content, false))
+    literal_run(content, true)
+        .0
+        .max(literal_run(content, false).0)
 }
 
 /// [`longest_literal_run`] with comments either stepped over
 /// (`skip_comments`) or read as text whose markers end no list.
-fn literal_run(content: &[u8], skip_comments: bool) -> usize {
+///
+/// The second number is the work spent looking for the ends of comments,
+/// in bytes looked at. It is there for the test that keeps this linear in
+/// the file's length.
+fn literal_run(content: &[u8], skip_comments: bool) -> (usize, usize) {
+    use std::cell::Cell;
+
     let (mut best, mut run, mut i) = (0, 0, 0);
     let word = |b: &u8| b.is_ascii_alphanumeric() || *b == b'_';
+    let searched = Cell::new(0usize);
     let line_end = |from: usize| {
-        content[from..]
+        let end = content[from..]
             .iter()
             .position(|&b| b == b'\n')
-            .map_or(content.len(), |n| from + n)
+            .map_or(content.len(), |n| from + n);
+        searched.set(searched.get() + (end - from));
+        end
     };
+    // Where a search for `*/` last came up empty: none follows that
+    // position, so none follows a later one either. Without this, every
+    // `/*` of a file that never closes one reads the rest of the file.
+    let no_close_from = Cell::new(usize::MAX);
     // The end of the comment that starts at `i`, if one does: `//` and `#`
     // to the end of the line, `/*` to its `*/`.
     let comment = |i: usize| -> Option<usize> {
@@ -337,8 +352,15 @@ fn literal_run(content: &[u8], skip_comments: bool) -> usize {
         if rest.starts_with(b"//") || rest.starts_with(b"#") {
             Some(line_end(i))
         } else if rest.starts_with(b"/*") {
-            let close = rest[2..].windows(2).position(|w| w == b"*/")?;
-            Some(i + 2 + close + 2)
+            if i >= no_close_from.get() {
+                return None;
+            }
+            let close = rest[2..].windows(2).position(|w| w == b"*/");
+            searched.set(searched.get() + close.map_or(rest.len() - 2, |n| n + 2));
+            if close.is_none() {
+                no_close_from.set(i);
+            }
+            Some(i + 2 + close? + 2)
         } else {
             None
         }
@@ -361,7 +383,7 @@ fn literal_run(content: &[u8], skip_comments: bool) -> usize {
         i = skip(i);
         let start = i;
         let Some(first) = content.get(i) else {
-            return best;
+            return (best, searched.get());
         };
         if matches!(first, b',' | b'[' | b']' | b'(' | b')' | b'{' | b'}') {
             i += 1;
@@ -677,6 +699,61 @@ mod tests {
         let at_limit = grouped(super::MAX_LITERAL_RUN, 16, "    [", "],", "\n");
         assert_eq!(run(&at_limit), super::MAX_LITERAL_RUN);
         assert!(!named(&at_limit), "rows at the limit");
+    }
+
+    /// The check reads every text file under the size limit, so it must
+    /// stay linear in the file's length whatever the file holds. Looking
+    /// for the end of a comment is the part that can go wrong: a file of
+    /// `/* ` that closes none once made every one of them read the rest of
+    /// the file, and a file just under the limit took longer than nine
+    /// minutes.
+    ///
+    /// This counts the bytes looked at instead of taking the time: the
+    /// count is the same in every build and on a busy machine. Read
+    /// quadratically, the first file costs a third of its length squared,
+    /// about ninety thousand million bytes; the bound is four times its
+    /// length, about two million.
+    #[test]
+    fn looking_for_the_end_of_a_comment_is_linear() {
+        let fill = |unit: &str| unit.repeat((super::MAX_FILE_SIZE - 1) / unit.len());
+        for unit in [
+            "/* ",
+            "/*",
+            "/*/",
+            "/* */ ",
+            "x /* */ ",
+            "- /* 1, */ ",
+            "// 1,\n",
+            "x // 1,\n",
+            "# ",
+            "/ * ",
+        ] {
+            let text = fill(unit);
+            assert!(text.len() < super::MAX_FILE_SIZE && text.len() > super::MAX_FILE_SIZE - 16);
+            for skip_comments in [true, false] {
+                let (_, searched) = super::literal_run(text.as_bytes(), skip_comments);
+                assert!(
+                    searched <= 4 * text.len(),
+                    "{unit:?} repeated, comments skipped: {skip_comments}: \
+                     {searched} bytes looked at for a file of {}",
+                    text.len()
+                );
+            }
+        }
+        // Such a file is checked like any other, and it holds no list.
+        let unclosed = fill("/* ");
+        assert_eq!(
+            check("src/lib.rs", unclosed.as_bytes()),
+            Vec::<String>::new()
+        );
+        // A `/*` that is never closed is no comment, here as in a short
+        // file: what follows it is read, and it ends a list as any other
+        // text does.
+        let skipping = |text: &str| super::literal_run(text.as_bytes(), true).0;
+        assert_eq!(skipping("/* 1, 2, 3,"), 3);
+        assert_eq!(skipping("/* a */ 1, /* 2, 3, 4,"), 3);
+        assert_eq!(skipping("1, /* 2, /* 3, */ 4, /* 5,"), 2);
+        assert_eq!(skipping("1, /* 2, */ 3, /* 4, */ 5, /* 6, 7"), 3);
     }
 
     /// The embedded clamp bytecode is such an array. It passes as the one
