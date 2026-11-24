@@ -198,6 +198,8 @@ pub fn track(
                         descriptor(s, Role::Sampler)?;
                     }
                 }
+                // `buffer_gl*_inv` invalidate a cache: they name no buffer.
+                Fields::Buffer { .. } if inst.name().ends_with("_inv") => {}
                 Fields::Buffer { rsrc, .. } => descriptor(rsrc, Role::Resource)?,
                 Fields::Smem { base, .. } if inst.name().starts_with("s_buffer_") => {
                     descriptor(base, Role::Resource)?;
@@ -3053,7 +3055,19 @@ pub(crate) mod tests {
         assert_eq!(r.waterfall.reads.len(), 4);
     }
 
-    /// `global_load_dword v4, v[2:3], off` at `v2 = s10 + v1` (a
+    #[test]
+    fn cache_invalidates_use_no_descriptor() {
+        // buffer_gl0_inv, then buffer_gl1_inv: their resource fields are
+        // zero, which is no descriptor in s0-s3.
+        let r = track_words(
+            &[0xE1C4_0000, 0, 0xE1C8_0000, 0, S_ENDPGM],
+            &[],
+            HwStage::Cs,
+        );
+        assert!(r.descriptors.is_empty());
+    }
+
+    /// `global_load_ubyte v4, v[2:3], null` at `v2 = s10 + v1` (a
     /// `v_add_nc_u32_e64`, saturating when `clamp`), `v3 = 0`.
     fn global_load_at_sum(clamp: bool) -> Result<Resources, ShaderError> {
         let words = [
@@ -3061,7 +3075,7 @@ pub(crate) mod tests {
             0x0002_020A,
             0x7E06_0280, // v_mov_b32 v3, 0
             0xDC20_8000,
-            0x047D_0002, // global_load_dword v4, v[2:3], off
+            0x047D_0002, // global_load_ubyte v4, v[2:3], null
             S_ENDPGM,
         ];
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
