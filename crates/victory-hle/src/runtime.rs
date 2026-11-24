@@ -87,16 +87,27 @@ pub struct Title {
 impl Title {
     /// Id, store id and storage quota from the manifest (zero or empty
     /// where it has none); the storage folder is left for the caller.
+    ///
+    /// How the console reads a manifest that is not what the tools write is
+    /// not known, so nothing is guessed: an element that occurs more than
+    /// once, a title id that is not plain hexadecimal digits and a size
+    /// that is not plain decimal digits all count as not given.
     pub fn from_manifest(text: &str) -> Title {
         let elements = elements(text);
         let get = |path: &str| {
-            elements
-                .iter()
-                .find(|(p, _)| p == path)
-                .map(|(_, text)| text.as_str())
+            let mut found = elements.iter().filter(|(p, _)| p == path);
+            match (found.next(), found.next()) {
+                (Some((_, text)), None) => Some(text.as_str()),
+                _ => None,
+            }
         };
-        let id = get("Game/TitleId").and_then(|v| u32::from_str_radix(v, 16).ok());
-        let storage_mb = get("Game/PersistentLocalStorage/SizeMB").and_then(|v| v.parse().ok());
+        let digits = |v: &str, radix: u32| !v.is_empty() && v.chars().all(|c| c.is_digit(radix));
+        let id = get("Game/TitleId")
+            .filter(|v| digits(v, 16))
+            .and_then(|v| u32::from_str_radix(v, 16).ok());
+        let storage_mb = get("Game/PersistentLocalStorage/SizeMB")
+            .filter(|v| digits(v, 10))
+            .and_then(|v| v.parse().ok());
         Title {
             id: id.unwrap_or(0),
             store_id: get("Game/StoreId").unwrap_or_default().to_owned(),
@@ -112,10 +123,27 @@ impl Title {
     }
 }
 
+/// Where the tag that `rest` starts with ends (just past its `>`), if it
+/// does. A `>` inside a quoted attribute value is part of the value, as in
+/// XML.
+fn tag_end(rest: &str) -> Option<usize> {
+    let mut quote = None;
+    for (at, c) in rest.char_indices() {
+        match (quote, c) {
+            (None, '"' | '\'') => quote = Some(c),
+            (Some(open), c) if c == open => quote = None,
+            (None, '>') => return Some(at + 1),
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Each element of an XML text as its path from the root (`Game/TitleId`)
 /// and its trimmed text up to the first child, the predefined entities
 /// decoded; comments, CDATA sections, declarations and attributes are
-/// skipped.
+/// skipped. Names are taken as written (a namespace prefix is part of the
+/// name), and the text ends at a tag that never closes.
 fn elements(text: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut path: Vec<&str> = Vec::new();
@@ -127,7 +155,7 @@ fn elements(text: &str) -> Vec<(String, String)> {
         } else if rest.starts_with("<![CDATA[") {
             rest.find("]]>").map(|e| e + 3)
         } else {
-            rest.find('>').map(|e| e + 1)
+            tag_end(rest)
         };
         let Some(end) = end else { break };
         let tag = &rest[1..end - 1];
@@ -236,5 +264,197 @@ mod tests {
         let text = "<Game><PersistentLocalStorage><SizeMB>17592186044416</SizeMB>\
                     </PersistentLocalStorage></Game>";
         assert_eq!(Title::from_manifest(text).storage_bytes, u64::MAX);
+    }
+
+    const ID: &str = "<TitleId>639AA8DD</TitleId>";
+
+    fn game(inner: &str) -> Title {
+        Title::from_manifest(&format!("<Game>{inner}</Game>"))
+    }
+
+    /// Manifests the tools would not write. What the console makes of them
+    /// is not known, so each either reads as the well-formed XML it is or
+    /// leaves the value out (id 0, no store id, no quota); none is read
+    /// leniently into a value its text does not plainly give.
+    #[test]
+    fn manifest_edge_cases() {
+        assert_eq!(game(ID).id, 0x639A_A8DD);
+
+        // A `>` in a quoted attribute value is not the end of its tag.
+        for text in [
+            "<Game note=\"a>b\"><TitleId>639AA8DD</TitleId></Game>",
+            "<Game><TitleId kind='a>b'>639AA8DD</TitleId></Game>",
+            "<Game><Identity Name=\"<TitleId>1</TitleId>\"/><TitleId>639AA8DD</TitleId></Game>",
+            "<Game><Other a=\"it's\" b='\"'/><TitleId>639AA8DD</TitleId></Game>",
+        ] {
+            assert_eq!(Title::from_manifest(text).id, 0x639A_A8DD, "{text}");
+        }
+
+        // Tags that never close: nothing after them is read.
+        for text in [
+            "<Game><TitleId",
+            "<Game><TitleId>639AA8DD</TitleId",
+            "<Game note=\"><TitleId>639AA8DD</TitleId></Game>",
+            "<Game><!-- <TitleId>639AA8DD</TitleId></Game>",
+            "<Game><![CDATA[ <TitleId>639AA8DD</TitleId></Game>",
+            "<",
+            "<<<<",
+            ">>>>",
+            "</",
+            "</>",
+            "<>",
+            "<!-->",
+            "<Game/><TitleId>639AA8DD</TitleId>",
+        ] {
+            let t = Title::from_manifest(text);
+            assert!(t.id == 0 || t.id == 0x639A_A8DD, "{text}: {:08X}", t.id);
+            assert_eq!((t.store_id.as_str(), t.storage_bytes), ("", 0), "{text}");
+        }
+        assert_eq!(Title::from_manifest("<Game><TitleId").id, 0);
+        assert_eq!(
+            Title::from_manifest("<Game note=\"><TitleId>639AA8DD</TitleId></Game>").id,
+            0
+        );
+
+        // A namespace prefix is part of the name: not the element we know.
+        let prefixed = "<mgc:Game xmlns:mgc=\"urn:x\"><mgc:TitleId>639AA8DD</mgc:TitleId>\
+                        <mgc:StoreId>9ABC</mgc:StoreId></mgc:Game>";
+        assert_eq!(Title::from_manifest(prefixed), Title::default());
+        assert_eq!(game("<x:TitleId>639AA8DD</x:TitleId>").id, 0);
+
+        // The id is hexadecimal digits, as the tools write it; white space
+        // around it is not part of it.
+        assert_eq!(game("<TitleId>\n  639aa8dd\t</TitleId>").id, 0x639A_A8DD);
+        assert_eq!(game("<TitleId>0000002A</TitleId>").id, 0x2A);
+        for id in [
+            "0x639AA8DD",
+            "0X639AA8DD",
+            "+639AA8DD",
+            "-1",
+            "639A A8DD",
+            "639AA8DD0",
+            "639AA8DG",
+            "\u{ff16}39AA8DD",
+            "",
+            "&amp;",
+        ] {
+            assert_eq!(game(&format!("<TitleId>{id}</TitleId>")).id, 0, "{id:?}");
+        }
+        let quota = |size: &str| {
+            let size = format!("<SizeMB>{size}</SizeMB>");
+            game(&format!(
+                "<PersistentLocalStorage>{size}</PersistentLocalStorage>"
+            ))
+            .storage_bytes
+        };
+        assert_eq!(quota(" 16 "), 16 << 20);
+        for size in ["+16", "-16", "0x10", "1 6", "16MB", "1.5", ""] {
+            assert_eq!(quota(size), 0, "{size:?}");
+        }
+
+        // Said twice is not said: no value is picked.
+        let two_roots = "<Game><TitleId>639AA8DD</TitleId><StoreId>A</StoreId></Game>\
+                         <Game><TitleId>11111111</TitleId><StoreId>B</StoreId></Game>";
+        assert_eq!(Title::from_manifest(two_roots), Title::default());
+        assert_eq!(game(&format!("{ID}{ID}")).id, 0);
+        assert_eq!(game(&format!("{ID}<TitleId/>")).id, 0);
+        // Another element of the same name elsewhere is another element.
+        assert_eq!(game(&format!("{ID}<Other>{ID}</Other>")).id, 0x639A_A8DD);
+    }
+
+    /// A small xorshift generator, so the random cases are the same on
+    /// every run and host.
+    struct Random(u64);
+
+    impl Random {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    /// Text made of the pieces a manifest is made of, in any order.
+    fn random_manifest(random: &mut Random) -> String {
+        const PIECES: &[&str] = &[
+            "<",
+            ">",
+            "</",
+            "/>",
+            "<!--",
+            "-->",
+            "<![CDATA[",
+            "]]>",
+            "<?",
+            "?>",
+            "<!",
+            "\"",
+            "'",
+            "=",
+            "/",
+            " ",
+            "\n",
+            "&",
+            "&amp;",
+            "&lt;",
+            "&gt;",
+            ";",
+            "<Game>",
+            "</Game>",
+            "<TitleId>",
+            "</TitleId>",
+            "Game",
+            "TitleId",
+            "StoreId",
+            "PersistentLocalStorage",
+            "SizeMB",
+            "mgc:",
+            "0x",
+            "639AA8DD",
+            "1024",
+            "f",
+            "9",
+            "+",
+            "-",
+            "\u{e9}",
+            "\u{feff}",
+            "\u{1f600}",
+            "\0",
+        ];
+        (0..random.below(40))
+            .map(|_| PIECES[random.below(PIECES.len())])
+            .collect()
+    }
+
+    /// Whatever the text, parsing ends and what it yields is well formed:
+    /// element text never holds a tag, and the title holds only what an
+    /// element of the right name gave.
+    #[test]
+    fn random_manifests_never_panic() {
+        let mut random = Random(0x9e37_79b9_7f4a_7c15);
+        let (mut with_id, mut without) = (0, 0);
+        for _ in 0..20_000 {
+            let text = random_manifest(&mut random);
+            let found = elements(&text);
+            assert!(found.len() <= text.matches('<').count(), "{text:?}");
+            let t = Title::from_manifest(&text);
+            assert_eq!(t.storage, PathBuf::new());
+            let named = |name: &str| found.iter().any(|(path, _)| path == name);
+            assert!(t.id == 0 || named("Game/TitleId"), "{text:?}");
+            assert!(t.store_id.is_empty() || named("Game/StoreId"), "{text:?}");
+            assert_eq!(t.storage_bytes % (1 << 20), 0, "{text:?}");
+            if t.id == 0 {
+                without += 1;
+            } else {
+                with_id += 1;
+            }
+        }
+        // The cases reach both outcomes.
+        assert!(with_id > 0 && without > 0, "{with_id} {without}");
     }
 }
