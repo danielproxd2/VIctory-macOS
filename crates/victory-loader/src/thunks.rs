@@ -170,6 +170,79 @@ mod tests {
         unimplemented_import(site);
     }
 
+    fn site(policy: UnimplementedPolicy) -> &'static ImportSite {
+        Box::leak(Box::new(ImportSite {
+            dll: "probe.dll".into(),
+            symbol: "Missing".into(),
+            policy,
+            calls: AtomicU64::new(0),
+        }))
+    }
+
+    /// The generated stub, called as a title calls an import: it returns 0
+    /// in `rax` and counts the call for its import. (What a function that
+    /// returns a float would leave in `xmm0` is not set.)
+    #[test]
+    fn return_zero_stub_returns_zero_and_counts() {
+        let (first, second) = (
+            site(UnimplementedPolicy::ReturnZero),
+            site(UnimplementedPolicy::ReturnZero),
+        );
+        let mut block = ThunkBlock::new(2).unwrap();
+        let stubs = [block.emit(first).unwrap(), block.emit(second).unwrap()];
+        assert_eq!(stubs[1], stubs[0] + THUNK_SIZE);
+        block.seal().unwrap();
+
+        // SAFETY: sealed stubs; they take whatever the caller passes and
+        // return in `rax`, as the import they stand for would.
+        let call: extern "system" fn(u64, u64, u64, u64, u64) -> u64 =
+            unsafe { std::mem::transmute(stubs[0]) };
+        let total = unimplemented_call_count();
+        assert_eq!(call(1, 2, 3, 4, 5), 0);
+        assert_eq!(call(u64::MAX, 0, 0, 0, 0), 0);
+        assert_eq!(first.calls.load(Ordering::Relaxed), 2);
+        assert_eq!(second.calls.load(Ordering::Relaxed), 0);
+        // Other tests of this program call stubs too.
+        assert!(unimplemented_call_count() >= total + 2);
+
+        // SAFETY: as above.
+        let call: extern "system" fn() -> u64 = unsafe { std::mem::transmute(stubs[1]) };
+        assert_eq!(call(), 0);
+        assert_eq!(second.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(first.calls.load(Ordering::Relaxed), 2);
+    }
+
+    /// A block has room for the stubs it was asked for (and what the rest
+    /// of its last page holds); one more is an error, not a write past it.
+    #[test]
+    fn thunk_block_overflow_is_an_error() {
+        let site = site(UnimplementedPolicy::ReturnZero);
+        let mut block = ThunkBlock::new(1).unwrap();
+        let room = 4096 / THUNK_SIZE;
+        let mut stubs = Vec::new();
+        for _ in 0..room {
+            stubs.push(block.emit(site).unwrap());
+        }
+        assert!(stubs.windows(2).all(|w| w[1] == w[0] + THUNK_SIZE));
+        for _ in 0..2 {
+            let full = block.emit(site).map_err(|e| e.to_string());
+            assert_eq!(full, Err("import stub block is full".to_owned()));
+        }
+        block.seal().unwrap();
+        // The last stub that fitted is whole.
+        // SAFETY: a sealed stub, as in the test above.
+        let call: extern "system" fn() -> u64 = unsafe { std::mem::transmute(stubs[room - 1]) };
+        assert_eq!(call(), 0);
+        assert_eq!(site.calls.load(Ordering::Relaxed), 1);
+
+        // More than a page's worth, asked for: all of them fit.
+        let mut block = ThunkBlock::new(room + 1).unwrap();
+        for _ in 0..=room {
+            block.emit(site).unwrap();
+        }
+        block.seal().unwrap();
+    }
+
     #[test]
     fn a_trapped_import_is_in_the_crash_log() {
         let dir = tempfile::tempdir().unwrap();

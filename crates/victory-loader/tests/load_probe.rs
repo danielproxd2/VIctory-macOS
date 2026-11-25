@@ -551,3 +551,66 @@ fn static_tls_template_reaches_existing_new_and_raw_threads() {
     // one does not again.
     unsafe { image.unload() };
 }
+
+/// In a child process of the next test: binds the probe so that an import
+/// nobody has traps, and calls it.
+#[test]
+fn trap_stub_child() {
+    let Some(log) = std::env::var_os("VICTORY_TRAP_STUB_LOG") else {
+        return;
+    };
+    println!();
+    victory_loader::log_crashes_to(log.into());
+    let prepared = prepare(&std::fs::read(fixture("hle_probe.dll")).unwrap()).unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let image = victory_loader::load(&prepared, cache.path()).unwrap();
+    let report = image
+        .bind_imports(&TestResolver, UnimplementedPolicy::Trap)
+        .unwrap();
+    for missing in &report.missing {
+        println!("missing={}!{}", missing.dll, missing.symbol);
+    }
+    let address = image.export("probe_missing").expect("probe_missing");
+    // SAFETY: the probe's export takes nothing and returns a `u64`; the
+    // import it calls is bound to the stub this test is about.
+    let probe_missing: extern "system" fn() -> u64 = unsafe { std::mem::transmute(address) };
+    println!("calling");
+    let returned = probe_missing();
+    println!("returned={returned}");
+}
+
+/// With the policy that is the default, an import nobody implements ends
+/// the process when the title calls it, through the stub the loader wrote
+/// into the import's slot, and the crash log says which import it was.
+#[test]
+fn trapped_import_through_the_stub_is_in_the_crash_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("crashes.log");
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "trap_stub_child", "--nocapture"])
+        .env("VICTORY_TRAP_STUB_LOG", &log)
+        .output()
+        .unwrap();
+    let printed = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<_> = printed.lines().map(str::trim_end).collect();
+    assert!(
+        lines.iter().any(|l| l
+            .eq_ignore_ascii_case("missing=victory-probe-missing.dll!VIctoryProbeNotImplemented")),
+        "{printed}"
+    );
+    // The call was made and did not come back.
+    assert!(lines.contains(&"calling"), "{printed}");
+    assert!(!printed.contains("returned="), "{printed}");
+    assert!(
+        !out.status.success(),
+        "the trap ends the process: {printed}"
+    );
+    let text = std::fs::read_to_string(&log).unwrap_or_default();
+    let wanted =
+        "VIctory: unimplemented import victory-probe-missing.dll!VIctoryProbeNotImplemented called";
+    assert!(
+        text.to_ascii_lowercase()
+            .contains(&wanted.to_ascii_lowercase()),
+        "crash log: {text:?}"
+    );
+}
