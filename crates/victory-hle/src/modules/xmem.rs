@@ -141,6 +141,10 @@ fn virtual_alloc(
             kind |= MEM_WRITE_WATCH;
         }
     }
+    // A commit at the title's address changes what a thread that maps
+    // physical pages there has just asked the host about, and the fallback
+    // below asks and releases itself: both wait their turn (see `PHYSICAL`).
+    let mut turn = (!base.is_null() && kind & MEM_COMMIT != 0).then(physical);
     // SAFETY: the title's own arguments, cleaned of console bits; the
     // parameter points at `requirements`, which outlives the call.
     let at = unsafe {
@@ -168,13 +172,34 @@ fn virtual_alloc(
         );
     }
     if at.is_null() {
-        if !base.is_null() && kind & MEM_COMMIT != 0 {
-            return commit_in_placeholder(base as usize, size, protect);
+        if let Some(physical) = turn.as_mut() {
+            return commit_in_placeholder(physical, base as usize, size, protect);
         }
     } else if kind & MEM_RESERVE != 0 {
+        // Nothing left to keep others from, and `REGIONS` is taken alone.
+        drop(turn);
         remember(at as usize, size, flags, placeholder);
     }
     at
+}
+
+// Test only: what this thread runs once between asking the host what a
+// range holds and the release that relies on the answer.
+#[cfg(test)]
+thread_local! {
+    static CHECKED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Marks the point between a check of the host's memory (`reserved_only`)
+/// and the release that relies on it. Nothing happens here outside the
+/// tests, which run another thread at this point to show that it cannot get
+/// in between.
+fn checked() {
+    #[cfg(test)]
+    if let Some(hook) = CHECKED.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
 }
 
 /// What the host says of the region of `process` that holds `address`;
@@ -240,7 +265,16 @@ fn takes_views(base: usize, len: usize) -> bool {
 /// in one of our placeholder reservations, the 64 KiB pages holding them
 /// are split off and become committed memory of their own. Null if they do
 /// not, or if any of those pages is committed or mapped already.
-fn commit_in_placeholder(base: usize, size: usize, protect: u32) -> *mut c_void {
+///
+/// The caller holds `PHYSICAL` (it passes the guard's contents): the check
+/// of the host's memory and the release below are one step to every other
+/// thread that commits or maps here.
+fn commit_in_placeholder(
+    _turn: &mut Physical,
+    base: usize,
+    size: usize,
+    protect: u32,
+) -> *mut c_void {
     const HOST_PAGE: usize = 0x1000;
     let null = std::ptr::null_mut();
     let start = base & !(PAGE - 1);
@@ -273,9 +307,11 @@ fn commit_in_placeholder(base: usize, size: usize, protect: u32) -> *mut c_void 
     if !reserved_only(start, end - start) {
         return null;
     }
+    checked();
     // SAFETY: the range was reserved here as a placeholder and the host
-    // says nothing is committed or mapped in it, so the release destroys no
-    // memory: it splits the placeholder around the range (and fails
+    // says nothing is committed or mapped in it (and under `PHYSICAL` no
+    // call of ours changes that before the release), so the release
+    // destroys no memory: it splits the placeholder around the range (and fails
     // harmlessly when the range is all of it). The replacement acts on a
     // placeholder of exactly this range or fails.
     let at = unsafe {
@@ -315,6 +351,7 @@ fn commit_in_placeholder(base: usize, size: usize, protect: u32) -> *mut c_void 
 // a record is dropped when its range is handed out here again, and a query
 // drops one whose allocation the host no longer has as it was recorded
 // (see `flags_of`).
+// Lock order: taken alone, or under `PHYSICAL` (see there), never before it.
 static REGIONS: Mutex<Regions> = Mutex::new(Regions {
     reserved: BTreeMap::new(),
     placeholders: BTreeMap::new(),
@@ -701,6 +738,26 @@ struct Physical {
     views: BTreeMap<usize, (usize, Slice)>,
 }
 
+/// The page table, and the turn to change what a reservation of ours holds.
+///
+/// A release that keeps the placeholder (`VirtualFree` with
+/// `MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER`) does not fail on committed
+/// memory that took a placeholder's place: it destroys it. So the host is
+/// asked what a range holds before each such release (`takes_views`,
+/// `reserved_only`), and the answer must still be true at the release:
+/// every path that asks and releases, and every commit of ours at an address
+/// the title names, holds this lock from before the first question until
+/// after the release and what replaces the placeholder. Those paths are
+/// `XMemMapPhysicalPages`, `map_alias` (with `unmap` and `map` below them),
+/// and a fixed-base commit in `virtual_alloc` with `commit_in_placeholder`.
+///
+/// Lock order: `PHYSICAL`, then `REGIONS`. Nothing takes `PHYSICAL` while
+/// it holds `REGIONS`; `commit_in_placeholder` takes `REGIONS` under
+/// `PHYSICAL`, and `remember`, `forget` and `flags_of` take `REGIONS` alone.
+// shortcut: the title's own calls of the host's `VirtualAlloc` and
+// `VirtualFree` do not pass through here and take no turn; a title that
+// commits with the host while it maps pages at the same address is not
+// ordered by anything here.
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
     Mutex::new(Physical {
         // Page numbers are opaque to titles; 0 stays unused.
@@ -942,6 +999,8 @@ pub extern "system" fn XMemMapPhysicalPages(
         );
         return std::ptr::null_mut();
     };
+    // Held from the question to the last mapping: see `PHYSICAL`.
+    let mut physical = physical();
     if !pages.is_null() && !takes_views(base, len) {
         tracing::warn!(
             address = format_args!("{base:#x}"),
@@ -950,7 +1009,6 @@ pub extern "system" fn XMemMapPhysicalPages(
         );
         return std::ptr::null_mut();
     }
-    let mut physical = physical();
     unmap(&mut physical, base, len);
     if pages.is_null() {
         return address;
@@ -1030,11 +1088,12 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let Some((from, _)) = range::byte_span(from, if from == 0 { 0 } else { len as u64 }) else {
         return false;
     };
-    // Nor is the title's committed memory replaced (see `takes_views`).
+    // Nor is the title's committed memory replaced (see `takes_views`). The
+    // lock is held from the question to the last mapping: see `PHYSICAL`.
+    let mut physical = physical();
     if from != 0 && !takes_views(to, len) {
         return false;
     }
-    let mut physical = physical();
     unmap(&mut physical, to, len);
     for k in (0..len).step_by(PAGE) {
         if from == 0 {
@@ -1061,7 +1120,8 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
 }
 
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
-/// must lie in one placeholder.
+/// must lie in one placeholder. Having `physical` is having the turn that
+/// makes the check and the release below one step (see `PHYSICAL`).
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     // The release below is not confined to placeholders: it makes one of
     // committed memory that took a placeholder's place (see
@@ -1076,7 +1136,9 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         );
         return false;
     }
-    // SAFETY: the host says the range is reserved and holds no memory, so
+    checked();
+    // SAFETY: the host says the range is reserved and holds no memory (and
+    // under `PHYSICAL` no call of ours changes that before the release), so
     // the release destroys none: it splits the placeholder around the range
     // (failing harmlessly when the range is the whole placeholder). The
     // mapping acts on a placeholder of exactly this range or fails.
@@ -1603,6 +1665,146 @@ mod tests {
         assert_eq!(unsafe { at(1).cast::<u8>().read() }, 0x4d, "the first page");
         assert_eq!(XMemMapPhysicalPages(at(1), 1, std::ptr::null()), at(1));
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    /// How long a thread started between another's check and its release
+    /// gets to finish. It never does where both hold one lock, so this is
+    /// what each interleaving below costs; without the lock its calls take
+    /// well under a millisecond.
+    const WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
+
+    /// Runs `first` on this thread and, once it has asked the host what its
+    /// range holds and before it releases (`checked`), starts `second` on
+    /// another thread and gives it `WINDOW` to finish. `first`'s result,
+    /// whether `second` finished in between, and `second`'s result.
+    fn interleaved<A, B: Send + 'static>(
+        first: impl FnOnce() -> A,
+        second: impl FnOnce() -> B + Send + 'static,
+    ) -> (A, bool, B) {
+        type Started<B> = Option<(std::thread::JoinHandle<B>, bool)>;
+        let started: std::rc::Rc<std::cell::RefCell<Started<B>>> = Default::default();
+        let hook = {
+            let started = started.clone();
+            move || {
+                let (done, finished) = std::sync::mpsc::channel();
+                let thread = std::thread::spawn(move || {
+                    let result = second();
+                    let _ = done.send(());
+                    result
+                });
+                let between = finished.recv_timeout(WINDOW).is_ok();
+                *started.borrow_mut() = Some((thread, between));
+            }
+        };
+        CHECKED.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        let a = first();
+        // A `first` that never reached its release leaves the hook unused.
+        CHECKED.with(|slot| slot.borrow_mut().take());
+        let (thread, between) = started
+            .borrow_mut()
+            .take()
+            .expect("the first call got as far as its release");
+        (a, between, thread.join().expect("the second call returned"))
+    }
+
+    /// A commit and a mapping of the same 64 KiB page from two threads: the
+    /// one that asked the host first also releases first. Without one lock
+    /// over both steps the other gets in between, and the release then
+    /// destroys memory it was told was not there.
+    #[test]
+    fn no_commit_or_mapping_gets_between_a_check_and_its_release() {
+        let a = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            3 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            1 | 6 << 12,
+            PAGE_READWRITE,
+        );
+        assert!(!a.is_null());
+        let base = a as usize;
+        let at = move |page: usize| base + page * PAGE;
+        let kind = |page: usize| {
+            let info = query(at(page) as *const c_void);
+            (info.host.State, info.host.Type)
+        };
+        let commit = |at: usize| {
+            let (kind, base) = (MEM_COMMIT | PAGES_64K, at as *mut c_void);
+            XMemVirtualAlloc(base, PAGE, kind, GRAPHICS, PAGE_READWRITE) as usize
+        };
+        let map = |at: usize, page: usize| {
+            XMemMapPhysicalPages(at as *mut c_void, 1, [page].as_ptr()) as usize
+        };
+        let pages = allocate(1);
+        assert!(write_physical(&pages, 0, &[0x4d]));
+        let page = pages[0];
+        let first_byte = |at: usize| {
+            // SAFETY: callers have seen the page committed.
+            unsafe { (at as *const u8).read() }
+        };
+
+        // A mapping that has checked its page, and a commit of that page.
+        let (mapped, between, _) = interleaved(|| map(at(0), page), move || commit(at(0)));
+        assert!(
+            !between,
+            "a commit ran between the mapping's check and release"
+        );
+        assert_eq!(mapped, at(0));
+        assert_eq!(
+            kind(0),
+            (MEM_COMMIT, MEM_MAPPED),
+            "the view is what is there"
+        );
+        assert_eq!(first_byte(at(0)), 0x4d);
+
+        // A commit that has checked its page, and a mapping of that page.
+        let (committed, between, mapped) = interleaved(
+            || {
+                let committed = commit(at(1));
+                if committed != 0 {
+                    // SAFETY: committed read-write just now.
+                    unsafe { (committed as *mut u8).write_bytes(0x6b, PAGE) };
+                }
+                committed
+            },
+            move || map(at(1), page),
+        );
+        assert!(
+            !between,
+            "a mapping ran between the commit's check and release"
+        );
+        assert_eq!(committed, at(1));
+        assert_eq!(mapped, 0, "the mapping came second and found memory there");
+        assert_eq!(kind(1), (MEM_COMMIT, MEM_PRIVATE));
+        assert_eq!(first_byte(at(1)), 0x6b);
+        assert_eq!(first_byte(at(1) + PAGE - 1), 0x6b);
+
+        // A mapping that has checked a page the title decommitted, and a
+        // commit the host takes at once (no placeholder is left there).
+        assert_eq!(commit(at(2)), at(2));
+        // SAFETY: memory of this test's reservation.
+        let decommitted = unsafe {
+            VirtualFree(
+                at(2) as *mut c_void,
+                PAGE,
+                windows_sys::Win32::System::Memory::MEM_DECOMMIT,
+            )
+        };
+        assert_ne!(decommitted, 0);
+        assert_eq!(kind(2).0, MEM_RESERVE);
+        let (mapped, between, _) = interleaved(|| map(at(2), page), move || commit(at(2)));
+        assert!(
+            !between,
+            "a commit ran between the mapping's check and release"
+        );
+        assert_eq!(mapped, at(2));
+        assert_eq!(kind(2), (MEM_COMMIT, MEM_MAPPED));
+        assert_eq!(first_byte(at(2)), 0x4d);
+
+        for page in [0, 2] {
+            let at = at(page) as *mut c_void;
+            assert_eq!(XMemMapPhysicalPages(at, 1, std::ptr::null()), at);
+        }
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
     }
 
     static HOOKED_ALLOCS: AtomicUsize = AtomicUsize::new(0);
