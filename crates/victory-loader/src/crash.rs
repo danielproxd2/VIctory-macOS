@@ -723,8 +723,12 @@ mod tests {
         assert_eq!(memory_at(base + 0x3008), "no access");
         // SAFETY: releases the reservation made above.
         unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
-        assert_eq!(memory_at(base + 8), "nothing mapped there");
+        // Free memory is asked for where nothing can ever be mapped, the
+        // first 64 KiB, at both of its ends. The range released above is
+        // not asked for: the other tests of this program run on their own
+        // threads, and an allocation of theirs may take it at any moment.
         assert_eq!(memory_at(0), "nothing mapped there");
+        assert_eq!(memory_at(0xfff8), "nothing mapped there");
         assert_eq!(memory_at(usize::MAX), "outside the address space");
         // This test's own code: an image page, named by its module.
         let code = memory_at(memory_at_names_what_an_access_hit as *const () as usize);
