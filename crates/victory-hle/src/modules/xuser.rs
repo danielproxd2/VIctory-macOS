@@ -248,6 +248,40 @@ extern "system" fn token_result(
     xasync::XAsyncGetResult(block, (&raw const TOKEN).cast(), size, buffer, used)
 }
 
+/// Tells the UTF-16 token calls apart from the 8-bit ones on a block.
+static TOKEN_UTF16: u8 = 0;
+
+/// `XUserGetTokenAndSignatureUtf16Async`: the 8-bit call with UTF-16
+/// strings, so it has the same answer: tokens come from the service, and
+/// the request fails with the documented `E_GAMEUSER_FAILED_TO_GET_TOKEN`
+/// ("The token request failed").
+#[allow(clippy::too_many_arguments)]
+extern "system" fn token_utf16_async(
+    _: This,
+    _: Handle,
+    _options: u32,
+    _method: *const u16,
+    _url: *const u16,
+    _header_count: usize,
+    _headers: *const c_void,
+    _body_size: usize,
+    _body: *const c_void,
+    block: *mut AsyncBlock,
+) -> HRESULT {
+    tracing::info!("token and signature (UTF-16): offline");
+    xasync::finished(block, (&raw const TOKEN_UTF16).cast(), FAILED_TO_GET_TOKEN)
+}
+extern "system" fn token_utf16_result(
+    _: This,
+    block: *mut AsyncBlock,
+    size: usize,
+    buffer: *mut c_void,
+    _data: *mut *const c_void,
+    used: *mut usize,
+) -> HRESULT {
+    xasync::XAsyncGetResult(block, (&raw const TOKEN_UTF16).cast(), size, buffer, used)
+}
+
 /// The user never changes and no device is ever associated, so these
 /// callbacks are never called.
 extern "system" fn register(
@@ -269,7 +303,12 @@ extern "system" fn find_for_device(_: This, _device: *const c_void, _: *mut Hand
 }
 
 // Unset slots (no title seen calls them): maximum users, gamer pictures,
-// the UTF-16 token calls, issue resolution.
+// issue resolution. The public reference gives no value for the maximum
+// (XUserGetMaxUsers: "the maximum number of users that a game session
+// allows on the current platform"), no error for a user without a picture
+// (XUserGetGamerPictureAsync) and no result for issue resolution without
+// its system UI, so these keep failing with `E_NOTIMPL` and write nothing
+// (`unanswered_slots_fail_with_e_notimpl_and_write_nothing`).
 static VTABLE: Methods<35> = Methods([
     query_interface as *const (),          // 0x00 QueryInterface
     add_ref as *const (),                  // 0x08 AddRef
@@ -297,9 +336,9 @@ static VTABLE: Methods<35> = Methods([
     token_async as *const (),              // 0xb8 token and signature
     token_size as *const (),               // 0xc0
     token_result as *const (),             // 0xc8
-    missing::<26> as *const (),            // 0xd0 the same, UTF-16: begin
-    missing::<27> as *const (),            // 0xd8 result size
-    missing::<28> as *const (),            // 0xe0 result
+    token_utf16_async as *const (),        // 0xd0 the same, UTF-16
+    token_size as *const (),               // 0xd8
+    token_utf16_result as *const (),       // 0xe0
     missing::<29> as *const (),            // 0xe8 resolve issue with UI: begin
     missing::<30> as *const (),            // 0xf0 result
     missing::<31> as *const (),            // 0xf8 the same, UTF-16: begin
@@ -422,5 +461,143 @@ mod tests {
             xasync::XAsyncGetStatus(&mut block, true),
             FAILED_TO_GET_TOKEN
         );
+    }
+
+    fn block() -> AsyncBlock {
+        AsyncBlock {
+            queue: std::ptr::null(),
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        }
+    }
+
+    /// The UTF-16 token call is the 8-bit one with wide strings: the same
+    /// documented failure, no result size, nothing written.
+    #[test]
+    fn the_wide_token_call_fails_like_the_narrow_one() {
+        type Token = extern "system" fn(
+            This,
+            Handle,
+            u32,
+            *const u16,
+            *const u16,
+            usize,
+            *const c_void,
+            usize,
+            *const c_void,
+            *mut AsyncBlock,
+        ) -> HRESULT;
+        type Size = extern "system" fn(This, *mut AsyncBlock, *mut usize) -> HRESULT;
+        type TokenResult = extern "system" fn(
+            This,
+            *mut AsyncBlock,
+            usize,
+            *mut c_void,
+            *mut *const c_void,
+            *mut usize,
+        ) -> HRESULT;
+        let this: This = &OBJECT;
+        let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
+        let (method, url) = (wide("GET"), wide("https://example.invalid/"));
+        let null = std::ptr::null();
+        let mut b = block();
+        let begin = slot::<Token>(&OBJECT, 0xd0);
+        assert_eq!(
+            begin(
+                this,
+                user(),
+                0,
+                method.as_ptr(),
+                url.as_ptr(),
+                0,
+                null,
+                0,
+                null,
+                &mut b
+            ),
+            S_OK
+        );
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), FAILED_TO_GET_TOKEN);
+        assert_eq!(FAILED_TO_GET_TOKEN as u32, 0x8924_5111);
+        let mut size = 0x55;
+        assert_eq!(
+            slot::<Size>(&OBJECT, 0xd8)(this, &mut b, &mut size),
+            FAILED_TO_GET_TOKEN
+        );
+        let (mut buffer, mut data, mut used) = ([0xa5_u8; 32], 0x1234 as *const c_void, 0x55);
+        let hr = slot::<TokenResult>(&OBJECT, 0xe0)(
+            this,
+            &mut b,
+            buffer.len(),
+            buffer.as_mut_ptr().cast(),
+            &mut data,
+            &mut used,
+        );
+        assert_eq!(hr, FAILED_TO_GET_TOKEN);
+        assert_eq!(
+            (size, buffer, data as usize, used),
+            (0x55, [0xa5; 32], 0x1234, 0x55)
+        );
+    }
+
+    /// Slots with no documented offline answer: called with the public
+    /// API's arguments they fail with `E_NOTIMPL`, start no async call and
+    /// leave every output as it was.
+    #[test]
+    fn unanswered_slots_fail_with_e_notimpl_and_write_nothing() {
+        use crate::modules::xasync::E_NOTIMPL;
+        let this: This = &OBJECT;
+        assert_eq!(E_NOTIMPL as u32, 0x8000_4001);
+
+        // XUserGetMaxUsers(maxUsers).
+        type Max = extern "system" fn(This, *mut u32) -> HRESULT;
+        let mut max = 0xdead_beef_u32;
+        assert_eq!(slot::<Max>(&OBJECT, 0x30)(this, &mut max), E_NOTIMPL);
+        assert_eq!(max, 0xdead_beef);
+
+        // No call was begun on the block: our words in it are as they were.
+        let untouched = |b: &mut AsyncBlock| assert_eq!(b.internal, [0; 4]);
+
+        // XUserGetGamerPictureAsync(user, pictureSize, async), its result
+        // size and its result.
+        type Picture = extern "system" fn(This, Handle, u32, *mut AsyncBlock) -> HRESULT;
+        type Size = extern "system" fn(This, *mut AsyncBlock, *mut usize) -> HRESULT;
+        type PictureResult =
+            extern "system" fn(This, *mut AsyncBlock, usize, *mut u8, *mut usize) -> HRESULT;
+        let mut b = block();
+        assert_eq!(
+            slot::<Picture>(&OBJECT, 0x80)(this, user(), 1, &mut b),
+            E_NOTIMPL
+        );
+        untouched(&mut b);
+        let mut size = 0x55;
+        assert_eq!(
+            slot::<Size>(&OBJECT, 0x88)(this, &mut b, &mut size),
+            E_NOTIMPL
+        );
+        let (mut png, mut used) = ([0xa5_u8; 16], 0x55);
+        let result = slot::<PictureResult>(&OBJECT, 0x90);
+        assert_eq!(
+            result(this, &mut b, png.len(), png.as_mut_ptr(), &mut used),
+            E_NOTIMPL
+        );
+        assert_eq!((size, png, used), (0x55, [0xa5; 16], 0x55));
+
+        // XUserResolveIssueWithUiAsync(user, url, async) and its result,
+        // 8-bit and UTF-16.
+        type Resolve<C> = extern "system" fn(This, Handle, *const C, *mut AsyncBlock) -> HRESULT;
+        type Done = extern "system" fn(This, *mut AsyncBlock) -> HRESULT;
+        for (begin, done) in [(0xe8, 0xf0), (0xf8, 0x100)] {
+            let mut b = block();
+            let hr = if begin == 0xe8 {
+                slot::<Resolve<c_char>>(&OBJECT, begin)(this, user(), std::ptr::null(), &mut b)
+            } else {
+                slot::<Resolve<u16>>(&OBJECT, begin)(this, user(), std::ptr::null(), &mut b)
+            };
+            assert_eq!(hr, E_NOTIMPL, "slot {begin:#x}");
+            untouched(&mut b);
+            assert_eq!(slot::<Done>(&OBJECT, done)(this, &mut b), E_NOTIMPL);
+        }
     }
 }
