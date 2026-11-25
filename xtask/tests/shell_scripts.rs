@@ -426,6 +426,64 @@ fn victory_sh_without_arguments_says_what_to_pass_and_fails() {
     assert_eq!(started, "", "nothing is built or started");
 }
 
+/// The launcher ends as what it started under Wine ended: victory.exe ends
+/// with the exit code of the title it ran, and whoever starts the launcher
+/// reads that code as its status. (A status has eight bits here; Wine
+/// hands on the low eight of a Windows exit code.)
+#[test]
+fn victory_sh_ends_with_the_exit_code_of_what_wine_ran() {
+    for code in [7, 0, 255] {
+        let dir = scratch(&format!("victory-sh-exit-{code}"));
+        let log = dir.join("started.log");
+        fs::create_dir_all(dir.join("wine/lib/external/D3DMetal.framework")).unwrap();
+        script(
+            &dir.join("bin/cargo"),
+            r#"echo "cargo $*" >> "$STAND_IN_LOG""#,
+        );
+        // A stand-in for Wine running victory.exe on a title that returns
+        // `code`: victory's last line, then the title's code.
+        script(
+            &dir.join("wine/bin/wine"),
+            &format!(
+                r#"echo "wine $*" >> "$STAND_IN_LOG"
+echo "title exited with {code}"
+exit {code}"#
+            ),
+        );
+        // A config file of the test's own: without one named, the script
+        // would read the victory.toml of whoever runs the tests.
+        let config = dir.join("victory.toml");
+        fs::write(&config, "").unwrap();
+        let out = Command::new(root().join("tools/macos/victory.sh"))
+            .args(["run", "--execute", "a title.exe"])
+            .env("CARGO", dir.join("bin/cargo"))
+            .env("WINE", dir.join("wine/bin/wine"))
+            .env("HOME", dir.join("home"))
+            .env("STAND_IN_LOG", &log)
+            .env("VICTORY_CONFIG", &config)
+            .env_remove("VICTORY_DATA_DIR")
+            .env_remove("WINEPREFIX")
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(code), "{}", text(&out.stderr));
+        // What the program said arrives too, and the launcher adds nothing.
+        assert_eq!(text(&out.stdout), format!("title exited with {code}\n"));
+        assert_eq!(text(&out.stderr), "", "code {code}");
+        // Built once, then Wine started once, with the title's arguments.
+        let started = fs::read_to_string(&log).unwrap();
+        let started: Vec<&str> = started.lines().collect();
+        let [cargo, wine] = started[..] else {
+            panic!("code {code}: {started:?}");
+        };
+        assert!(cargo.starts_with("cargo build "), "{cargo}");
+        assert!(wine.starts_with("wine "), "{wine}");
+        assert!(
+            wine.ends_with("/release/victory.exe run --execute a title.exe"),
+            "{wine}"
+        );
+    }
+}
+
 /// The variable the launcher sets is the one the configuration reads.
 #[test]
 fn victory_sh_sets_the_variable_the_config_reads() {
