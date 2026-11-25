@@ -160,6 +160,14 @@ pub extern "system" fn create_deserializer(
     if blob.is_null() || size == 0 || iid.is_null() || out.is_null() {
         return E_INVALIDARG;
     }
+    // Bytes that cannot hold a serialized root signature are answered
+    // here, as Windows' deserializer answers them. Not every host's does:
+    // D3DMetal's takes a blob that ends a byte early, and reads through a
+    // null pointer when given bytes that are no container at all.
+    // SAFETY: the title passes `size` bytes.
+    if !holds_a_root_signature(unsafe { std::slice::from_raw_parts(blob, size) }) {
+        return E_INVALIDARG;
+    }
     static FUNCTION: OnceLock<Option<usize>> = OnceLock::new();
     let Some(address) = host_export(&FUNCTION, c"D3D12CreateRootSignatureDeserializer") else {
         tracing::warn!("no host d3d12.dll to deserialize root signatures");
@@ -167,6 +175,44 @@ pub extern "system" fn create_deserializer(
     };
     // SAFETY: the export has this signature; it takes what the title passed.
     unsafe { std::mem::transmute::<usize, Deserialize>(address)(blob, size, iid, out) }
+}
+
+/// Whether `blob` can be a serialized root signature: a whole container
+/// with a root signature part. That is `DXBC`, 16 bytes of checksum, a
+/// version, the container's size and its count of parts, then each part's
+/// offset; a part is a four-character name, its size and its bytes, and a
+/// root signature's is named `RTS0`. The container must not say it is
+/// longer than the bytes there are, and every part must lie inside them.
+///
+/// The checksum and the root signature itself are the host's to judge, as
+/// are bytes after the container's end.
+pub(crate) fn holds_a_root_signature(blob: &[u8]) -> bool {
+    let word = |at: usize| -> Option<usize> {
+        let bytes = blob.get(at..at.checked_add(4)?)?;
+        usize::try_from(u32::from_le_bytes(bytes.try_into().ok()?)).ok()
+    };
+    // The name of the part at `index`, if all of it is there.
+    let part = |index: usize| -> Option<&[u8]> {
+        let at = word(index.checked_mul(4)?.checked_add(32)?)?;
+        let len = word(at.checked_add(4)?)?;
+        let end = at.checked_add(8)?.checked_add(len)?;
+        (end <= blob.len()).then(|| &blob[at..at + 4])
+    };
+    let (Some(size), Some(count)) = (word(24), word(28)) else {
+        return false;
+    };
+    if !blob.starts_with(b"DXBC") || size > blob.len() {
+        return false;
+    }
+    let mut found = false;
+    for index in 0..count {
+        match part(index) {
+            Some(name) => found |= name == b"RTS0",
+            // Also ends the walk over a count the bytes cannot hold.
+            None => return false,
+        }
+    }
+    found
 }
 
 #[repr(C)]
@@ -542,13 +588,108 @@ mod tests {
         );
     }
 
+    /// A container of our own making with the given parts (its checksum
+    /// is left zero), as `D3D12SerializeRootSignature` lays one out.
+    fn container(parts: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
+        let word = |n: usize| u32::try_from(n).unwrap().to_le_bytes();
+        let mut offset = 32 + 4 * parts.len();
+        let total = offset + parts.iter().map(|(_, d)| 8 + d.len()).sum::<usize>();
+        let mut out = b"DXBC".to_vec();
+        out.extend_from_slice(&[0; 16]);
+        out.extend_from_slice(&word(1));
+        out.extend_from_slice(&word(total));
+        out.extend_from_slice(&word(parts.len()));
+        for (_, data) in parts {
+            out.extend_from_slice(&word(offset));
+            offset += 8 + data.len();
+        }
+        for (name, data) in parts {
+            out.extend_from_slice(*name);
+            out.extend_from_slice(&word(data.len()));
+            out.extend_from_slice(data);
+        }
+        assert_eq!(out.len(), total);
+        out
+    }
+
+    /// Only a whole container with a root signature part can be a
+    /// serialized root signature. What the part holds is not looked at,
+    /// and bytes after the container are left to the host.
+    #[test]
+    fn only_whole_containers_with_a_root_signature_part_pass() {
+        let whole = container(&[(b"RTS0", &[0; 24])]);
+        assert!(holds_a_root_signature(&whole));
+        assert!(holds_a_root_signature(&container(&[
+            (b"SHEX", &[1, 2, 3, 4]),
+            (b"RTS0", &[0; 24]),
+        ])));
+        let mut longer = whole.clone();
+        longer.extend_from_slice(&[0; 8]);
+        assert!(holds_a_root_signature(&longer), "bytes after its end");
+
+        // Cut short anywhere: in the part, in the offsets, in the header.
+        for len in 0..whole.len() {
+            assert!(!holds_a_root_signature(&whole[..len]), "{len} bytes");
+        }
+        // Whole, with a size that says there is more.
+        let mut says_more = whole.clone();
+        says_more[24..28].copy_from_slice(&(whole.len() as u32 + 1).to_le_bytes());
+        assert!(!holds_a_root_signature(&says_more));
+        // No root signature in it.
+        assert!(!holds_a_root_signature(&container(&[(b"SHEX", &[0; 24])])));
+        assert!(!holds_a_root_signature(&container(&[])));
+        // A part that says it runs past the end, and one that starts there.
+        let mut long = whole.clone();
+        long[40..44].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(!holds_a_root_signature(&long));
+        let mut far = whole.clone();
+        far[32..36].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(!holds_a_root_signature(&far));
+        // More parts counted than the bytes can hold.
+        let mut many = whole.clone();
+        many[28..32].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(!holds_a_root_signature(&many));
+        // Not a container.
+        let mut unsigned = whole.clone();
+        unsigned[..4].copy_from_slice(b"dxbc");
+        assert!(!holds_a_root_signature(&unsigned));
+        assert!(!holds_a_root_signature(&[0xff; 64]));
+        assert!(!holds_a_root_signature(&[0; 64]));
+        assert!(!holds_a_root_signature(b"DXBC"));
+    }
+
+    /// Bytes that cannot hold a root signature are refused before the host
+    /// is asked, so the answer is the same with any host and with none,
+    /// and nothing is written.
+    #[test]
+    fn bytes_that_hold_no_root_signature_are_refused_without_the_host() {
+        let iid = [0u8; 16];
+        let whole = container(&[(b"RTS0", &[0; 24])]);
+        let cut = &whole[..whole.len() - 1];
+        let garbage = [0xffu8; 64];
+        for blob in [cut, &garbage[..]] {
+            let mut out = std::ptr::null_mut();
+            assert_eq!(
+                create_deserializer(blob.as_ptr(), blob.len(), &iid, &mut out),
+                E_INVALIDARG
+            );
+            assert!(out.is_null());
+        }
+    }
+
     /// Truncated and nonsense blobs reach the host, which rejects them
     /// without writing an object.
+    ///
+    /// (Here they are answered before the host, by
+    /// `holds_a_root_signature`: Windows' deserializer rejects both, but
+    /// D3DMetal's takes the truncated blob and faults on the nonsense.)
     #[cfg(windows)]
     #[test]
     fn malformed_blobs_are_rejected_by_the_host() {
         use windows::Win32::Graphics::Direct3D12::ID3D12RootSignatureDeserializer;
         use windows::core::Interface;
+        // The host's d3d12.dll, as the device tests use: one at a time.
+        let _host = crate::testing::serial();
         let desc = VersionedDesc {
             version: 1,
             desc: Desc {
