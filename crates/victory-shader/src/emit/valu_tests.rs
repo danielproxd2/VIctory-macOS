@@ -53,6 +53,19 @@ const fn vgpr(n: u8) -> u16 {
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
 fn build_valu_cs(body: &[u32]) -> HostShader {
+    build_valu_cs_storing(body, 1)
+}
+
+/// As [`build_valu_cs`], and the shader also stores `v1..v3` (the first
+/// three inputs as `body` left them) to dwords 1 to 3 of the UAV, so that a
+/// test can read back what reached the shader beside what it computed.
+fn build_valu_cs_with_inputs(body: &[u32]) -> HostShader {
+    build_valu_cs_storing(body, 4)
+}
+
+/// [`build_valu_cs`] with a store of each of `v0..v{stores}` to the dword
+/// of its number.
+fn build_valu_cs_storing(body: &[u32], stores: u8) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.extend(asm::sop1("s_mov_b32", 5, imm(0)));
@@ -63,14 +76,18 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         words.extend(asm::vop1("v_mov_b32", i + 1, asm::sgpr(i)));
     }
     words.extend_from_slice(body);
-    // buffer_store_dword v0, off, s[8:11], 0
-    words.extend(asm::mubuf(
-        "buffer_store_dword",
-        Buffer {
-            srsrc: 8,
-            ..Buffer::default()
-        },
-    ));
+    // buffer_store_dword v<i>, off, s[8:11], 0, offset 4 * i
+    for i in 0..stores {
+        words.extend(asm::mubuf(
+            "buffer_store_dword",
+            Buffer {
+                vdata: i,
+                srsrc: 8,
+                offset: 4 * u16::from(i),
+                ..Buffer::default()
+            },
+        ));
+    }
     words.push(S_ENDPGM);
 
     let code = asm::bytes(&words);
@@ -159,6 +176,17 @@ fn run_cases(
     cases: &[[u32; 4]],
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
+    run_cases_reading(shader, cases, |backend, i, inputs, out: [u32; 1]| {
+        check(backend, i, inputs, out[0]);
+    });
+}
+
+/// [`run_cases`] with the first `N` dwords of the UAV given to `check`.
+fn run_cases_reading<const N: usize>(
+    shader: &HostShader,
+    cases: &[[u32; 4]],
+    mut check: impl FnMut(&str, usize, [u32; 4], [u32; N]),
+) {
     let _one = crate::testing::one_gpu_test_at_a_time();
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Some(host) = crate::testing::host(warp) else {
@@ -182,13 +210,14 @@ fn run_cases(
                     &pso,
                     &Dispatch {
                         roots: vec![(0, Root::Constants(ud))],
-                        views: &[View::RawUav(1)],
+                        views: &[View::RawUav(N as u32)],
                         samplers: &[],
                         groups: [1, 1, 1],
                     },
                 )
                 .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-            check(label, i, inputs, out[0][0]);
+            let read: [u32; N] = out[0][..N].try_into().expect("the UAV has N dwords");
+            check(label, i, inputs, read);
         }
     }
 }
@@ -308,31 +337,101 @@ fn max_and_min_order_negative_zero_below_positive_zero() {
         ("v_max3_f32", 0x154, pz),
         ("v_min3_f32", 0x151, nz),
     ];
-    // Under D3DMetal a -0 input reaches the shader as +0 (Apple's shader
-    // converter or Metal's fast math), so the minimums cannot be checked
-    // there: each is left out with a skip line, so that a run shows it.
-    // docs/macos.md lists this as an open difference.
-    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
-    // SAFETY: ntdll is always loaded; both names end with a NUL.
-    let wine = unsafe {
-        GetProcAddress(
-            GetModuleHandleA(c"ntdll.dll".as_ptr().cast()),
-            c"wine_get_version".as_ptr().cast(),
-        )
-    }
-    .is_some();
     for (name, op, want) in ops {
-        if wine && want == nz {
-            crate::testing::skip(&format!(
-                "{name}: under Wine a -0 input reaches the shader as +0"
-            ));
-            continue;
-        }
         let shader = build_valu_cs(&vop3(op, 0, vgpr(1), vgpr(2), vgpr(3)));
         run_cases(&shader, &cases, |backend, _, inp, got| {
             assert_eq!(got, want, "{backend}: {name} {inp:x?}");
         });
     }
+}
+
+/// A -0 among a shader's inputs is a -0 inside the shader, on every host:
+/// the shader stores the registers its float minimum read beside the
+/// minimum itself, and each comes back with the bits it was given. (Under
+/// D3DMetal the minimum of a -0 and a +0 once came back as +0, which was
+/// read as the input losing its sign on the way in; it was D3DMetal
+/// handing back another shader's code, see
+/// `shaders_of_one_container_length_keep_their_own_results`.)
+#[test]
+fn negative_zero_inputs_reach_the_shader() {
+    let (pz, nz) = (0_u32, 0x8000_0000_u32);
+    let one = 1.0_f32.to_bits();
+    let cases = [
+        [nz, nz, nz, 0],
+        [nz, pz, nz, 0],
+        [pz, nz, pz, 0],
+        [pz, pz, nz, 0],
+        [nz, one, pz, 0],
+        [one, nz, nz, 0],
+    ];
+    // v_min_f32 v0, v1, v2: the inputs are used as floats too.
+    let min = build_valu_cs_with_inputs(&asm::vop2("v_min_f32", 0, asm::vgpr(1), 2));
+    // v_mul_f32 v0, v1, v2: a float result that has the sign of its inputs.
+    let mul = build_valu_cs_with_inputs(&asm::vop2("v_mul_f32", 0, asm::vgpr(1), 2));
+    let mut wrong = Vec::new();
+    for (name, shader) in [("v_min_f32", &min), ("v_mul_f32", &mul)] {
+        run_cases_reading(shader, &cases, |backend, _, inp, out: [u32; 4]| {
+            let (a, b) = (f32::from_bits(inp[0]), f32::from_bits(inp[1]));
+            let want = if name == "v_mul_f32" {
+                (a * b).to_bits()
+            } else if a == b {
+                inp[0] | inp[1] // of two zeros, -0 if either is
+            } else {
+                a.min(b).to_bits()
+            };
+            if out[1..] != inp[..3] {
+                wrong.push(format!(
+                    "{backend}: {name}: inputs {:x?} read back as {:x?}",
+                    &inp[..3],
+                    &out[1..]
+                ));
+            }
+            if out[0] != want {
+                wrong.push(format!(
+                    "{backend}: {name} {:x?} = {:#x}, want {want:#x}",
+                    &inp[..2],
+                    out[0]
+                ));
+            }
+        });
+    }
+    assert_eq!(wrong, Vec::<String>::new());
+}
+
+/// The half-float maximums and minimums order -0 below +0 as the f32 ones
+/// do (they are computed in f32 and narrowed).
+#[test]
+fn f16_max_and_min_order_negative_zero_below_positive_zero() {
+    let (pz, nz) = (0_u32, 0x8000_u32);
+    let cases = [
+        [nz, pz, nz, 0],
+        [pz, nz, nz, 0],
+        [nz, pz, pz, 0],
+        [pz, nz, pz, 0],
+    ];
+    let two = |name| asm::vop2(name, 0, asm::vgpr(1), 2);
+    let three = |name| {
+        let sources = [asm::vgpr(1), asm::vgpr(2), asm::vgpr(3)];
+        asm::vop3(name, 0, &sources, Vop3Mods::default())
+    };
+    let ops = [
+        ("v_max_f16", two("v_max_f16"), pz),
+        ("v_min_f16", two("v_min_f16"), nz),
+        ("v_max3_f16", three("v_max3_f16"), pz),
+        ("v_min3_f16", three("v_min3_f16"), nz),
+    ];
+    let mut wrong = Vec::new();
+    for (name, body, want) in ops {
+        let shader = build_valu_cs(&body);
+        run_cases(&shader, &cases, |backend, _, inp, got| {
+            if got & 0xFFFF != want {
+                wrong.push(format!(
+                    "{backend}: {name} {inp:x?} = {got:#x}, want {want:#x}"
+                ));
+            }
+        });
+    }
+    assert_eq!(wrong, Vec::<String>::new());
 }
 
 #[test]
