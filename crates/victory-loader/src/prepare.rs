@@ -161,6 +161,8 @@ const CALLBACKS_FIELD_ODD_RELOCATION: &str =
     "a base relocation other than DIR64 at its start changes the TLS callbacks field";
 const RELOCATIONS_OUTSIDE_SECTIONS: &str = "base relocation directory is outside the sections";
 const RELOCATION_BLOCK_MALFORMED: &str = "malformed base relocation block";
+const RELOCATION_BLOCK_ZERO_NOT_LAST: &str =
+    "a base relocation block of size 0 is followed by more of the table";
 
 /// One entry of the base relocation table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -214,8 +216,15 @@ fn base_relocations(bytes: &[u8], info: &ImageInfo) -> Result<Vec<BaseRelocation
         layout::read_u32(table, at),
         at.checked_add(4).and_then(|at| layout::read_u32(table, at)),
     ) {
-        // A block of size 0 ends the table for the Windows loader as well.
+        // A block of size 0 ends the table for Wine's loader. Whether the
+        // Windows loader stops there too is not established, so only the
+        // case where it cannot matter is accepted: nothing follows the
+        // block. Bytes after it may be entries one loader applies and
+        // another never sees, and those could not be disarmed.
         if block == 0 {
+            if at + 8 != table.len() {
+                return Err(PrepareError::Patch(RELOCATION_BLOCK_ZERO_NOT_LAST));
+            }
             break;
         }
         let entries = at
@@ -774,11 +783,11 @@ mod tests {
                 "block size {size}"
             );
         }
-        // A block of size 0 ends the table: the field's entry is then not
-        // in it, which is the "not relocated" refusal.
+        // A block of size 0 with the rest of the table behind it: see
+        // `a_zero_sized_relocation_block_must_be_the_last`.
         let mut bytes = built.bytes.clone();
         write_u32(&mut bytes, block_size, 0).unwrap();
-        assert_eq!(patch_error(prepare(&bytes)), CALLBACKS_FIELD_NOT_RELOCATED);
+        assert_eq!(patch_error(prepare(&bytes)), RELOCATION_BLOCK_ZERO_NOT_LAST);
         // A block with a header and no entries is well formed.
         let mut bytes = built.bytes.clone();
         write_u32(&mut bytes, block_size, 8).unwrap();
@@ -786,6 +795,67 @@ mod tests {
         let relocations = base_relocations(&bytes, &info).unwrap();
         // The four bytes left over cannot hold another block header.
         assert_eq!(relocations, []);
+    }
+
+    /// A title with a TLS directory whose callbacks field is 0 and two
+    /// base relocation blocks: an empty one and one with a DIR64 entry on
+    /// the field, in the order asked for. Returns the image with the empty
+    /// block's size set to 0, and the file offset of the DIR64 entry.
+    fn with_a_zero_sized_block(zero_first: bool) -> (Vec<u8>, usize) {
+        let page = tls_directory_page();
+        let field = [(reloc::DIR64, layout::TLS64_ADDRESS_OF_CALLBACKS as u16)];
+        let builder = title().tls_without_callbacks();
+        let builder = if zero_first {
+            builder.reloc_block(0, &[]).reloc_block(page, &field)
+        } else {
+            builder.reloc_block(page, &field).reloc_block(0, &[])
+        };
+        let mut bytes = builder.build().unwrap().bytes;
+        let info = ImageInfo::parse(&bytes).unwrap();
+        assert_eq!(info.tls.as_ref().unwrap().directory_rva, page);
+        assert_eq!(info.tls.as_ref().unwrap().callbacks_va, 0);
+        // An empty block is 8 bytes, the other one 12.
+        let first = first_relocation_entry(&bytes) - 8;
+        let (zero, entry) = if zero_first {
+            (first, first + 8 + 8)
+        } else {
+            (first + 12, first + 8)
+        };
+        assert_eq!(layout::read_u32(&bytes, zero + 4), Some(8));
+        assert_eq!(bytes[entry..entry + 2], 0xA018u16.to_le_bytes());
+        write_u32(&mut bytes, zero + 4, 0).unwrap();
+        (bytes, entry)
+    }
+
+    /// Wine's loader stops at a block of size 0; that the Windows loader
+    /// does too is not established. An entry behind such a block is one a
+    /// loader may apply and we did not disarm, so the image is refused.
+    #[test]
+    fn a_zero_sized_relocation_block_must_be_the_last() {
+        // The callbacks field is 0 in the file and its DIR64 entry sits
+        // behind the zero block: this used to prepare with the entry armed.
+        let (bytes, entry) = with_a_zero_sized_block(true);
+        assert_eq!(bytes[entry..entry + 2], 0xA018u16.to_le_bytes());
+        assert_eq!(patch_error(prepare(&bytes)), RELOCATION_BLOCK_ZERO_NOT_LAST);
+        let info = ImageInfo::parse(&bytes).unwrap();
+        assert!(matches!(
+            base_relocations(&bytes, &info),
+            Err(PrepareError::Patch(RELOCATION_BLOCK_ZERO_NOT_LAST))
+        ));
+    }
+
+    #[test]
+    fn a_zero_sized_relocation_block_at_the_end_is_harmless() {
+        // Nothing follows the zero block, so every loader sees the same
+        // table, and the entry on the field is disarmed as usual.
+        let (bytes, entry) = with_a_zero_sized_block(false);
+        let prepared = prepare(&bytes).unwrap();
+        assert_eq!(prepared.bytes[entry..entry + 2], [0, 0]);
+        let info = ImageInfo::parse(&prepared.bytes).unwrap();
+        let relocations = base_relocations(&prepared.bytes, &info).unwrap();
+        // The 12-byte block's entry and its padding; nothing from the end.
+        assert_eq!(relocations.len(), 2);
+        assert!(relocations.iter().all(|r| r.kind == REL_BASED_ABSOLUTE));
     }
 
     #[test]
