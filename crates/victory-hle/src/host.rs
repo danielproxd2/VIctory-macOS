@@ -405,6 +405,104 @@ mod imp {
 mod tests {
     use super::*;
 
+    /// What the default policy passes through to the host, by DLL name:
+    /// whole names, and prefixes for the patterns that end in `*`.
+    #[test]
+    fn pass_through_policy_table() {
+        let policy = HostPolicy::default();
+        for dll in [
+            "kernel32.dll",
+            "KERNEL32.DLL",
+            "KernelBase.dll",
+            "ntdll.dll",
+            "ucrtbase.dll",
+            "ws2_32.dll",
+            "WS2_32.dll",
+            "winhttp.dll",
+            "crypt32.dll",
+            "iphlpapi.dll",
+            "IPHLPAPI.DLL",
+            "ole32.dll",
+            "xaudio2_9.dll",
+            // Patterns: versioned API sets and runtime libraries.
+            "api-ms-win-core-synch-l1-2-0.dll",
+            "API-MS-Win-Core-File-l1-1-0.dll",
+            "api-ms-win-core-winrt-l1-1-0.dll",
+            "api-ms-win-core-winrt-string-l1-1-0.dll",
+            "api-ms-win-crt-runtime-l1-1-0.dll",
+            "api-ms-win-eventing-provider-l1-1-0.dll",
+            "api-ms-win-security-base-l1-1-0.dll",
+            "api-ms-win-shcore-scaling-l1-1-1.dll",
+            "ext-ms-win-rtcore-ntuser-window-l1-1-0.dll",
+            "vcruntime140.dll",
+            "vcruntime140_1.dll",
+            "msvcp140.dll",
+            "msvcp140_atomic_wait.dll",
+        ] {
+            assert!(policy.allows(dll), "{dll}");
+        }
+        for dll in [
+            "",
+            "*",
+            // Console-only: ours, or missing.
+            "xgameruntime.dll",
+            "xmem.dll",
+            "d3d12_xs.dll",
+            // Other ways onto the network, which nothing here vets.
+            "wininet.dll",
+            "urlmon.dll",
+            "dnsapi.dll",
+            "mswsock.dll",
+            "wsock32.dll",
+            "icmp.dll",
+            "cryptnet.dll",
+            "combase.dll",
+            "webio.dll",
+            "httpapi.dll",
+            "netapi32.dll",
+            "rasapi32.dll",
+            "wlanapi.dll",
+            "bluetoothapis.dll",
+            "msxml6.dll",
+            // Desktop surface a console title has no use for.
+            "user32.dll",
+            "shell32.dll",
+            // A whole name is not a prefix, and a prefix is not a suffix.
+            "ws2_32.dll.dll",
+            "kernel32",
+            "my-kernel32.dll",
+            "xapi-ms-win-core-synch-l1-2-0.dll",
+            "api-ms-win-net-isolation-l1-1-0.dll",
+            "ext-ms-win-ntuser-window-l1-1-0.dll",
+            "xaudio2_8.dll",
+        ] {
+            assert!(!policy.allows(dll), "{dll}");
+        }
+        // The policy that passes nothing through.
+        let none = HostPolicy::none();
+        for dll in ["kernel32.dll", "api-ms-win-core-synch-l1-2-0.dll", ""] {
+            assert!(!none.allows(dll), "{dll}");
+        }
+        // A pattern is the title's DLL name in lower case.
+        let custom = HostPolicy {
+            allow: vec!["one.dll".into(), "two-*".into()],
+        };
+        assert!(custom.allows("ONE.dll") && custom.allows("Two-l1.dll"));
+        assert!(!custom.allows("two.dll") && !custom.allows("one.dll2"));
+        // Where there is no host to ask, nothing resolves either way.
+        #[cfg(not(windows))]
+        assert_eq!(
+            policy.resolve(
+                "kernel32.dll",
+                &ImportSymbol::Name {
+                    hint: 0,
+                    name: "Sleep".into()
+                }
+            ),
+            None
+        );
+    }
+
     #[test]
     fn bindings_are_read_from_source_text() {
         let source = r#"
