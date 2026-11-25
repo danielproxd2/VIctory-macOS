@@ -1458,6 +1458,9 @@ mod tests {
         crate::shadow::unregister(resource, address);
     }
 
+    /// The size helper by value. Its call site in `State::rectangles_of`
+    /// is run by `rectangle_vertices_must_lie_inside_their_buffer` (the
+    /// 6 GiB view), on a device only.
     #[test]
     fn expanded_rectangles_fit_a_host_view_or_are_refused() {
         assert_eq!(expanded(2, 8), Some(96));
@@ -1506,6 +1509,13 @@ mod tests {
 
     /// A user-data index outside the values of its root parameter stores
     /// nothing.
+    ///
+    /// This covers the helper only. Its call site in `State::bind` is not
+    /// covered: reaching it takes a host pipeline whose translated shader
+    /// has a user-data index past the host parameter's size, and this
+    /// crate's tests cannot build a host pipeline from a synthetic shader
+    /// until the device rig exists. Until then, indexing the values
+    /// directly there again would fail no test.
     #[test]
     fn user_data_outside_its_constants_is_not_stored() {
         let mut values = [0u32; 4];
