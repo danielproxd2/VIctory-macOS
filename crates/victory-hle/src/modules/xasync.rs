@@ -474,9 +474,96 @@ struct Call {
     identity: usize,
     done: Mutex<bool>,
     finished: Condvar,
+    ops: Mutex<Ops>,
+}
+
+/// The provider's operations under way on a call, and whether the call is
+/// over. `Cleanup` is where a provider frees its context ("data in the
+/// context can be cleaned up", as the public reference has it), so it is
+/// the last operation a provider sees: none starts once the call is over,
+/// and the cleanup waits for those that other threads are still in.
+#[derive(Default)]
+struct Ops {
+    /// The thread of each operation under way.
+    running: Vec<std::thread::ThreadId>,
+    /// The call left the table: no further operation starts.
+    over: bool,
+    cleaned: bool,
+}
+
+impl Ops {
+    /// Whether the calling thread is to run the cleanup now: the call is
+    /// over, nobody has cleaned up, and no other thread is in the
+    /// provider. Operations of the calling thread itself do not hold it
+    /// back: a provider that completes its call from inside one of them
+    /// has asked for the cleanup there.
+    fn cleanup_due(&mut self) -> bool {
+        let me = std::thread::current().id();
+        let due = self.over && !self.cleaned && self.running.iter().all(|t| *t == me);
+        self.cleaned |= due;
+        due
+    }
 }
 
 impl Call {
+    fn new(provider: Provider, context: *mut c_void, identity: *const c_void) -> Arc<Call> {
+        Arc::new(Call {
+            provider,
+            context: context as usize,
+            identity: identity as usize,
+            done: Mutex::new(false),
+            finished: Condvar::new(),
+            ops: Mutex::default(),
+        })
+    }
+
+    /// Calls the provider with `op` unless the call is over (`None`: the
+    /// provider was not called). If the call ended on another thread
+    /// meanwhile, its cleanup follows here.
+    fn op(
+        &self,
+        op: u32,
+        block: *mut AsyncBlock,
+        size: usize,
+        buffer: *mut c_void,
+    ) -> Option<HRESULT> {
+        let me = std::thread::current().id();
+        {
+            let mut ops = lock(&self.ops);
+            if ops.over {
+                return None;
+            }
+            ops.running.push(me);
+        }
+        let hr = self.provider(op, block, size, buffer);
+        let cleanup = {
+            let mut ops = lock(&self.ops);
+            if let Some(at) = ops.running.iter().rposition(|t| *t == me) {
+                ops.running.swap_remove(at);
+            }
+            ops.cleanup_due()
+        };
+        if cleanup {
+            self.provider(OP_CLEANUP, block, 0, std::ptr::null_mut());
+        }
+        Some(hr)
+    }
+
+    /// The call has left the table: no operation starts from here on, and
+    /// the provider cleans up, now or when the operations other threads
+    /// are in have returned. Called without the table's lock, since the
+    /// provider may call back into us.
+    fn end(&self, block: *mut AsyncBlock) {
+        let cleanup = {
+            let mut ops = lock(&self.ops);
+            ops.over = true;
+            ops.cleanup_due()
+        };
+        if cleanup {
+            self.provider(OP_CLEANUP, block, 0, std::ptr::null_mut());
+        }
+    }
+
     fn provider(
         &self,
         op: u32,
@@ -519,7 +606,7 @@ fn release(block: *mut AsyncBlock) {
     // Unlocked before the provider runs: it may call back into us.
     let removed = lock(&CALLS).remove(&(block as usize));
     if let Some(call) = removed {
-        call.provider(OP_CLEANUP, block, 0, std::ptr::null_mut());
+        call.end(block);
     }
 }
 
@@ -539,17 +626,12 @@ pub fn XAsyncBegin(
     let (status, size) = words(block);
     status.store(E_PENDING as u32 as usize, Ordering::Release);
     size.store(0, Ordering::Release);
-    let call = Arc::new(Call {
-        provider,
-        context: context as usize,
-        identity: identity as usize,
-        done: Mutex::new(false),
-        finished: Condvar::new(),
-    });
+    let call = Call::new(provider, context, identity);
     lock(&CALLS).insert(block as usize, call.clone());
     // A failed begin fails the call, so the completion routine still runs.
-    let hr = call.provider(OP_BEGIN, block, 0, std::ptr::null_mut());
-    if hr < 0 {
+    if let Some(hr) = call.op(OP_BEGIN, block, 0, std::ptr::null_mut())
+        && hr < 0
+    {
         XAsyncComplete(block, hr, 0);
     }
     S_OK
@@ -563,7 +645,11 @@ pub fn XAsyncSchedule(block: *mut AsyncBlock, delay_ms: u32) -> HRESULT {
         let hr = if canceled {
             E_ABORT
         } else {
-            call.provider(OP_DO_WORK, block, 0, std::ptr::null_mut())
+            // A call that ended while its work was queued has none to do.
+            match call.op(OP_DO_WORK, block, 0, std::ptr::null_mut()) {
+                Some(hr) => hr,
+                None => return,
+            }
         };
         if hr != E_PENDING {
             XAsyncComplete(block, hr, 0);
@@ -619,7 +705,7 @@ pub fn XAsyncComplete(block: *mut AsyncBlock, result: HRESULT, required_size: us
     };
     // Unlocked before the provider runs: it may call back into us.
     if let Some(ended) = ended {
-        ended.provider(OP_CLEANUP, block, 0, std::ptr::null_mut());
+        ended.end(block);
     }
     *done = true;
     call.finished.notify_all();
@@ -662,7 +748,15 @@ pub fn XAsyncGetResultSize(block: *mut AsyncBlock, out: *mut usize) -> HRESULT {
 /// provider completed it first.
 pub fn XAsyncCancel(block: *mut AsyncBlock) {
     if let Some(call) = call(block) {
-        call.provider(OP_CANCEL, block, 0, std::ptr::null_mut());
+        cancel(&call, block);
+    }
+}
+
+/// [`XAsyncCancel`] of a call found in the table a moment ago. It may have
+/// completed on another thread since, and its provider cleaned up: then
+/// there is nothing left to cancel, and the provider is not asked.
+fn cancel(call: &Call, block: *mut AsyncBlock) {
+    if call.op(OP_CANCEL, block, 0, std::ptr::null_mut()).is_some() {
         XAsyncComplete(block, E_ABORT, 0);
     }
 }
@@ -696,7 +790,10 @@ pub fn XAsyncGetResult(
     if buffer_size < size || buffer.is_null() {
         return E_NOT_SUFFICIENT_BUFFER;
     }
-    let hr = call.provider(OP_GET_RESULT, block, buffer_size, buffer);
+    // Taken by another thread since the look-up: as for no call at all.
+    let Some(hr) = call.op(OP_GET_RESULT, block, buffer_size, buffer) else {
+        return E_ILLEGAL_METHOD_CALL;
+    };
     if !used.is_null() {
         // SAFETY: checked non-null.
         unsafe { used.write(size) };
@@ -1285,6 +1382,157 @@ mod tests {
         completing.join().unwrap();
         assert_eq!((waited, polled, sized), (E_ABORT, E_ABORT, E_ABORT));
         assert_eq!(XAsyncGetStatus(&mut block, true), E_ABORT);
+    }
+
+    /// What a provider was asked to do, in order, and a way to hold it in
+    /// its cancel operation.
+    #[derive(Default)]
+    struct Seen {
+        ops: Mutex<Vec<&'static str>>,
+        /// Sent to when the provider is in `Cancel`; it then waits for
+        /// the second channel.
+        park: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    }
+
+    impl Seen {
+        fn ops(&self) -> Vec<&'static str> {
+            lock(&self.ops).clone()
+        }
+    }
+
+    /// Notes every operation; completes with a failure when it works.
+    extern "system" fn noting(op: u32, data: *const ProviderData) -> HRESULT {
+        // SAFETY: the context is the test's `Seen`, which outlives the
+        // call.
+        let (seen, block) = unsafe { (&*(*data).context.cast::<Seen>(), (*data).block) };
+        let note = |what| lock(&seen.ops).push(what);
+        match op {
+            OP_BEGIN => note("begin"),
+            OP_DO_WORK => {
+                note("work");
+                XAsyncComplete(block, E_NOTIMPL, 0);
+                note("work done");
+            }
+            OP_GET_RESULT => note("result"),
+            OP_CANCEL => {
+                note("cancel");
+                if let Some((parked, go_on)) = lock(&seen.park).take() {
+                    let _ = parked.send(());
+                    let _ = go_on.recv_timeout(Duration::from_secs(30));
+                }
+                note("cancel done");
+            }
+            OP_CLEANUP => note("cleanup"),
+            _ => note("unknown"),
+        }
+        S_OK
+    }
+
+    fn begin_noting(block: &mut AsyncBlock, seen: &Seen) {
+        let context = std::ptr::from_ref(seen).cast_mut().cast();
+        let (identity, name) = (std::ptr::null(), std::ptr::null());
+        assert_eq!(
+            XAsyncBegin(block, context, identity, name, Some(noting)),
+            S_OK
+        );
+        assert_eq!(XAsyncGetStatus(block, false), E_PENDING);
+    }
+
+    fn manual_block(queue: *const Queue) -> AsyncBlock {
+        AsyncBlock {
+            queue,
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        }
+    }
+
+    /// `Cleanup` is where a provider frees its context, so no operation
+    /// may follow it. A cancel that found the call just before another
+    /// thread completed it and cleaned up does not reach the provider any
+    /// more, and does not turn the call's result into `E_ABORT`; nor does
+    /// work still queued for the call.
+    #[test]
+    fn a_call_that_is_over_is_not_cancelled() {
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(0, 0, &mut q), S_OK);
+        let seen = Seen::default();
+        let mut block = manual_block(q);
+        begin_noting(&mut block, &seen);
+        assert_eq!(XAsyncSchedule(&mut block, 0), S_OK);
+        // Where `XAsyncCancel` stands once it has looked the call up.
+        let found = call(&mut block).expect("a call in flight");
+
+        XAsyncComplete(&mut block, E_INVALIDARG, 0);
+        assert_eq!(seen.ops(), ["begin", "cleanup"]);
+
+        cancel(&found, &mut block);
+        assert_eq!(
+            found.op(OP_CANCEL, &mut block, 0, std::ptr::null_mut()),
+            None
+        );
+        assert_eq!(
+            found.op(OP_DO_WORK, &mut block, 0, std::ptr::null_mut()),
+            None
+        );
+        assert_eq!(
+            found.op(OP_GET_RESULT, &mut block, 0, std::ptr::null_mut()),
+            None
+        );
+        XAsyncCancel(&mut block);
+        // The work queued before the call ended finds no call.
+        assert!(XTaskQueueDispatch(q, WORK, 0));
+        assert_eq!(seen.ops(), ["begin", "cleanup"]);
+        assert_eq!(XAsyncGetStatus(&mut block, true), E_INVALIDARG);
+        XTaskQueueCloseHandle(q);
+    }
+
+    /// A call completed while another thread is in the provider's cancel
+    /// is over at once for the title (its status is final), but the
+    /// provider cleans up only when the cancel has returned.
+    #[test]
+    fn a_cancel_under_way_holds_back_the_cleanup() {
+        use std::sync::mpsc::channel;
+        let (parked, in_cancel) = channel();
+        let (release, go_on) = channel();
+        let seen = Seen::default();
+        *lock(&seen.park) = Some((parked, go_on));
+        let mut block = manual_block(std::ptr::null());
+        begin_noting(&mut block, &seen);
+
+        let address = &raw mut block as usize;
+        let cancelling = std::thread::spawn(move || XAsyncCancel(address as *mut AsyncBlock));
+        assert!(in_cancel.recv_timeout(Duration::from_secs(30)).is_ok());
+        XAsyncComplete(&mut block, E_INVALIDARG, 0);
+        let during = seen.ops();
+        let status = XAsyncGetStatus(&mut block, true);
+        let gone = call(&mut block).is_none();
+        release.send(()).unwrap();
+        cancelling.join().unwrap();
+
+        assert_eq!(during, ["begin", "cancel"]);
+        assert_eq!(seen.ops(), ["begin", "cancel", "cancel done", "cleanup"]);
+        // The completion won; the cancel's own `E_ABORT` came too late.
+        assert!(gone, "the call has ended");
+        assert_eq!(status, E_INVALIDARG);
+        assert_eq!(XAsyncGetStatus(&mut block, true), E_INVALIDARG);
+    }
+
+    /// A provider that completes its call from inside one of its own
+    /// operations is cleaned up there, as before: only operations on
+    /// other threads hold the cleanup back.
+    #[test]
+    fn completing_inside_an_operation_cleans_up_at_once() {
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(0, 0, &mut q), S_OK);
+        let seen = Seen::default();
+        let mut block = manual_block(q);
+        begin_noting(&mut block, &seen);
+        assert_eq!(XAsyncSchedule(&mut block, 0), S_OK);
+        assert!(XTaskQueueDispatch(q, WORK, 0));
+        assert_eq!(seen.ops(), ["begin", "work", "cleanup", "work done"]);
+        assert_eq!(XAsyncGetStatus(&mut block, true), E_NOTIMPL);
+        XTaskQueueCloseHandle(q);
     }
 
     #[test]
