@@ -1,6 +1,7 @@
 //! Repository maintenance. Run with `cargo xtask <command>`.
 
 mod embed_clamp;
+mod fmt;
 mod policy;
 
 use std::path::{Path, PathBuf};
@@ -34,6 +35,17 @@ enum Cmd {
     /// depth.dxbc in a folder (depth.hlsl compiled as the clamp-bytecode
     /// workflow compiles clamp.hlsl).
     EmbedDepth { folder: PathBuf },
+    /// Format the fork's own Rust files with rustfmt: those that are not in
+    /// the last merged upstream commit (the merge base of HEAD and
+    /// upstream/main). Files that exist upstream are left as they are, also
+    /// where the fork changed them: upstream's layout is kept so that
+    /// merges do not conflict on formatting.
+    Fmt,
+    /// Check that the fork's own Rust files are formatted, without writing.
+    /// Files that exist upstream are not checked, also where the fork
+    /// changed them. Without an `upstream` remote (a plain clone) nothing
+    /// is checked and the command succeeds with a message.
+    FmtCheck,
 }
 
 fn main() -> Result<()> {
@@ -50,6 +62,8 @@ fn main() -> Result<()> {
             &root.join("crates/victory-gpu/src"),
             &folder,
         ),
+        Cmd::Fmt => fmt::run(&root, true),
+        Cmd::FmtCheck => fmt::run(&root, false),
         Cmd::InstallHooks => {
             let status = Command::new("git")
                 .args(["config", "core.hooksPath", ".githooks"])
