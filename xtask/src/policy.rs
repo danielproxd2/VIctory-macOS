@@ -887,20 +887,115 @@ mod tests {
         );
     }
 
+    /// Whether this process runs under Wine: its ntdll has the export
+    /// only Wine's has.
+    fn under_wine() -> bool {
+        #[cfg(windows)]
+        {
+            use std::ffi::{c_char, c_void};
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn GetModuleHandleA(name: *const c_char) -> *mut c_void;
+                fn GetProcAddress(module: *mut c_void, name: *const c_char) -> *mut c_void;
+            }
+            // SAFETY: ntdll is loaded in every process and both names end
+            // with a NUL.
+            unsafe {
+                let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr());
+                !ntdll.is_null() && !GetProcAddress(ntdll, c"wine_get_version".as_ptr()).is_null()
+            }
+        }
+        #[cfg(not(windows))]
+        false
+    }
+
+    /// Whether the repository check has nothing to list files with: the
+    /// process runs under Wine and no `git` was found to start (`git`
+    /// is how starting it ended). Only that: the host's git is a Unix
+    /// program that a Windows search path does not hold. On any other
+    /// system, and for any other failure, the check runs and says what
+    /// went wrong.
+    fn no_git_under_wine(wine: bool, git: Result<(), std::io::ErrorKind>) -> bool {
+        wine && git == Err(std::io::ErrorKind::NotFound)
+    }
+
+    /// What the test does where the check cannot run (`reason`): the line
+    /// it prints before it passes, or, where the switch `var` is on in
+    /// this run (its value is `value`; only `1` is on), what it fails with.
+    fn unmet(var: &str, value: Option<&str>, reason: &str, test: &str) -> Result<String, String> {
+        if value.is_some_and(|v| v.trim() == "1") {
+            Err(format!("{var}=1: {reason} ({test})"))
+        } else {
+            Ok(format!("skipped: {reason} ({test})"))
+        }
+    }
+
     /// Enforces the policy wherever tests run, even in clones without the hook.
+    ///
+    /// The check lists files with git. Inside Wine (the macOS test runs)
+    /// the host's git cannot be started, so there the test passes after
+    /// the line `skipped: <reason> (<test>)` on the process's own standard
+    /// error, past the harness's capture; `VICTORY_REQUIRE_POLICY=1` makes
+    /// that a failure. `cargo xtask policy` and the native test run check
+    /// the same tree.
     #[test]
     fn repository_passes_policy() {
-        // The check lists files with git. Where git cannot be started, as
-        // inside Wine on the macOS test runs, there is nothing to check.
-        if std::process::Command::new("git")
+        use std::io::Write;
+        let git = std::process::Command::new("git")
             .arg("--version")
             .output()
-            .is_err()
-        {
-            eprintln!("git cannot be started here: policy not checked");
+            .map(drop)
+            .map_err(|e| e.kind());
+        if no_git_under_wine(under_wine(), git) {
+            let var = "VICTORY_REQUIRE_POLICY";
+            let thread = std::thread::current();
+            match unmet(
+                var,
+                std::env::var(var).ok().as_deref(),
+                "Wine starts no git: the repository policy is not checked",
+                thread.name().unwrap_or("?"),
+            ) {
+                Ok(line) => {
+                    let _ = writeln!(std::io::stderr(), "{line}");
+                }
+                Err(why) => panic!("{why}"),
+            }
             return;
         }
         super::run(&crate::workspace_root(), false).unwrap();
+    }
+
+    /// The repository check is left out only under Wine with no git to
+    /// start; a missing git anywhere else, or any other failure under
+    /// Wine, goes on to the check, which fails.
+    #[test]
+    fn only_wine_without_git_leaves_the_check_out() {
+        use std::io::ErrorKind::{NotFound, PermissionDenied};
+        assert!(no_git_under_wine(true, Err(NotFound)));
+        assert!(!no_git_under_wine(false, Err(NotFound)));
+        assert!(!no_git_under_wine(true, Err(PermissionDenied)));
+        assert!(!no_git_under_wine(true, Ok(())));
+        assert!(!no_git_under_wine(false, Ok(())));
+        // This process is under Wine only if it is a Windows process.
+        assert!(cfg!(windows) || !under_wine());
+    }
+
+    /// The skip is the uniform line, and a failure naming the switch only
+    /// when the switch is exactly `1`.
+    #[test]
+    fn the_left_out_check_is_a_visible_skip_or_a_failure() {
+        let var = "VICTORY_REQUIRE_POLICY";
+        for off in [None, Some(""), Some("0"), Some("true"), Some("11")] {
+            assert_eq!(
+                unmet(var, off, "no git", "tests::a_test"),
+                Ok("skipped: no git (tests::a_test)".into()),
+                "{off:?}"
+            );
+        }
+        assert_eq!(
+            unmet(var, Some("1"), "no git", "tests::a_test"),
+            Err("VICTORY_REQUIRE_POLICY=1: no git (tests::a_test)".into())
+        );
     }
 
     #[test]
