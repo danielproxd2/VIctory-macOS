@@ -66,6 +66,11 @@ fn inspect_reports_the_probes_imports() {
         ("title_a.dll", "title_a_named"),
         ("kernel32.dll", "GetTickCount"),
         ("kernel32.dll", "GetCurrentProcessId"),
+        ("kernel32.dll", "CreateFileW"),
+        ("kernel32.dll", "LoadLibraryExA"),
+        ("xmem.dll", "XMemAlloc"),
+        ("xmem.dll", "XMemVirtualAlloc"),
+        ("ws2_32.dll", "connect"),
     ] {
         assert!(
             functions(&imports, dll).contains(&function),
@@ -90,7 +95,17 @@ fn inspect_reports_the_probes_imports() {
     // --exports lists what the probe offers the tests.
     let out = victory(&["inspect".as_ref(), probe.as_os_str(), "--exports".as_ref()]);
     let text = report(&out);
-    for export in ["probe_xgameruntime_init", "probe_missing", "probe_delayed"] {
+    for export in [
+        "probe_xgameruntime_init",
+        "probe_missing",
+        "probe_delayed",
+        "probe_xmem_alloc",
+        "probe_connect_ordinal",
+        "probe_create",
+        "probe_query_api",
+        // Data: the table of allocation hooks a title's image may export.
+        "__XMemAllocationHooks__",
+    ] {
         assert!(
             text.lines().any(|l| l.contains(&format!("  {export}  0x"))),
             "{export}\n{text}"
@@ -147,6 +162,10 @@ fn census_reports_covered_and_missing_imports() {
     let covered = [
         // Implemented by our runtime.
         "xgameruntime.dll!XGameRuntimeInitialize",
+        "xmem.dll!XMemAlloc",
+        // The host's, overridden by our runtime.
+        "kernel32.dll!CreateFileW",
+        "ws2_32.dll!connect",
         // Passed through to the host.
         "kernel32.dll!GetCurrentProcessId",
     ];
@@ -172,6 +191,12 @@ fn census_reports_covered_and_missing_imports() {
     for name in nobodys {
         assert!(list.iter().any(|m| m == name), "{name} in {list:?}");
     }
-    let ours = "xgameruntime.dll!XGameRuntimeInitialize";
-    assert!(!list.iter().any(|m| m == ours), "{list:?}");
+    for ours in [
+        "xgameruntime.dll!XGameRuntimeInitialize",
+        "xmem.dll!XMemAlloc",
+        "kernel32.dll!CreateFileW",
+        "ws2_32.dll!connect",
+    ] {
+        assert!(!list.iter().any(|m| m == ours), "{ours} in {list:?}");
+    }
 }

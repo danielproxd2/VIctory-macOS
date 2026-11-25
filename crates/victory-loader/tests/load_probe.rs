@@ -2,7 +2,7 @@
 //! (tests/fixtures/hle-probe), without any game data.
 #![cfg(windows)]
 
-use std::ffi::CString;
+use std::ffi::{CString, c_void};
 
 use victory_loader::{
     ImportResolver, Provenance, Resolution, UnimplementedPolicy, WithTitleDlls, prepare,
@@ -46,15 +46,48 @@ extern "system" fn fake_delayed() -> u32 {
     4242
 }
 
+/// The console's memory API has no host: the probe's imports from it get
+/// these, which hand out nothing. (victory-hle's tests bind the probe
+/// against the real ones.)
+extern "system" fn fake_xmem_alloc(_size: usize, _attributes: u64) -> *mut c_void {
+    std::ptr::null_mut()
+}
+extern "system" fn fake_xmem_free(_address: *mut c_void, _attributes: u64) {}
+extern "system" fn fake_xmem_virtual_alloc(
+    _base: *mut c_void,
+    _size: usize,
+    _kind: u32,
+    _flags: u64,
+    _protect: u32,
+) -> *mut c_void {
+    std::ptr::null_mut()
+}
+
 struct TestResolver;
 
 impl ImportResolver for TestResolver {
     fn resolve(&self, dll: &str, symbol: &ImportSymbol) -> Resolution {
         let dll = dll.to_ascii_lowercase();
-        let ImportSymbol::Name { name, .. } = symbol else {
-            return Resolution::Missing;
+        let name = match symbol {
+            ImportSymbol::Name { name, .. } => name,
+            // By ordinal alone: the host's, if it has the DLL.
+            ImportSymbol::Ordinal(ordinal) => {
+                return host_ordinal(&dll, *ordinal)
+                    .map(|address| Resolution::Found {
+                        address,
+                        provenance: Provenance::Host,
+                    })
+                    .unwrap_or(Resolution::Missing);
+            }
         };
         let hle = match (dll.as_str(), name.as_str()) {
+            ("xmem.dll", "XMemAlloc" | "XMemAllocDefault") => {
+                Some(fake_xmem_alloc as *const () as usize)
+            }
+            ("xmem.dll", "XMemFree" | "XMemFreeDefault") => {
+                Some(fake_xmem_free as *const () as usize)
+            }
+            ("xmem.dll", "XMemVirtualAlloc") => Some(fake_xmem_virtual_alloc as *const () as usize),
             ("xgameruntime.dll", "XGameRuntimeInitialize") => {
                 Some(fake_xgameruntime_initialize as *const () as usize)
             }
@@ -109,6 +142,21 @@ fn host(dll: &str, name: &str) -> Option<usize> {
             return None;
         }
         GetProcAddress(module, name.as_ptr().cast()).map(|f| f as *const () as usize)
+    }
+}
+
+/// The host's export `ordinal` of `dll`, if the host has that DLL.
+fn host_ordinal(dll: &str, ordinal: u16) -> Option<usize> {
+    let dll = CString::new(dll).ok()?;
+    // SAFETY: a NUL-terminated string; a value below 0x10000 in place of
+    // the name is an ordinal. Only DLLs the host has are loaded: title DLLs
+    // are answered before this resolver is asked.
+    unsafe {
+        let module = LoadLibraryA(dll.as_ptr().cast());
+        if module.is_null() {
+            return None;
+        }
+        GetProcAddress(module, usize::from(ordinal) as *const u8).map(|f| f as *const () as usize)
     }
 }
 
@@ -173,17 +221,32 @@ fn loads_binds_and_calls_probe() {
     // probe's runtime imports more from the host, and which ones depends
     // on the toolchain that built it, so those are held to a rule instead
     // of a list: whatever is not named here comes from the host.
-    const FROM_HLE: [&str; 3] = [
+    const FROM_HLE: [&str; 8] = [
         "xgameruntime.dll!XGameRuntimeInitialize",
         "kernel32.dll!GetTickCount",
         "victory-probe-delayed.dll!VIctoryProbeDelayed",
+        "xmem.dll!XMemAlloc",
+        "xmem.dll!XMemFree",
+        "xmem.dll!XMemAllocDefault",
+        "xmem.dll!XMemFreeDefault",
+        "xmem.dll!XMemVirtualAlloc",
     ];
     const FROM_TITLE: [&str; 3] = [
         "title_a.dll!title_a_named",
         "title_a.dll!#7",
         "title_a.dll!TITLE_A_DATA",
     ];
-    const FROM_HOST: &str = "kernel32.dll!GetCurrentProcessId";
+    // This resolver overrides nothing of these; the real one does (see
+    // victory-hle's tests/probe_hle.rs).
+    const FROM_HOST: [&str; 7] = [
+        "kernel32.dll!GetCurrentProcessId",
+        "kernel32.dll!CreateFileW",
+        "kernel32.dll!GetFileAttributesW",
+        "kernel32.dll!LoadLibraryExA",
+        "kernel32.dll!GetProcAddress",
+        "ws2_32.dll!connect",
+        "ws2_32.dll!#4",
+    ];
     const MISSING: &str = "victory-probe-missing.dll!VIctoryProbeNotImplemented";
     let provided_by = |wanted: Option<Provenance>| -> Vec<&str> {
         let mut names: Vec<_> = answers
@@ -203,7 +266,9 @@ fn loads_binds_and_calls_probe() {
     assert_eq!(provided_by(Some(Provenance::Title)), sorted(&FROM_TITLE));
     assert_eq!(provided_by(None), [MISSING]);
     let from_host = provided_by(Some(Provenance::Host));
-    assert!(from_host.contains(&FROM_HOST), "{from_host:?}");
+    for name in FROM_HOST {
+        assert!(from_host.contains(&name), "{name} in {from_host:?}");
+    }
 
     // The loader asked once for each import of the image, delay imports
     // included, and for nothing else.
