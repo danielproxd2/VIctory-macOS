@@ -582,6 +582,32 @@ fn tagged_record(handle: u64, tag: u32) -> Option<RtvRecord> {
     (record.tag == tag).then_some(record)
 }
 
+/// What follows a heap description, read only as a hint: a title that
+/// passes the plain description has its own stack or data after it, or
+/// nothing at all where the description ends a page, which is then no
+/// placement (the kernel reads it, so that it cannot fault).
+fn placement_after(desc: *const HeapDesc) -> Option<Placement> {
+    let after = desc.wrapping_add(1).cast::<u8>();
+    #[cfg(windows)]
+    {
+        let mut bytes = [0u8; size_of::<Placement>()];
+        crate::host::read_into(after, &mut bytes).then(|| {
+            let (address, size) = bytes.split_at(8);
+            Placement {
+                address: u64::from_le_bytes(address.try_into().unwrap_or_default()),
+                size: u64::from_le_bytes(size.try_into().unwrap_or_default()),
+            }
+        })
+    }
+    // shortcut: without a host (tests on other systems) it is read as it
+    // is: there is no title there.
+    #[cfg(not(windows))]
+    {
+        // SAFETY: as above; the tests pass the extended description.
+        Some(unsafe { after.cast::<Placement>().read_unaligned() })
+    }
+}
+
 /// Device method.
 pub(crate) extern "system" fn create_heap(
     _: This,
@@ -597,14 +623,16 @@ pub(crate) extern "system" fn create_heap(
     else {
         return E_INVALIDARG;
     };
-    // SAFETY: read only as a hint: a title that passes the plain
-    // description has its own stack or data after it.
-    let placement = unsafe { desc_ptr.add(1).cast::<Placement>().read_unaligned() };
     // shortcut: a placement is recognised by its size matching the count,
     // since the plain and extended descriptions share the slot and the
     // interface version; find the flag that tells them apart if a title
     // trips over this.
-    let placed = placement.address != 0 && placement.size == size;
+    let placement = placement_after(desc_ptr);
+    let placed = placement.is_some_and(|p| p.address != 0 && p.size == size);
+    let placement = placement.unwrap_or(Placement {
+        address: 0,
+        size: 0,
+    });
     tracing::debug!(?desc, placed, "descriptor heap");
     let (start, memory) = if placed {
         (placement.address, None)
@@ -789,5 +817,61 @@ mod tests {
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+    }
+
+    /// A plain description in the last bytes of a page, with nothing
+    /// mapped after it: the look for a placement behind it must not
+    /// fault, and finds none.
+    #[cfg(windows)]
+    #[test]
+    fn a_heap_description_at_the_end_of_a_page_is_read_safely() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree,
+        };
+        const PAGE: usize = 0x1000;
+        // SAFETY: two fresh pages of our own, the second given back.
+        let pages = unsafe {
+            let pages = VirtualAlloc(
+                std::ptr::null(),
+                2 * PAGE,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            );
+            assert!(!pages.is_null());
+            assert_ne!(
+                VirtualFree(pages.cast::<u8>().add(PAGE).cast(), PAGE, MEM_DECOMMIT),
+                0
+            );
+            pages.cast::<u8>()
+        };
+        let desc = HeapDesc {
+            kind: 0,
+            count: 64,
+            flags: 0,
+            nodes: 0,
+        };
+        // SAFETY: the description's 16 bytes end the first page.
+        let at = unsafe { pages.add(PAGE - size_of::<HeapDesc>()).cast::<HeapDesc>() };
+        // SAFETY: as above.
+        unsafe { at.write(desc) };
+        assert!(placement_after(at).is_none());
+        // One byte of a placement missing is none either.
+        // SAFETY: inside the first page.
+        let short = unsafe { pages.add(PAGE - 31).cast::<HeapDesc>() };
+        assert!(placement_after(short).is_none());
+
+        let mut h = std::ptr::null();
+        assert_eq!(
+            create_heap(std::ptr::null(), at, &HEAP_IIDS[0], &mut h),
+            S_OK
+        );
+        let start = slot::<extern "system" fn(This) -> u64>(h, 0x48)(h);
+        // Memory of the heap's own, not placed.
+        assert_ne!(start, 0);
+        assert_eq!(start % 64, 0);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(h, 0x10)(h), 0);
+        // SAFETY: ours, no longer used.
+        unsafe { VirtualFree(pages.cast(), 0, MEM_RELEASE) };
     }
 }

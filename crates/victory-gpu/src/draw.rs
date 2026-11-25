@@ -115,6 +115,12 @@ pub(crate) fn take_dropped() -> u64 {
 }
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
+/// Draws and dispatches not run on the host so far.
+#[cfg(test)]
+pub(crate) fn dropped_draws() -> u64 {
+    DROPPED.load(Ordering::Relaxed)
+}
+
 /// Marks the last traced draw as not run on the host.
 #[cfg(feature = "diagnostics")]
 fn dropped(pipeline: usize) {
@@ -158,12 +164,48 @@ macro_rules! once {
     }};
 }
 
-fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
+/// The most a root signature holds, in 32-bit values: PC D3D12's limit.
+/// A root parameter takes at least one, so there are no more parameters
+/// than this either.
+/// shortcut: whether the console allows more is not known; what a title
+/// sets past it is ignored (logged once), not kept.
+const ROOT_DWORDS: usize = 64;
+
+/// Sets root parameter `slot`; false (and nothing kept) for a slot no
+/// root signature has. The title's slot sizes the vector.
+fn set(roots: &mut Vec<Root>, slot: u32, root: Root) -> bool {
     let slot = slot as usize;
+    if slot >= ROOT_DWORDS {
+        once!(
+            slot,
+            "a root parameter past the root signature limit; ignored"
+        );
+        return false;
+    }
     if roots.len() <= slot {
         roots.resize(slot + 1, Root::None);
     }
     roots[slot] = root;
+    true
+}
+
+/// Stores a shader's user-data value at `index` of the values the host
+/// parameter takes; false if the translator's index is outside them.
+fn store(values: &mut [u32], index: u32, value: u32) -> bool {
+    match values.get_mut(index as usize) {
+        Some(v) => {
+            *v = value;
+            true
+        }
+        None => false,
+    }
+}
+
+/// The bytes of `rects` rectangles of `stride`-byte vertices drawn as two
+/// triangles each, if a host vertex buffer view (32 bits) can say them.
+fn expanded(rects: u64, stride: u64) -> Option<u32> {
+    let bytes = rects.checked_mul(6)?.checked_mul(stride)?;
+    u32::try_from(bytes).ok()
 }
 
 impl State {
@@ -222,17 +264,40 @@ impl State {
     }
 
     pub(crate) fn set_constants(&mut self, compute: bool, slot: u32, values: &[u32], offset: u32) {
+        // The title's offset and count size the vector: checked first,
+        // so that a refused write leaves the state as it was.
+        let end = (offset as usize)
+            .checked_add(values.len())
+            .filter(|end| *end <= ROOT_DWORDS);
+        let Some(end) = end else {
+            once!(
+                offset,
+                count = values.len(),
+                "root constants past the root signature limit; ignored"
+            );
+            return;
+        };
         let roots = self.roots(compute);
         let s = slot as usize;
-        if !matches!(roots.get(s), Some(Root::Constants(_))) {
-            set(roots, slot, Root::Constants(Vec::new()));
+        if !matches!(roots.get(s), Some(Root::Constants(_)))
+            && !set(roots, slot, Root::Constants(Vec::new()))
+        {
+            return;
         }
-        if let Root::Constants(c) = &mut roots[s] {
-            let end = offset as usize + values.len();
+        if let Some(Root::Constants(c)) = roots.get_mut(s) {
             if c.len() < end {
                 c.resize(end, 0);
             }
             c[offset as usize..end].copy_from_slice(values);
+        }
+    }
+
+    /// The constants root parameter `slot` holds, if it holds constants.
+    #[cfg(test)]
+    pub(crate) fn constants(&self, compute: bool, slot: u32) -> Option<Vec<u32>> {
+        match self.roots_ref(compute).get(slot as usize) {
+            Some(Root::Constants(c)) => Some(c.clone()),
+            _ => None,
         }
     }
 
@@ -485,10 +550,19 @@ impl State {
                     let fresh = made
                         .iter()
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
-                    values[u.index as usize] = match fresh {
+                    let value = match fresh {
                         Some(&(_, offset)) => offset,
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
+                    // The index is the translator's, the size the host
+                    // pipeline's: they agree unless one of them is wrong.
+                    if !store(&mut values, u.index, value) {
+                        once!(
+                            index = u.index,
+                            dwords,
+                            "a shader's user data lies outside its root constants"
+                        );
+                    }
                 }
                 // SAFETY: an open list; `values` covers the parameter.
                 unsafe {
@@ -900,6 +974,13 @@ impl State {
             }
             let v = self.vertex[slot as usize];
             let stride = u64::from(v.stride);
+            // What the host view of the triangles says its size is: more
+            // than it can say is refused before any memory is asked for
+            // (it used to be cut to 32 bits over memory of the full size).
+            let Some(size) = expanded(rects, stride) else {
+                once!(slot, "rectangles too large for a host vertex buffer");
+                return false;
+            };
             // The title's first vertex, count and stride are each 32 bits:
             // their sum and products are checked, never wrapped.
             let from = (u64::from(first) + u64::from(count))
@@ -911,7 +992,7 @@ impl State {
                 once!(slot, "rectangle vertices outside their buffer");
                 return false;
             };
-            let Some((gpu, to)) = list.scratch(rects * 6 * stride) else {
+            let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                 return false;
             };
             let (from, to, stride) = (from as usize, to as usize, stride as usize);
@@ -929,7 +1010,7 @@ impl State {
             });
             let view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: gpu,
-                SizeInBytes: (rects * 6 * stride as u64) as u32,
+                SizeInBytes: size,
                 StrideInBytes: v.stride,
             };
             // SAFETY: an open list; the view names live scratch memory.
@@ -1320,7 +1401,82 @@ mod tests {
             3
         ));
 
+        // Twice as many bytes as triangles as the vertices have: a buffer
+        // of 3 GiB of them (registered; nothing is behind the address and
+        // nothing reads it) would need a 6 GiB view. Refused before the
+        // buffer gets a host copy.
+        const BIG: u64 = 0x7b00_0000_0000;
+        crate::shadow::register(resource, BIG, 0xc000_0000);
+        let big = VertexView {
+            address: BIG,
+            size: 0xc000_0000,
+            stride: 8,
+        };
+        let refused = !ran(big, 0x1800_0000, 0);
+        let copied = crate::shadow::copied(resource, BIG);
+        crate::shadow::unregister(resource, BIG);
+        assert!(refused, "a view of 6 GiB");
+        assert!(!copied, "a host copy was made for a refused draw");
+
         drop(list);
         crate::shadow::unregister(resource, address);
+    }
+
+    #[test]
+    fn expanded_rectangles_fit_a_host_view_or_are_refused() {
+        assert_eq!(expanded(2, 8), Some(96));
+        assert_eq!(expanded(0, 8), Some(0));
+        // The most rectangles that fit, of 16 and of 8 bytes a vertex.
+        assert_eq!(expanded(0x02aa_aaaa, 16), Some(0xffff_ffc0));
+        assert_eq!(expanded(0x0555_5555, 8), Some(0xffff_fff0));
+        // One more rectangle: 2^32 + 32 bytes, which 32 bits cut to 32.
+        assert_eq!(expanded(0x0555_5556, 8), None);
+        assert_eq!(expanded(0x0800_0000, 8), None, "0x1_8000_0000 bytes");
+        // Past 64 bits.
+        assert_eq!(expanded(u64::from(u32::MAX / 3), u64::from(u32::MAX)), None);
+        assert_eq!(expanded(u64::MAX, 1), None);
+    }
+
+    /// Root constants are kept up to the 64 values a root signature holds;
+    /// a write past that, or to a parameter no signature has, changes
+    /// nothing and allocates nothing.
+    #[test]
+    fn root_constants_past_the_limit_are_ignored() {
+        let mut state = State::default();
+        state.set_constants(false, 0, &[1, 2], u32::MAX);
+        state.set_constants(false, 0, &[1, 2], 63);
+        state.set_constants(false, 0, &[0; 65], 0);
+        state.set_constants(true, 1, &[1], 64);
+        assert!(state.graphics.is_empty() && state.compute.is_empty());
+
+        state.set_constants(false, 0, &[1, 2, 3, 4], 60);
+        let mut expected = vec![0u32; 60];
+        expected.extend([1, 2, 3, 4]);
+        assert_eq!(state.constants(false, 0), Some(expected.clone()));
+        state.set_constants(false, 0, &[9, 9], 63);
+        assert_eq!(state.constants(false, 0), Some(expected));
+        state.set_constants(false, 0, &[9], 63);
+        assert_eq!(state.constants(false, 0).unwrap()[60..], [1, 2, 3, 9]);
+
+        // Parameters: 64 at most, whatever is set there.
+        state.set_constants(true, u32::MAX, &[1], 0);
+        state.set_constants(true, 64, &[1], 0);
+        state.set_table(true, u32::MAX, 0x1000);
+        state.set_view(true, 1 << 20, 0x1000);
+        assert!(state.compute.is_empty());
+        state.set_view(true, 63, 0x1000);
+        assert_eq!(state.compute.len(), 64);
+    }
+
+    /// A user-data index outside the values of its root parameter stores
+    /// nothing.
+    #[test]
+    fn user_data_outside_its_constants_is_not_stored() {
+        let mut values = [0u32; 4];
+        assert!(store(&mut values, 3, 7));
+        assert!(!store(&mut values, 4, 8));
+        assert!(!store(&mut values, u32::MAX, 9));
+        assert!(!store(&mut [], 0, 1));
+        assert_eq!(values, [0, 0, 0, 7]);
     }
 }

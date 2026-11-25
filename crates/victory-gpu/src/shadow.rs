@@ -442,6 +442,16 @@ pub(crate) fn unregister(resource: usize, start: u64) {
     buffers().map.remove(&(start, resource));
 }
 
+/// Whether the buffer registered as (`resource`, `start`) has a host copy.
+#[cfg(test)]
+pub(crate) fn copied(resource: usize, start: u64) -> bool {
+    let buffers = buffers();
+    buffers
+        .map
+        .get(&(start, resource))
+        .is_some_and(|e| e.shadow.is_some())
+}
+
 /// How many buffers starting below an address are looked at before a
 /// longer search is worth a line in the log.
 const NEAR: usize = 64;

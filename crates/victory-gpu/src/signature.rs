@@ -3,7 +3,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use crate::object::{
-    self, COMMAND_SIGNATURE, E_INVALIDARG, HRESULT, Iid, Object, Table, This, guid,
+    self, COMMAND_SIGNATURE, E_INVALIDARG, E_OUTOFMEMORY, HRESULT, Iid, Object, Table, This, guid,
 };
 use crate::resource::PAGEABLE_IIDS;
 
@@ -50,12 +50,21 @@ pub(crate) extern "system" fn create(
     if desc.arguments.is_null() && desc.count > 0 {
         return E_INVALIDARG;
     }
-    let arguments = if desc.count == 0 {
-        Vec::new()
-    } else {
+    // The count sizes a copy: every argument of public D3D12 takes at
+    // least 4 bytes of a record, so a record of `stride` bytes has no more
+    // than a quarter as many. (A zero stride says nothing.)
+    if desc.stride != 0 && desc.count > desc.stride / 4 {
+        return E_INVALIDARG;
+    }
+    let mut arguments = Vec::new();
+    if desc.count > 0 {
+        if arguments.try_reserve_exact(desc.count as usize).is_err() {
+            return E_OUTOFMEMORY;
+        }
         // SAFETY: the title passes `count` argument descriptions.
-        unsafe { std::slice::from_raw_parts(desc.arguments, desc.count as usize) }.to_vec()
-    };
+        let given = unsafe { std::slice::from_raw_parts(desc.arguments, desc.count as usize) };
+        arguments.extend_from_slice(given);
+    }
     tracing::debug!(stride = desc.stride, ?arguments, "command signature");
     let signature = Box::new(Signature {
         object: Object::new(&FUNCTIONS),
@@ -92,3 +101,70 @@ static FUNCTIONS: Table<24> = {
     f[7] = object::parent_device as *const (); // 0x38
     Table(f)
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::object::{S_OK, slot};
+
+    fn create_with(stride: u32, count: u32, arguments: *const [u32; 4]) -> (HRESULT, This) {
+        let desc = Desc {
+            stride,
+            count,
+            arguments,
+            nodes: 0,
+        };
+        let null = std::ptr::null();
+        let mut out = null;
+        let hr = create(null, &desc, null, &SIGNATURE_IIDS[0], &mut out);
+        (hr, out)
+    }
+
+    #[test]
+    fn signatures_keep_their_arguments() {
+        // Draw, indexed draw, a constant: (type, fields).
+        let arguments = [[0u32, 0, 0, 0], [1, 0, 0, 0], [5, 2, 0, 1]];
+        for (stride, count) in [(16u32, 0u32), (16, 1), (40, 3)] {
+            let (hr, s) = create_with(stride, count, arguments.as_ptr());
+            assert_eq!(hr, S_OK, "{count} arguments");
+            let (kept_stride, kept) = layout(s).unwrap();
+            assert_eq!(kept_stride, stride);
+            assert_eq!(kept, &arguments[..count as usize]);
+            assert_eq!(slot::<extern "system" fn(This) -> u32>(s, 0x10)(s), 0);
+        }
+        // No arguments need no pointer.
+        let (hr, s) = create_with(0, 0, std::ptr::null());
+        assert_eq!(hr, S_OK);
+        assert_eq!(layout(s).map(|l| l.1.len()), Some(0));
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(s, 0x10)(s), 0);
+        assert!(layout(std::ptr::null()).is_none());
+    }
+
+    /// The argument count is the title's: one without arguments behind
+    /// it, or more arguments than the record has room for, is refused
+    /// before anything is read or allocated for it.
+    #[test]
+    fn signatures_with_impossible_counts_are_refused() {
+        let one = [[0u32; 4]];
+        let null: This = std::ptr::null();
+        let out = |r: (HRESULT, This)| (r.0, r.1.is_null());
+        assert_eq!(
+            out(create_with(16, 1, std::ptr::null())),
+            (E_INVALIDARG, true)
+        );
+        assert_eq!(
+            out(create_with(16, u32::MAX, one.as_ptr())),
+            (E_INVALIDARG, true)
+        );
+        assert_eq!(out(create_with(16, 5, one.as_ptr())), (E_INVALIDARG, true));
+        assert_eq!(
+            out(create_with(u32::MAX, u32::MAX, one.as_ptr())),
+            (E_INVALIDARG, true)
+        );
+        let mut s = null;
+        assert_eq!(
+            create(null, std::ptr::null(), null, &SIGNATURE_IIDS[0], &mut s),
+            E_INVALIDARG
+        );
+    }
+}

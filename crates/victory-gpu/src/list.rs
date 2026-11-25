@@ -889,6 +889,11 @@ extern "system" fn reset_x(this: This, allocator: This, pipeline: This, _flags: 
     reset(this, allocator, pipeline)
 }
 
+/// The most upload memory one request gets, and the largest alignment.
+/// shortcut: ours, not the console's (which is not known); the title's
+/// requests seen are a few megabytes.
+const UPLOAD_LIMIT: usize = 1 << 30;
+
 /// Newer lists' 0x4a0 `(size, alignment) -> pointer`: memory the list
 /// owns until it is reset, which the CPU writes and the GPU reads at the
 /// same address; null on failure. Grand Theft Auto VI's BVH builder puts
@@ -896,8 +901,12 @@ extern "system" fn reset_x(this: This, allocator: This, pipeline: This, _flags: 
 /// `E_NOTIMPL` as a pointer).
 extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mut u8 {
     let align = usize::try_from(alignment).unwrap_or(0).max(16);
+    // The title's numbers are not trusted: past the limit, and where the
+    // memory is not to be had, the answer is null, not an allocation
+    // failure that ends the process.
     let Some(len) = usize::try_from(size)
         .ok()
+        .filter(|s| *s <= UPLOAD_LIMIT && align <= UPLOAD_LIMIT)
         .and_then(|s| s.checked_add(align))
     else {
         return std::ptr::null_mut();
@@ -905,8 +914,17 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
     if this.is_null() || !align.is_power_of_two() {
         return std::ptr::null_mut();
     }
-    let mut block = vec![0u8; len];
-    let start = block.as_mut_ptr();
+    let Ok(layout) = std::alloc::Layout::array::<u8>(len) else {
+        return std::ptr::null_mut();
+    };
+    // SAFETY: `len` is at least 16, so the layout is not empty.
+    let start = unsafe { std::alloc::alloc_zeroed(layout) };
+    if start.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: `len` zeroed bytes from the global allocator with the layout
+    // of a byte vector of that capacity.
+    let block = unsafe { Vec::from_raw_parts(start, len, len) };
     // SAFETY: the offset is below `align`, so `size` bytes fit after it.
     let at = unsafe { start.add(start.align_offset(align)) };
     // SAFETY: the title passes one of our lists.
@@ -1073,11 +1091,17 @@ mod state {
         super::count_dispatch();
         with_state(this, |list, s| s.dispatch(list, x, y, z));
     }
+    /// Whether a mesh dispatch asks for more than one group in y or z
+    /// (by comparing each: their product does not fit in 32 bits).
+    pub(super) fn other_groups(y: u32, z: u32) -> bool {
+        y != 1 || z != 1
+    }
+
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.
     pub(super) extern "system" fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
         super::count_draw();
-        if y * z != 1 {
+        if other_groups(y, z) {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
         }
@@ -1500,6 +1524,128 @@ mod tests {
                 .is_empty()
         );
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    /// An allocator and a list of it, as a title creates them.
+    fn new_list() -> (This, This) {
+        let null = std::ptr::null();
+        let (mut allocator, mut list) = (null, null);
+        let hr = create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator);
+        assert_eq!(hr, S_OK);
+        let hr = create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list);
+        assert_eq!(hr, S_OK);
+        (allocator, list)
+    }
+
+    fn release(o: This) -> u32 {
+        slot::<extern "system" fn(This) -> u32>(o, 0x10)(o)
+    }
+
+    /// Upload memory of a size or alignment no title can mean is refused
+    /// with null, as the method's other failures are; nothing is allocated
+    /// for it.
+    #[test]
+    fn upload_memory_of_absurd_size_is_refused() {
+        #[cfg(windows)]
+        let _gpu = crate::testing::serial_with_device();
+        #[cfg(not(windows))]
+        let _gpu = crate::testing::serial();
+        let (allocator, list) = new_list();
+        let held = || {
+            // SAFETY: the list is ours.
+            let uploads = unsafe { &(*list.cast::<List>()).uploads };
+            uploads.lock().unwrap().len()
+        };
+        assert!(allocate_upload(list, 1 << 60, 16).is_null());
+        assert!(allocate_upload(list, u64::MAX, 16).is_null());
+        assert!(allocate_upload(list, u64::MAX - 8, 0).is_null());
+        assert!(allocate_upload(list, 8, 1 << 62).is_null());
+        assert!(allocate_upload(list, 8, u64::MAX).is_null());
+        assert!(allocate_upload(list, UPLOAD_LIMIT as u64 + 1, 16).is_null());
+        assert!(allocate_upload(list, 8, 2 * UPLOAD_LIMIT as u64).is_null());
+        assert_eq!(held(), 0);
+        // An ordinary request is still served, zeroed and aligned.
+        let p = allocate_upload(list, 40, 64);
+        assert!(!p.is_null() && (p as usize).is_multiple_of(64));
+        // SAFETY: 40 bytes were handed out.
+        assert_eq!(unsafe { std::slice::from_raw_parts(p, 40) }, [0u8; 40]);
+        assert_eq!(held(), 1);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    /// A mesh dispatch whose y and z group counts multiply past 32 bits is
+    /// taken like any other (the title's mesh programs take x groups
+    /// only): it reaches the draw state, where without a pipeline it is a
+    /// dropped draw.
+    #[cfg(windows)]
+    #[test]
+    fn mesh_dispatch_group_counts_do_not_overflow() {
+        assert!(!state::other_groups(1, 1));
+        assert!(state::other_groups(1, 0) && state::other_groups(2, 1));
+        assert!(state::other_groups(0x1_0000, 0x1_0000));
+        // A product that is 1 in 32 bits.
+        assert!(state::other_groups(3, 0xaaaa_aaab));
+
+        let Some(_gpu) = crate::testing::gpu() else {
+            return;
+        };
+        let (allocator, list) = new_list();
+        assert!(host_list(list).is_some());
+        type DispatchMesh = extern "system" fn(This, u32, u32, u32);
+        let dispatch = crate::testing::list_slot::<DispatchMesh>(list, 0x3f8);
+        let before = crate::draw::dropped_draws();
+        dispatch(list, 1, 0x1_0000, 0x1_0000);
+        dispatch(list, 1, u32::MAX, u32::MAX);
+        assert_eq!(crate::draw::dropped_draws(), before + 2);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    /// Root constants set through the list reach its draw state; those
+    /// past the root signature limit do not.
+    #[cfg(windows)]
+    #[test]
+    fn root_constants_through_the_list_are_bounded() {
+        let Some(_gpu) = crate::testing::gpu() else {
+            return;
+        };
+        let (allocator, list) = new_list();
+        type Constants = extern "system" fn(This, u32, u32, *const u32, u32);
+        type Constant = extern "system" fn(This, u32, u32, u32);
+        let graphics = crate::testing::list_slot::<Constants>(list, 0x140);
+        let compute = crate::testing::list_slot::<Constants>(list, 0x138);
+        let values = [7u32, 8, 9, 10];
+        let stored = |is_compute: bool, slot: u32| {
+            // SAFETY: the list is ours.
+            let state = unsafe { &(*list.cast::<List>()).state };
+            state.lock().unwrap().constants(is_compute, slot)
+        };
+        graphics(list, 2, 4, values.as_ptr(), 60);
+        let mut expected = vec![0u32; 60];
+        expected.extend(values);
+        assert_eq!(stored(false, 2), Some(expected.clone()));
+        // Past the 64 dwords of a root signature: ignored, nothing kept.
+        graphics(list, 2, 2, values.as_ptr(), 63);
+        graphics(list, 2, 1, values.as_ptr(), u32::MAX);
+        graphics(list, 3, 4, values.as_ptr(), 61);
+        assert_eq!(stored(false, 2), Some(expected));
+        assert_eq!(stored(false, 3), None);
+        // A root parameter no signature can have.
+        compute(list, u32::MAX, 1, values.as_ptr(), 0);
+        compute(list, 64, 1, values.as_ptr(), 0);
+        assert_eq!(stored(true, u32::MAX), None);
+        assert_eq!(stored(true, 64), None);
+        compute(list, 63, 1, values.as_ptr(), 0);
+        assert_eq!(stored(true, 63), Some(vec![7]));
+        // The single-value methods are 0x128 (compute) and 0x130.
+        let one = crate::testing::list_slot::<Constant>(list, 0x130);
+        one(list, 1, 5, u32::MAX);
+        assert_eq!(stored(false, 1), None);
+        one(list, 1, 5, 1);
+        assert_eq!(stored(false, 1), Some(vec![0, 5]));
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
     }
