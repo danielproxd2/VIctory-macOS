@@ -986,17 +986,28 @@ fn connect_by_list_reaches_loopback_and_sets_an_error_otherwise() {
         &generous,
         null,
     );
+    let error = last_error();
+    // Windows connects a socket again after a refused attempt. Wine on
+    // macOS does not, and the stand-in has only that socket. That is
+    // measured here, on the host's own `connect`, not taken from the
+    // stand-in's failure: only where the host itself refuses the second
+    // connect may the stand-in fail, and then with the host's error for
+    // it and without a connection. Anything else the stand-in does there,
+    // and any failure on a host that does connect again, fails the test.
     let wine = crate::host::function("ntdll.dll", "wine_get_version").is_some();
-    if wine && reached == 0 {
-        // Windows connects a socket again after a refused attempt. Wine
-        // on macOS does not, and the stand-in has only that socket: the
-        // call fails there, with an error and without a connection.
-        assert_ne!(last_error(), 0);
+    if let (true, Err(host_error)) = (wine, host_connects_again()) {
+        assert_eq!((reached, error), (0, host_error));
         assert!(!connected(&listener));
-        crate::testing::skip("this Wine does not connect a socket again after a refused attempt");
+        crate::testing::skip_unless_required(
+            "VICTORY_REQUIRE_RECONNECT",
+            &format!(
+                "this Wine does not connect a socket again after a refused attempt \
+                 (error {host_error}): candidates after a refused one are not checked"
+            ),
+        );
         return;
     }
-    assert_eq!(reached, 1, "error {}", last_error());
+    assert_eq!(reached, 1, "error {error}");
     let (_, peer) = listener.accept().unwrap();
     assert_eq!(socket_addr(local.as_ptr(), local_len as i32), Some(peer));
     assert_eq!(
@@ -1004,6 +1015,42 @@ fn connect_by_list_reaches_loopback_and_sets_an_error_otherwise() {
         Some((HOME, port).into())
     );
     assert_eq!(s.local(), Some(peer));
+}
+
+/// Whether the host connects a socket again after a refused attempt,
+/// which `WSAConnectByList`'s stand-in needs for a candidate after a
+/// refused one: the host's own `connect`, twice on one socket, first to a
+/// port that refuses and then to a listener. `Err` is the Winsock error
+/// of the second connect, which reached no one.
+fn host_connects_again() -> Result<(), i32> {
+    let (listener, port) = listener();
+    let (home, closed) = (v4(HOME, port), v4(HOME, refusing()));
+    let connect = host!("ws2_32.dll", "connect": extern "system" fn(Socket, *const u8, i32) -> i32);
+    let s = Sock::new(AF_INET, STREAM);
+    wsa_error(0);
+    assert_eq!(
+        (connect(s.0, closed.as_ptr(), 16), last_error()),
+        (SOCKET_ERROR, WSAECONNREFUSED)
+    );
+    if connect(s.0, home.as_ptr(), 16) == 0 {
+        assert!(connected(&listener));
+        return Ok(());
+    }
+    let error = last_error();
+    assert_ne!(error, 0);
+    assert!(!connected(&listener));
+    Err(error)
+}
+
+/// The probe's answer is the host's, the same every time it is asked;
+/// and off Wine a socket connects again after a refused attempt, as the
+/// stand-in's reference says the real call's sockets do.
+#[test]
+fn the_host_says_whether_a_socket_connects_again() {
+    let first = host_connects_again();
+    assert_eq!(host_connects_again(), first);
+    let wine = crate::host::function("ntdll.dll", "wine_get_version").is_some();
+    assert!(wine || first == Ok(()), "{first:?}");
 }
 
 /// True while `list` is one of ours, with canonical names swapped.
