@@ -1146,11 +1146,6 @@ fn system_commit() -> Option<PERFORMANCE_INFORMATION> {
 /// A memory failure the user can act on goes to the crash log, as the
 /// title is unlikely to survive it.
 fn report(message: &str) {
-    #[cfg(test)]
-    tests::REPORTED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push(message.to_owned());
     victory_loader::log_crash(message);
 }
 
@@ -1343,12 +1338,12 @@ mod tests {
 
     use super::*;
 
-    /// What `report` sent to the crash log, for the tests that expect it.
-    pub(super) static REPORTED: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
+    /// What reached the crash log (`victory_loader::log_crash`) and holds
+    /// `part`.
     fn reported(part: &str) -> Vec<String> {
-        let all = REPORTED.lock().unwrap_or_else(|e| e.into_inner());
-        all.iter().filter(|m| m.contains(part)).cloned().collect()
+        let mut all = victory_loader::logged_crashes();
+        all.retain(|m| m.contains(part));
+        all
     }
 
     fn query(address: *const c_void) -> BasicInformation {

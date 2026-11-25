@@ -45,6 +45,7 @@ windows = { workspace = true, optional = true, features = [
 windows-core = { workspace = true, optional = true }
 
 [dev-dependencies]
+victory-loader = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
 
 [features]

@@ -39,6 +39,8 @@ mod tls_scan;
 #[cfg(windows)]
 mod windows;
 
+#[cfg(all(windows, feature = "test-support"))]
+pub use crash::logged_crashes;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use crash::save_on_crash;
 #[cfg(windows)]

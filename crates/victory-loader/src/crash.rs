@@ -70,7 +70,24 @@ pub fn log_crash(text: &str) {
         title_output()
     );
     eprint!("{text}");
+    #[cfg(feature = "test-support")]
+    LOGGED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(text.clone());
     append_to_log(&text);
+}
+
+/// Every text `log_crash` has sent to the crash log in this process.
+#[cfg(feature = "test-support")]
+static LOGGED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// What [`log_crash`] has sent to the crash log in this process, oldest
+/// first: for the tests of its callers in other crates, which share one
+/// process and cannot each name the log file (the first to name it wins).
+#[cfg(feature = "test-support")]
+pub fn logged_crashes() -> Vec<String> {
+    LOGGED.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 fn append_to_log(text: &str) {

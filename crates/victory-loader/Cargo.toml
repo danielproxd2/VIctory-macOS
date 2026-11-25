@@ -34,6 +34,9 @@ tempfile.workspace = true
 [features]
 # Debugging switches (scheduled stack dumps and the like).
 diagnostics = []
+# Exposes `victory_loader::logged_crashes` (what `log_crash` was given) to
+# other crates' tests. Enable it under [dev-dependencies] only.
+test-support = []
 
 [lints]
 workspace = true
