@@ -20,6 +20,8 @@ victory-shader = { workspace = true, features = ["host"] }
 tempfile.workspace = true
 # Its crash handler emulates `clzero`, whose write our guard must see.
 victory-loader.workspace = true
+# The console containers of the stand-in title that draws (`testkit`).
+victory-shader = { workspace = true, features = ["host", "test-support"] }
 
 [features]
 # Debugging switches (frame capture, the host debug layer, per-draw data).
