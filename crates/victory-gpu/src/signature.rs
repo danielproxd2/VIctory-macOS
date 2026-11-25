@@ -52,8 +52,9 @@ pub(crate) extern "system" fn create(
     }
     // The count sizes a copy: every argument of public D3D12 takes at
     // least 4 bytes of a record, so a record of `stride` bytes has no more
-    // than a quarter as many. (A zero stride says nothing.)
-    if desc.stride != 0 && desc.count > desc.stride / 4 {
+    // than a quarter as many, and a record of no bytes has none: a zero
+    // stride used to pass any count on to the allocation and the read.
+    if desc.count > desc.stride / 4 {
         return E_INVALIDARG;
     }
     let mut arguments = Vec::new();
@@ -159,6 +160,13 @@ mod tests {
         assert_eq!(out(create_with(16, 5, one.as_ptr())), (E_INVALIDARG, true));
         assert_eq!(
             out(create_with(u32::MAX, u32::MAX, one.as_ptr())),
+            (E_INVALIDARG, true)
+        );
+        // A record of no bytes has no arguments, whatever the count.
+        assert_eq!(out(create_with(0, 1, one.as_ptr())), (E_INVALIDARG, true));
+        assert_eq!(out(create_with(3, 1, one.as_ptr())), (E_INVALIDARG, true));
+        assert_eq!(
+            out(create_with(0, u32::MAX, one.as_ptr())),
             (E_INVALIDARG, true)
         );
         let mut s = null;
