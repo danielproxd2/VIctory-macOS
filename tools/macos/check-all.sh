@@ -88,7 +88,7 @@ tally() {
 # the test harness had already written on that line; the test's name at the
 # end is dropped so that tests skipped for one reason count together.
 skips() {
-    sed -n 's/.*skipped: //p' "$1" | sed 's/ ([a-z0-9_:]*)$//' | sort | uniq -c \
+    sed -n 's/.*skipped: //p' "$1" | sed 's/ ([a-z0-9_:]*).*$//' | sort | uniq -c \
         | sort -k1,1nr -k2 | sed 's/^ *\([0-9][0-9]*\) /\1 /'
 }
 
