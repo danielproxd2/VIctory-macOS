@@ -11,7 +11,9 @@ use victory_loader::{
 use victory_pe::ImportSymbol;
 use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
-use windows_sys::Win32::System::Threading::{CreateThread, INFINITE, WaitForSingleObject};
+use windows_sys::Win32::System::Threading::{
+    CreateThread, GetExitCodeThread, INFINITE, WaitForSingleObject,
+};
 
 mod common;
 use common::fixture;
@@ -438,4 +440,114 @@ fn maps_a_title_dll_the_title_loads_itself() {
     assert!(dlls[0].1.export("title_a_named").is_some());
     assert!(load("absent.dll", &|_| true).is_empty());
     assert!(load("late.dll", &|_| false).is_empty());
+}
+
+/// What every thread's copy of the probe's thread-local counter starts as
+/// (`TLS_TEMPLATE` in tests/fixtures/hle-probe).
+const TLS_TEMPLATE: u32 = 0x4154_0029;
+
+/// The probe's static TLS: every thread that calls into the image finds a
+/// block of its own there that started as a copy of the image's template.
+/// That goes for a thread that was running before the image was mapped
+/// (a title's DLL that is loaded late is mapped while its threads run),
+/// for a thread Rust starts afterwards and for one that starts in title
+/// code. Windows gives a DLL it maps its TLS on every thread; the prepared
+/// copy keeps its TLS directory so that it does.
+#[test]
+fn static_tls_template_reaches_existing_new_and_raw_threads() {
+    use std::sync::mpsc::channel;
+
+    // A thread that runs before the image is mapped, and until it is told
+    // what to call.
+    let (tell, told) = channel::<usize>();
+    let (answer, answered) = channel::<[u32; 2]>();
+    let (ready, is_ready) = channel::<()>();
+    let early = std::thread::spawn(move || {
+        ready.send(()).unwrap();
+        let address = told.recv().unwrap();
+        // SAFETY: the probe's `probe_tls_counter`, which takes nothing and
+        // returns a `u32`; it uses no import.
+        let f: extern "system" fn() -> u32 = unsafe { std::mem::transmute(address) };
+        answer.send([f(), f()]).unwrap();
+    });
+    is_ready.recv().unwrap();
+
+    let prepared = prepare(&std::fs::read(fixture("hle_probe.dll")).unwrap()).unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let image = victory_loader::load(&prepared, cache.path()).unwrap();
+    image
+        .bind_imports(&TestResolver, UnimplementedPolicy::ReturnZero)
+        .unwrap();
+
+    // The counter's first value is in the template the mapped image's TLS
+    // directory names: it is static TLS, not a slot filled on first use.
+    let tls = image.info().tls.as_ref().expect("the probe has static TLS");
+    let directory = (image.base() + tls.directory_rva as usize) as *const usize;
+    // SAFETY: the mapped image's TLS directory, whose first two fields are
+    // the start and end address of the template, relocated by the OS.
+    let template = unsafe {
+        let (start, end) = (
+            directory.read_unaligned(),
+            directory.add(1).read_unaligned(),
+        );
+        assert!(start >= image.base() && start < end, "{start:#x}..{end:#x}");
+        std::slice::from_raw_parts(start as *const u8, end - start)
+    };
+    assert!(
+        template.windows(4).any(|w| w == TLS_TEMPLATE.to_le_bytes()),
+        "no {TLS_TEMPLATE:#x} in the {} bytes of the TLS template",
+        template.len()
+    );
+
+    let address = image
+        .export("probe_tls_counter")
+        .expect("probe_tls_counter");
+    // SAFETY: as in the thread above.
+    let counter: extern "system" fn() -> u32 = unsafe { std::mem::transmute(address) };
+
+    // This thread was running before the map too.
+    assert_eq!(counter(), TLS_TEMPLATE + 1);
+    assert_eq!(counter(), TLS_TEMPLATE + 2);
+
+    // The thread that waited: its own copy, counted from the template.
+    tell.send(address).unwrap();
+    assert_eq!(
+        answered.recv().unwrap(),
+        [TLS_TEMPLATE + 1, TLS_TEMPLATE + 2]
+    );
+    early.join().unwrap();
+
+    // A thread Rust starts now.
+    let new = std::thread::spawn(move || counter()).join().unwrap();
+    assert_eq!(new, TLS_TEMPLATE + 1);
+
+    // A thread that starts in the title's code: its exit code is what the
+    // function returned.
+    // SAFETY: the export ignores the thread's argument; the handle is
+    // valid until closed.
+    let raw = unsafe {
+        let start: unsafe extern "system" fn(*mut std::ffi::c_void) -> u32 =
+            std::mem::transmute(address);
+        let thread = CreateThread(
+            std::ptr::null(),
+            0,
+            Some(start),
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+        );
+        assert!(!thread.is_null());
+        WaitForSingleObject(thread, INFINITE);
+        let mut code = 0;
+        assert_ne!(GetExitCodeThread(thread, &mut code), 0);
+        CloseHandle(thread);
+        code
+    };
+    assert_eq!(raw, TLS_TEMPLATE + 1);
+
+    // None of them touched this thread's copy.
+    assert_eq!(counter(), TLS_TEMPLATE + 3);
+    // SAFETY: every thread that called into the image has ended, and this
+    // one does not again.
+    unsafe { image.unload() };
 }

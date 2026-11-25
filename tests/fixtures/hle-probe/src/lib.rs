@@ -2,6 +2,7 @@
 //! exist on a PC, which is exactly the situation victory-loader handles.
 //! Loaded normally, this DLL would fail with "module not found".
 
+use std::cell::Cell;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -92,6 +93,27 @@ pub extern "system" fn probe_delayed() -> u32 {
 #[unsafe(no_mangle)]
 pub extern "system" fn probe_missing() -> u64 {
     unsafe { VIctoryProbeNotImplemented(42) }
+}
+
+/// What every thread's copy of `TLS_COUNTER` starts as: a value of the
+/// image's TLS template, which the tests look for there.
+const TLS_TEMPLATE: u32 = 0x4154_0029;
+
+thread_local! {
+    /// Static thread-local data, as titles have: no lazy set-up, the
+    /// thread's block is a copy of the template in the image.
+    static TLS_COUNTER: Cell<u32> = const { Cell::new(TLS_TEMPLATE) };
+}
+
+/// Adds one to the calling thread's counter and returns it: the template's
+/// value plus the number of calls on this thread.
+#[unsafe(no_mangle)]
+pub extern "system" fn probe_tls_counter() -> u32 {
+    TLS_COUNTER.with(|counter| {
+        let next = counter.get().wrapping_add(1);
+        counter.set(next);
+        next
+    })
 }
 
 static TLS_THREAD_STARTS: AtomicU32 = AtomicU32::new(0);
