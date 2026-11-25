@@ -45,6 +45,10 @@ impl Time for Real {
         START.get_or_init(Instant::now).elapsed()
     }
     fn sleep(&self, wait: Duration) {
+        // Tests read what a wait asked for: how long it then took is the
+        // scheduler's doing.
+        #[cfg(test)]
+        tests::ASKED.set(wait);
         std::thread::sleep(wait);
     }
 }
@@ -449,12 +453,105 @@ mod tests {
         assert_eq!(frame(on_time), (Some(7), 8, 40 * MS));
     }
 
+    thread_local! {
+        /// What this thread's last wait on the process's clock asked to
+        /// sleep (see [`Real::sleep`]).
+        pub(super) static ASKED: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
+    }
+
+    impl Pacer<Real> {
+        fn ended_on(&self, kind: u32) -> u64 {
+            self.last(kind).load(Ordering::Relaxed)
+        }
+        /// The latest tick passed at `at` on the process's clock, by the
+        /// clock's own start and interval.
+        fn passed(&self, at: Duration) -> u64 {
+            let clock = self.clock();
+            let c = clock.as_ref().expect("an interval was set");
+            let elapsed = at.saturating_sub(c.start).as_nanos();
+            c.first + (elapsed / c.interval.as_nanos().max(1)) as u64
+        }
+    }
+
+    /// A blocking flip wait through the device method.
+    struct Flip {
+        /// The tick it ended on.
+        tick: u64,
+        /// What it asked the clock to sleep.
+        asked: Duration,
+        /// The latest tick passed just before it began.
+        begun: u64,
+    }
+
+    /// Waits for the flip on the process's clock and holds the wait to the
+    /// rule without measuring how long it took (a test thread is not run
+    /// for 10 ms or 50 ms at a time on a busy host, more so under Wine).
+    /// The wait reads the clock once, at some moment between the readings
+    /// taken here before and after it, so with `prev` the last flip tick
+    /// taken and passed(t) the latest tick passed at t:
+    ///
+    ///   begun = passed(before) <= passed(its reading) <= passed(after) = ended
+    ///   tick  = max(passed(its reading), prev + 1)
+    ///   asked = the time from its reading to the tick, none if it passed
+    ///
+    /// Whatever the scheduler does, so:
+    /// - it asked to sleep only for the tick after the last one taken, and
+    ///   only if that tick had not passed when the wait began
+    ///   (asked > 0: tick == prev + 1 and begun <= prev);
+    /// - otherwise it asked for no sleep and ended on a tick that had
+    ///   passed when it returned, no earlier than the one passed when it
+    ///   began (asked == 0: max(begun, prev + 1) <= tick <= ended).
+    ///
+    /// The old rule (the next tick after now) breaks the first whenever a
+    /// wait begins after its tick passed: it asks to sleep to tick
+    /// passed + 1, which is later than prev + 1. From outside, that sleep
+    /// cannot be told from a thread that was not run until the next tick,
+    /// which is why the time asked for is read and not the time taken.
+    fn flip(token: &mut u64) -> Flip {
+        let null = std::ptr::null();
+        let prev = PACER.ended_on(FLIP);
+        let begun = PACER.passed(Real.now());
+        assert_eq!(wait(null, FLIP, u32::MAX, std::ptr::null(), 0, token), S_OK);
+        let asked = ASKED.get();
+        let ended = PACER.passed(Real.now());
+        let tick = PACER.ended_on(FLIP);
+        let seen = format!("tick {tick} after {prev}, asked {asked:?}, passed {begun} to {ended}");
+        if asked.is_zero() {
+            assert!(begun.max(prev + 1) <= tick && tick <= ended, "{seen}");
+        } else {
+            assert!(tick == prev + 1 && begun <= prev, "slept to a later tick: {seen}");
+        }
+        Flip { tick, asked, begun }
+    }
+
+    /// An origin poll (no time to wait) through the device method: a
+    /// time-out while the origin's next tick is ahead, and only then. The
+    /// wait reads the clock between the two readings here, so it must time
+    /// out if the tick is still ahead after it and must not if the tick
+    /// had passed before it (a thread not run for a whole tick; either is
+    /// right if the tick came in between).
+    fn poll(flags: u32, token: *mut u64) -> HRESULT {
+        let null = std::ptr::null();
+        let next = PACER.ended_on(ORIGIN) + 1;
+        let begun = PACER.passed(Real.now());
+        let hr = wait(null, ORIGIN, 0, std::ptr::null(), flags, token);
+        let ended = PACER.passed(Real.now());
+        if ended < next {
+            assert_eq!(hr, TIMEOUT, "tick {next} was ahead (at {ended})");
+        } else if begun >= next {
+            assert_eq!(hr, S_OK, "tick {next} had passed (at {begun})");
+        }
+        hr
+    }
+
     /// The device methods on the process's clock (the tick arithmetic is
     /// tested exactly on a stepped clock above). These are upstream's
-    /// assertions, on its 50 ms ticks (a thread woken 15-30 ms late on a
-    /// busy host, seen with 5 ms ticks, still makes its tick), with the
-    /// fork's on top: frames are numbered one after another, a flip wait
-    /// keeps the title's token, and a title may pass no token.
+    /// assertions, on its 50 ms ticks, with the fork's on top: frames are
+    /// numbered one after another, a flip wait keeps the title's token,
+    /// and a title may pass no token. Where upstream's bound the time a
+    /// wait took or took a tick to be ahead still, they are held here to
+    /// the clock's own numbers instead ([`flip`], [`poll`]): the thread
+    /// may be run late by any time and the test says the same.
     #[test]
     fn the_device_methods_pace_on_the_real_clock() {
         let null = std::ptr::null();
@@ -467,47 +564,53 @@ mod tests {
         let mut second = 0;
         assert_eq!(wait(null, ORIGIN, 1_000, list, 0, &mut second), S_OK);
         assert_eq!(second, first + 1);
-        // The next tick is 50 ms ahead, so no time to wait is a time-out.
-        assert_eq!(wait(null, ORIGIN, 0, list, 0, &mut second), TIMEOUT);
-        assert_eq!(second, first + 1, "no frame, the token is left alone");
+        // The next tick is 50 ms ahead, so no time to wait is a time-out:
+        // no frame, the token is left alone. (Had the thread not been run
+        // until that tick, the poll ends on it and begins a frame.)
+        let mut frames = second;
+        let timed_out = poll(0, &mut second) == TIMEOUT;
+        frames += u64::from(!timed_out);
+        assert_eq!((second, current()), (frames, frames), "timed out: {timed_out}");
+        // A time-out that begins a frame all the same.
         let mut early = 0;
-        let flags = TOKEN_ON_TIMEOUT;
-        assert_eq!(wait(null, ORIGIN, 0, list, flags, &mut early), TIMEOUT);
-        assert_eq!(early, second + 1);
+        poll(TOKEN_ON_TIMEOUT, &mut early);
+        assert_eq!(early, frames + 1);
         // A title that passes no token still begins a frame.
         let none = std::ptr::null_mut();
         assert_eq!(wait(null, ORIGIN, 1_000, list, 0, none), S_OK);
         assert_eq!(current(), early + 1);
-        assert!(PACER.last(ORIGIN).load(Ordering::Relaxed) >= 2);
+        assert!(PACER.ended_on(ORIGIN) >= 2);
 
         // The title's loop: an origin poll (which starts the frame), then
-        // a blocking flip wait. Each flip takes its own tick.
+        // a blocking flip wait. Each flip takes its own tick: the one after
+        // the flip before it, or the latest passed (see `flip`).
         assert_eq!(set_interval(null, null, 50_000, 3, 0), S_OK);
         let mut token = 7;
         let flips: Vec<u64> = (0..4)
             .map(|_| {
                 let _ = wait(null, ORIGIN, 0, list, TOKEN_ON_TIMEOUT, &mut token);
                 let frame = token;
-                assert_eq!(wait(null, FLIP, u32::MAX, list, 0, &mut token), S_OK);
+                let flip = flip(&mut token);
                 assert_eq!(token, frame, "a flip wait keeps the title's token");
-                PACER.ended_on_flip()
+                flip.tick
             })
             .collect();
-        assert!(flips.windows(2).all(|w| w[1] == w[0] + 1), "{flips:?}");
+        assert!(flips.windows(2).all(|w| w[1] > w[0]), "{flips:?}");
         assert_eq!(current(), early + 5);
         // Even when a flip wait begins on the tick another just ended on.
         let (tick, _) = PACER.next_tick(FLIP, Duration::ZERO);
         assert!(tick > flips[3]);
         // A flip wait begun after its tick passed (two ticks missed) ends at
         // once, on the latest tick passed; the next one waits for the next.
+        // "At once" is no sleep asked for; `flip` has held the tick to one
+        // that had passed when the wait returned.
         std::thread::sleep(Duration::from_millis(110));
-        let before = Instant::now();
-        assert_eq!(wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token), S_OK);
-        assert!(before.elapsed() < Duration::from_millis(10), "{:?}", before.elapsed());
-        let late = PACER.ended_on_flip();
-        assert!(late >= flips[3] + 2, "{late} after {}", flips[3]);
-        assert_eq!(wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token), S_OK);
-        assert_eq!(PACER.ended_on_flip(), late + 1);
+        let late = flip(&mut token);
+        assert!(late.begun >= flips[3] + 2, "{} after {}", late.begun, flips[3]);
+        assert_eq!(late.asked, Duration::ZERO, "slept on to tick {}", late.tick);
+        assert!(late.tick >= flips[3] + 2, "{} after {}", late.tick, flips[3]);
+        let next = flip(&mut token);
+        assert!(next.tick == late.tick + 1 || next.asked.is_zero(), "{} after {}", next.tick, late.tick);
 
         let mut count = 9;
         assert_eq!(
@@ -515,12 +618,6 @@ mod tests {
             S_OK
         );
         assert_eq!(count, 0);
-    }
-
-    impl Pacer<Real> {
-        fn ended_on_flip(&self) -> u64 {
-            self.last(FLIP).load(Ordering::Relaxed)
-        }
     }
 
     /// Two waits for one kind that begin together (two threads) take two
