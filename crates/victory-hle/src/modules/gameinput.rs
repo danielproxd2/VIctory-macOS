@@ -622,7 +622,11 @@ extern "system" fn current_reading(
     hand(out, found)
 }
 
-/// The reading after (`forward`) or before `reference` on its device.
+/// The reading after (`forward`) or before `reference` in the input
+/// stream: on `device` if one is given, else among every device's kept
+/// readings in time order ("an optionally filtered input stream"). A poll
+/// stamps all its readings alike, so readings of one instant are ordered
+/// by device, then by their sequence on it.
 fn relative(
     this: This,
     reference: *const Reading,
@@ -637,37 +641,43 @@ fn relative(
     let hub = hub(this);
     // SAFETY: a reading we handed out and the title still holds.
     let reference = unsafe { &*reference };
-    // shortcut: with no device given only the reference's device is walked,
-    // not every device's readings in time order; Grand Theft Auto VI walks
-    // only keyboard readings (one device) and the current pad's previous one.
     let Some(index) = hub.index(reference.device) else {
         return fail(out, E_INVALIDARG);
     };
+    // A device other than the reference's is refused, as before: what a
+    // walk from one device's reading through another's alone returns is
+    // not something we have seen a title rely on.
     if !device.is_null() && !std::ptr::eq(device, reference.device) {
         return fail(out, E_INVALIDARG);
     }
     let state = hub.state();
-    let history = &state.slots[index].history;
-    if history
+    if state.slots[index]
+        .history
         .front()
         .is_none_or(|oldest| reference.sequence < oldest.sequence)
     {
         return fail(out, REFERENCE_TOO_OLD);
     }
-    let wanted = |r: &&Ref| r.kind() & kind != 0;
-    let found = if forward {
-        history
-            .iter()
-            .filter(|r| r.sequence > reference.sequence)
-            .find(wanted)
+    let devices = if device.is_null() {
+        0..DEVICES
     } else {
-        history
-            .iter()
-            .rev()
-            .filter(|r| r.sequence < reference.sequence)
-            .find(wanted)
+        index..index + 1
     };
-    hand(out, found)
+    let place = |i: usize, r: &Reading| (r.timestamp, i, r.sequence);
+    let from = place(index, reference);
+    let candidates = devices
+        .flat_map(|i| state.slots[i].history.iter().map(move |r| (i, r)))
+        .filter(|(_, r)| r.kind() & kind != 0);
+    let found = if forward {
+        candidates
+            .filter(|&(i, r)| place(i, r) > from)
+            .min_by_key(|&(i, r)| place(i, r))
+    } else {
+        candidates
+            .filter(|&(i, r)| place(i, r) < from)
+            .max_by_key(|&(i, r)| place(i, r))
+    };
+    hand(out, found.map(|(_, r)| r))
 }
 extern "system" fn next_reading(
     this: This,
@@ -1808,5 +1818,89 @@ mod tests {
             assert_eq!(key.code_point, 0, "no characters: {key:?}");
         }
         release(r);
+    }
+
+    fn walk_any(
+        hub: &Hub,
+        offset: usize,
+        from: *const Reading,
+        kind: u32,
+    ) -> Result<*const Reading, HRESULT> {
+        type Walk = extern "system" fn(This, *const Reading, u32, *const Device, Out) -> HRESULT;
+        let mut out = std::ptr::null();
+        let walk = slot::<Walk, _>(&hub.object, offset);
+        let hr = walk(&hub.object, from, kind, std::ptr::null(), &mut out);
+        result(hr, out)
+    }
+
+    /// With no device given, next and previous walk every device's
+    /// readings as one stream in time order.
+    #[test]
+    fn device_less_walk_merges_devices_by_time() {
+        let (hub, host) = fake();
+        let (next, previous) = (0x28, 0x30);
+        let tick = || std::thread::sleep(Duration::from_millis(2));
+        // The first poll made a reading of the stand-in pad and one of the
+        // keyboard, at one instant.
+        let stand_in = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        let keyboard = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
+        assert_eq!(stamp(stand_in).0, reading(keyboard).timestamp);
+        let press = |slot: usize, buttons: u32| {
+            tick();
+            host.lock().unwrap().pads[slot] = Some(PadState {
+                buttons,
+                ..Default::default()
+            });
+            hub.poll();
+            current(hub, GAMEPAD_KIND, slot).unwrap()
+        };
+        let a0 = press(0, A);
+        let b1 = press(1, B);
+        let x0 = press(0, X);
+        assert_eq!(
+            [pad(a0).buttons, pad(b1).buttons, pad(x0).buttons],
+            [A, B, X]
+        );
+
+        // Forward through the pads' readings, across devices.
+        let order = [stand_in, a0, b1, x0];
+        for pair in order.windows(2) {
+            let found = walk_any(hub, next, pair[0], GAMEPAD_KIND);
+            assert_eq!(found, Ok(pair[1]));
+            release(pair[1]);
+            let found = walk_any(hub, previous, pair[1], GAMEPAD_KIND);
+            assert_eq!(found, Ok(pair[0]));
+            release(pair[0]);
+        }
+        assert_eq!(
+            walk_any(hub, next, x0, GAMEPAD_KIND),
+            Err(READING_NOT_FOUND)
+        );
+        assert_eq!(
+            walk_any(hub, previous, stand_in, GAMEPAD_KIND),
+            Err(READING_NOT_FOUND)
+        );
+        // The kind filters the stream: after the keyboard's only reading
+        // there is no keyboard reading, but there are the pads'.
+        assert_eq!(
+            walk_any(hub, next, keyboard, KEYBOARD_KIND),
+            Err(READING_NOT_FOUND)
+        );
+        let both = GAMEPAD_KIND | KEYBOARD_KIND;
+        assert_eq!(walk_any(hub, next, keyboard, both), Ok(a0));
+        release(a0);
+        // Readings of one instant follow device order: stand-in, keyboard.
+        assert_eq!(walk_any(hub, next, stand_in, both), Ok(keyboard));
+        release(keyboard);
+        assert_eq!(walk_any(hub, previous, keyboard, both), Ok(stand_in));
+        release(stand_in);
+        // With its device given, a walk stays on that device.
+        assert_eq!(walk(hub, next, a0), Ok(x0));
+        release(x0);
+        assert_eq!(walk(hub, previous, x0), Ok(a0));
+        release(a0);
+        for r in [stand_in, keyboard, a0, b1, x0] {
+            release(r);
+        }
     }
 }
