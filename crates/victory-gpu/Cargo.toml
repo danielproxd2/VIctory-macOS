@@ -18,6 +18,8 @@ victory-shader.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# Its crash handler emulates `clzero`, whose write our guard must see.
+victory-loader.workspace = true
 
 [features]
 # Debugging switches (frame capture, the host debug layer, per-draw data).

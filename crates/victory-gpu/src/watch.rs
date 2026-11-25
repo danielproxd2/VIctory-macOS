@@ -384,6 +384,65 @@ mod tests {
         title_memory_remapped(view, 2 * BLOCK);
     }
 
+    /// `clzero` into a guarded view block, with the loader's crash handler
+    /// installed as in a title run. Where the host CPU lacks the instruction
+    /// (Rosetta 2, Intel) that handler does the write, inside the exception:
+    /// the write faults there, our handler opens the block, and the line is
+    /// zeroed. Where the CPU has it, the write faults directly. Either way
+    /// the block counts as written. (If the emulation declined read-only
+    /// memory, this test would end the process on such a host.)
+    #[test]
+    fn clzero_into_a_guarded_block_opens_it() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
+        };
+        victory_loader::report_crashes();
+        // SAFETY: a pagefile section of two blocks, mapped read-write.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (2 * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize
+        };
+        assert_ne!(view, 0);
+        let at = view + BLOCK + 0x100;
+        // SAFETY: our view, still read-write.
+        unsafe { (at as *mut u8).sub(64).write_bytes(0xff, 192) };
+        assert!(guard(view, view + 2 * BLOCK).is_some()); // now read-only
+        assert_eq!(guard(view, view + 2 * BLOCK), Some(Vec::new()));
+        // SAFETY: clzero writes only the 64-byte line holding the address.
+        unsafe { std::arch::asm!(".byte 0x0f, 0x01, 0xfc", in("rax") at + 5) };
+        // SAFETY: readable bytes of our view.
+        let bytes = |from: usize| unsafe { std::slice::from_raw_parts(from as *const u8, 64) };
+        assert!(bytes(at).iter().all(|&b| b == 0));
+        assert!(
+            bytes(at - 64)
+                .iter()
+                .chain(bytes(at + 64))
+                .all(|&b| b == 0xff)
+        );
+        // The second block was written, the first was not.
+        assert_eq!(
+            guard(view, view + 2 * BLOCK),
+            Some((view / PAGE + 1..view / PAGE + 2).collect())
+        );
+        // SAFETY: our view.
+        unsafe {
+            UnmapViewOfFile(
+                windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: view as *mut _,
+                },
+            )
+        };
+        title_memory_remapped(view, 2 * BLOCK);
+    }
+
     /// A write or mapping that runs past the end of the address space (a
     /// title's `fread` with a huge count) covers up to the end; the sum used
     /// to overflow. Up there no test has guarded blocks.
