@@ -8,7 +8,7 @@ use anyhow::Result;
 use crate::{Console, Unimplemented};
 
 #[cfg(any(windows, test))]
-const SKIP_CPU_CHECK_ENV: &str = "VICTORY_SKIP_CPU_CHECK";
+pub(crate) const SKIP_CPU_CHECK_ENV: &str = "VICTORY_SKIP_CPU_CHECK";
 
 #[cfg(any(windows, test))]
 fn skip_cpu_check(value: Option<&str>) -> bool {
@@ -16,7 +16,7 @@ fn skip_cpu_check(value: Option<&str>) -> bool {
 }
 
 #[cfg(any(windows, test))]
-fn check_cpu_features_with(has_avx2: bool, skip_env: Option<&str>) -> Result<()> {
+pub(crate) fn check_cpu_features_with(has_avx2: bool, skip_env: Option<&str>) -> Result<()> {
     if has_avx2 || skip_cpu_check(skip_env) {
         return Ok(());
     }

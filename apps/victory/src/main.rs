@@ -4,6 +4,7 @@
 //! the user's cache directory (outside the repository).
 
 mod census;
+mod doctor;
 mod inspect;
 // The D3D12 runtime it drives is built for Windows only.
 #[cfg(windows)]
@@ -129,6 +130,11 @@ enum Command {
     /// lies inside the repository or the configured game directory is not
     /// there. No game directory configured is said, and is no failure.
     Config,
+    /// Check, without a game, whether this machine is ready for a run:
+    /// the host, the D3D12 device and what VIctory measures on it, the
+    /// configuration and its folders, the prebuilt shaders. One line per
+    /// item (ok, warning, PROBLEM, not checked); fails on any PROBLEM.
+    Doctor,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -247,6 +253,7 @@ fn dispatch(cli: Cli, out: &mut dyn Write) -> Result<u32> {
             &|path| victory_core::ensure_outside_repo(path).map_err(|e| e.to_string()),
             out,
         )?,
+        Command::Doctor => return doctor::run(out),
     }
     Ok(0)
 }

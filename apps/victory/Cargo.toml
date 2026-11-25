@@ -22,6 +22,17 @@ clap.workspace = true
 walkdir.workspace = true
 tracing.workspace = true
 
+# `doctor` asks the host and its D3D12 device directly.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_LibraryLoader"] }
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }
+
 [dev-dependencies]
 # Synthetic inputs, assembled in code: console shader containers
 # (`testkit`) and PE images (`testing`).

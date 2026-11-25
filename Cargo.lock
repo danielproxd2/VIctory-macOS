@@ -662,6 +662,8 @@ dependencies = [
  "victory-pe",
  "victory-shader",
  "walkdir",
+ "windows",
+ "windows-sys",
 ]
 
 [[package]]
