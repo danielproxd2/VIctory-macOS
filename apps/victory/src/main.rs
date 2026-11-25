@@ -197,6 +197,7 @@ fn show_config() -> Result<()> {
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
     }
+    let mut violations = 0usize;
     for p in cfg
         .game_dir
         .iter()
@@ -205,8 +206,14 @@ fn show_config() -> Result<()> {
     {
         if let Err(e) = victory_core::ensure_outside_repo(p) {
             println!("POLICY VIOLATION: {e}");
+            violations += 1;
         }
     }
+    // Scripts read the exit status, not the text.
+    anyhow::ensure!(
+        violations == 0,
+        "{violations} configured path(s) violate the asset policy (see docs/asset-policy.md)"
+    );
     Ok(())
 }
 
