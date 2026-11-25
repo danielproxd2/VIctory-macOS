@@ -1075,4 +1075,16 @@ mod tests {
         assert_eq!(t.store_id, "9&C");
         assert_eq!(t.storage_bytes, 1024 << 20);
     }
+
+    /// A comment inside a field that never closes ends the field's text
+    /// where it opens, and is reported as the tag that never closes.
+    #[test]
+    fn an_unclosed_comment_in_a_field_ends_it_and_is_reported() {
+        let text = "<Game><TitleId>639AA8DD<!-- cut</TitleId><StoreId>9C</StoreId></Game>";
+        let manifest = Title::read_manifest(text.as_bytes());
+        assert_eq!(manifest.refused, [Refusal::UnclosedTag]);
+        assert_eq!(manifest.title.id, 0x639A_A8DD);
+        // Nothing after it is read.
+        assert_eq!(manifest.title.store_id, "");
+    }
 }
