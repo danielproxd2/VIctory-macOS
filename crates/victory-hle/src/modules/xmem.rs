@@ -368,18 +368,26 @@ fn hooks() -> [usize; 2] {
         // Looked up once the title is mapped, which is before it runs.
         None => match crate::runtime::main_image() {
             Some(base) => *AT.get_or_init(|| {
-                use windows_sys::Win32::System::LibraryLoader::GetProcAddress;
-                // SAFETY: a mapped image and a NUL-terminated name.
-                let at = unsafe {
-                    GetProcAddress(base as _, c"__XMemAllocationHooks__".as_ptr().cast())
-                }
-                .map_or(0, |f| f as usize);
+                let at = hook_table(base);
                 tracing::info!(found = at != 0, "xmem allocation hooks");
                 at
             }),
             None => 0,
         },
     };
+    read_hooks(at)
+}
+
+/// Where the image at `base` exports its hooks, or 0.
+fn hook_table(base: usize) -> usize {
+    use windows_sys::Win32::System::LibraryLoader::GetProcAddress;
+    // SAFETY: a mapped image and a NUL-terminated name.
+    unsafe { GetProcAddress(base as _, c"__XMemAllocationHooks__".as_ptr().cast()) }
+        .map_or(0, |f| f as usize)
+}
+
+/// The two routines of the hook table at `at`; none if there is no table.
+fn read_hooks(at: usize) -> [usize; 2] {
     if at == 0 {
         return [0; 2];
     }
@@ -390,7 +398,18 @@ fn hooks() -> [usize; 2] {
 /// The title's general allocator, for middleware too: its hook if it has
 /// one, else [`XMemAllocDefault`].
 pub extern "system" fn XMemAlloc(size: usize, attributes: u64) -> *mut c_void {
-    match hooks()[0] {
+    alloc_through(hooks()[0], size, attributes)
+}
+
+/// See [`XMemAlloc`].
+pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
+    free_through(hooks()[1], address, attributes)
+}
+
+/// Allocates with the title's routine `hook`, or ours if it has none (0):
+/// a title may hook one of the two and not the other.
+fn alloc_through(hook: usize, size: usize, attributes: u64) -> *mut c_void {
+    match hook {
         0 => XMemAllocDefault(size, attributes),
         hook => {
             // SAFETY: the title's own routine of this type.
@@ -400,9 +419,9 @@ pub extern "system" fn XMemAlloc(size: usize, attributes: u64) -> *mut c_void {
     }
 }
 
-/// See [`XMemAlloc`].
-pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
-    match hooks()[1] {
+/// See [`alloc_through`].
+fn free_through(hook: usize, address: *mut c_void, attributes: u64) {
+    match hook {
         0 => XMemFreeDefault(address, attributes),
         hook => {
             // SAFETY: the title's own routine of this type.
@@ -1284,6 +1303,235 @@ mod tests {
         // the host fails it.
         let nowhere = (usize::MAX - 2 * PAGE + 1) as *mut c_void;
         assert_eq!(commit(nowhere, PAGE), null);
+    }
+
+    static HOOKED_ALLOCS: AtomicUsize = AtomicUsize::new(0);
+    static HOOKED_FREES: AtomicUsize = AtomicUsize::new(0);
+    /// The last attributes each hook was called with.
+    static HOOKED_WITH: Mutex<[u64; 2]> = Mutex::new([0; 2]);
+
+    /// A title's allocation routine: counts, and allocates as we would.
+    extern "system" fn title_alloc(size: usize, attributes: u64) -> *mut c_void {
+        HOOKED_ALLOCS.fetch_add(1, Ordering::Relaxed);
+        HOOKED_WITH.lock().unwrap()[0] = attributes;
+        XMemAllocDefault(size, attributes)
+    }
+
+    extern "system" fn title_free(address: *mut c_void, attributes: u64) {
+        HOOKED_FREES.fetch_add(1, Ordering::Relaxed);
+        HOOKED_WITH.lock().unwrap()[1] = attributes;
+        XMemFreeDefault(address, attributes);
+    }
+
+    #[test]
+    fn allocation_hooks_are_called_one_by_one() {
+        let calls = || {
+            (
+                HOOKED_ALLOCS.load(Ordering::Relaxed),
+                HOOKED_FREES.load(Ordering::Relaxed),
+            )
+        };
+        let (alloc, free) = (
+            title_alloc as AllocRoutine as usize,
+            title_free as FreeRoutine as usize,
+        );
+        let attributes = 6 << ALIGNMENT_SHIFT | 1 << 29;
+        // Each table, and how many calls reach the title's two routines.
+        for (table, (allocs, frees)) in [
+            ([0, 0], (0, 0)),
+            ([alloc, 0], (1, 0)),
+            ([0, free], (0, 1)),
+            ([alloc, free], (1, 1)),
+        ] {
+            let before = calls();
+            let p = alloc_through(table[0], 200, attributes);
+            assert!(!p.is_null(), "{table:x?}");
+            assert_eq!(p as usize % 64, 0);
+            // SAFETY: 200 bytes were allocated.
+            unsafe { p.cast::<u8>().write_bytes(0xcd, 200) };
+            free_through(table[1], p, attributes);
+            let after = calls();
+            assert_eq!((after.0 - before.0, after.1 - before.1), (allocs, frees));
+        }
+        // The title's routines get the caller's arguments as they came.
+        assert_eq!(*HOOKED_WITH.lock().unwrap(), [attributes; 2]);
+        // A null block reaches the title's routine too: it is its to judge.
+        let before = calls();
+        free_through(free, std::ptr::null_mut(), 0);
+        assert_eq!(calls().1 - before.1, 1);
+    }
+
+    #[test]
+    fn the_hook_table_is_read_where_the_title_exports_it() {
+        // A table as a title's exe exports it: two routine addresses.
+        static TABLE: [usize; 2] = [0x1111_0000, 0x2222_0000];
+        assert_eq!(read_hooks((&raw const TABLE) as usize), TABLE);
+        // An image without the export has no table, and no table no hooks.
+        // SAFETY: a module that is always loaded.
+        let kernel32 = unsafe {
+            windows_sys::Win32::System::LibraryLoader::GetModuleHandleA(
+                c"kernel32.dll".as_ptr().cast(),
+            )
+        };
+        assert!(!kernel32.is_null());
+        assert_eq!(hook_table(kernel32 as usize), 0);
+        assert_eq!(read_hooks(0), [0; 2]);
+        // No title is mapped in this process, so nothing was looked up and
+        // the exports go to our own allocator.
+        assert_eq!(crate::runtime::main_image(), None);
+        assert_eq!(hooks(), [0; 2]);
+        let p = XMemAlloc(64, 0);
+        assert!(!p.is_null());
+        XMemFree(p, 0);
+        XMemFree(std::ptr::null_mut(), 0);
+    }
+
+    /// Pins where default blocks come from today: the host's heap, wherever
+    /// that lies, not a reservation below 2^40 as on the console. Our
+    /// shortcut, not asserted as right: change the test with it.
+    #[test]
+    fn default_blocks_come_from_the_host_heap_today() {
+        for (size, attributes) in [(100, 0), (100, 1 << 29), (3 * MIB, 0xc << ALIGNMENT_SHIFT)] {
+            let p = XMemAllocDefault(size, attributes);
+            assert!(!p.is_null());
+            let info = query(p);
+            assert_eq!(info.host.State, MEM_COMMIT);
+            // Inside an allocation of the heap's, behind our header.
+            assert!((info.host.AllocationBase as usize) < p as usize, "{p:p}");
+            assert_eq!(info.flags, GRAPHICS);
+            // SAFETY: the header we wrote below the block.
+            let [bytes, align] = unsafe { p.cast::<[usize; 2]>().sub(1).read() };
+            assert_eq!(bytes, size + align);
+            eprintln!(
+                "a default block of {size} bytes: {p:p}, below 2^40: {}",
+                (p as usize) < 1 << 40
+            );
+            XMemFreeDefault(p, attributes);
+        }
+        // A size that leaves no room for the header is no block.
+        assert!(XMemAllocDefault(usize::MAX, 0).is_null());
+        assert!(XMemAllocDefault(usize::MAX - 8, 0x1f << ALIGNMENT_SHIFT).is_null());
+        XMemFreeDefault(std::ptr::null_mut(), 0);
+    }
+
+    /// Pins what the working-set statistics say today: every field filled
+    /// whatever is asked for, and no use per bandwidth class. Our shortcut,
+    /// not asserted as right: change the test with it.
+    #[test]
+    fn working_set_statistics_ignore_what_is_asked_today() {
+        let (gpu_optimal, standard) = victory_gpu::console::current().title_memory();
+        for which in [0, 1, 0x2000_0001, u32::MAX] {
+            let mut stats = WorkingSet {
+                tools_limit: 9,
+                gpu_optimal_used: 9,
+                ..Default::default()
+            };
+            assert_eq!(XMemGetWorkingSetStatistics(which, &mut stats), 1);
+            assert_eq!(stats.gpu_optimal_limit, gpu_optimal, "{which:#x}");
+            // Another test transfers memory meanwhile, so no exact figure.
+            assert!(stats.title_limit <= gpu_optimal + standard, "{which:#x}");
+            assert!(stats.title_limit > gpu_optimal, "{which:#x}");
+            assert!(stats.title_used > 0, "{which:#x}");
+            assert_eq!(stats.gpu_optimal_used, 0, "{which:#x}");
+            let tools = (
+                stats.tools_limit,
+                stats.tools_used,
+                stats.tools_gpu_optimal_limit,
+                stats.tools_gpu_optimal_used,
+            );
+            assert_eq!(tools, (0, 0, 0, 0), "{which:#x}");
+            let rest = (
+                stats.stack_used,
+                stats.physical_pages,
+                stats.kernel_pool_used,
+                stats.kernel_pool_limit,
+            );
+            assert_eq!(rest, (0, 0, 0, 0), "{which:#x}");
+        }
+        assert_eq!(XMemGetWorkingSetStatistics(0, std::ptr::null_mut()), 0);
+    }
+
+    #[test]
+    fn virtual_alloc_replace_placeholder_and_fixed_base_paths() {
+        // A title that splits its own 64 KiB-page reservation tells us of
+        // each part: it stays the placeholder it is, whole, and the call
+        // answers with the address it was given.
+        let a = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            2 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!a.is_null());
+        let second = a.wrapping_byte_add(PAGE);
+        let split = MEM_RESERVE | PAGES_64K | MEM_REPLACE_PLACEHOLDER;
+        assert_eq!(
+            XMemVirtualAlloc(second, PAGE, split, 0, PAGE_READWRITE),
+            second
+        );
+        assert_eq!(query(second).host.State, MEM_RESERVE);
+        let pages = allocate(2);
+        assert_eq!(XMemMapPhysicalPages(a, 2, pages.as_ptr()), a, "still one");
+        assert_eq!(mine(a, 2), [(a as usize, 2 * PAGE)]);
+        assert_eq!(XMemMapPhysicalPages(a, 2, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+
+        // A commit at an address inside a reservation: that page and no
+        // other, with the console's GPU access bits taken off the
+        // protection, and no access where none of the host's is named.
+        const GPU_READ_WRITE: u32 = 0x2000;
+        let r = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            4 * PAGE,
+            MEM_RESERVE,
+            GRAPHICS,
+            PAGE_NOACCESS,
+        );
+        assert!(!r.is_null());
+        let at = |page: usize| r.wrapping_byte_add(page * PAGE);
+        let rw = PAGE_READWRITE | GPU_READ_WRITE;
+        assert_eq!(
+            XMemVirtualAlloc(at(1), PAGE, MEM_COMMIT, GRAPHICS, rw),
+            at(1)
+        );
+        assert_eq!(
+            XMemVirtualAlloc(at(2), PAGE, MEM_COMMIT, GRAPHICS, GPU_READ_WRITE),
+            at(2)
+        );
+        let states = [0, 1, 2, 3].map(|page| query(at(page)).host.State);
+        assert_eq!(states, [MEM_RESERVE, MEM_COMMIT, MEM_COMMIT, MEM_RESERVE]);
+        assert_eq!(query(at(1)).host.Protect, PAGE_READWRITE);
+        assert_eq!(query(at(2)).host.Protect, PAGE_NOACCESS);
+        // SAFETY: committed read-write.
+        unsafe { at(1).cast::<u8>().write_bytes(1, PAGE) };
+        // Past the reservation, or no bytes: the host's refusal, as null.
+        let null = std::ptr::null_mut::<c_void>();
+        assert_eq!(
+            XMemVirtualAlloc(at(3), 2 * PAGE, MEM_COMMIT, GRAPHICS, rw),
+            null
+        );
+        assert_eq!(XMemVirtualAlloc(at(3), 0, MEM_COMMIT, GRAPHICS, rw), null);
+        assert_eq!(XMemVirtualAlloc(null, 0, MEM_RESERVE, GRAPHICS, rw), null);
+        assert_eq!(query(at(3)).host.State, MEM_RESERVE);
+        // SAFETY: our own reservation.
+        assert_ne!(unsafe { VirtualFree(r, 0, MEM_RELEASE) }, 0);
+
+        // A reservation at an address of the title's choice is made there
+        // or not at all: the address limits of the flags are for addresses
+        // we choose. `r` was above 4 GiB; 32-bit memory is asked for.
+        assert!(r as usize >= 1 << 32);
+        let kind = MEM_RESERVE | MEM_COMMIT;
+        let fixed = XMemVirtualAlloc(r, 4 * PAGE, kind, ADDRESS_32BIT, PAGE_READWRITE);
+        // Other tests reserve meanwhile, so the address may be taken.
+        if fixed.is_null() {
+            eprintln!("skipped: {r:p} was taken meanwhile");
+            return;
+        }
+        assert_eq!(fixed, r);
+        assert_eq!(query(r).flags, ADDRESS_32BIT);
+        // SAFETY: our own reservation.
+        assert_ne!(unsafe { VirtualFree(r, 0, MEM_RELEASE) }, 0);
     }
 
     #[test]
