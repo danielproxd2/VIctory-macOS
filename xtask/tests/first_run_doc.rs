@@ -40,6 +40,16 @@ const MESSAGES: &[(&str, &str)] = &[
         "tools/macos/victory.sh",
     ),
     ("cannot read the config file", "tools/macos/victory.sh"),
+    // The doctor.
+    (
+        "To check this Mac and the setup instead: tools/macos/victory.sh doctor",
+        "tools/macos/victory.sh",
+    ),
+    ("still the example value", "apps/victory/src/doctor.rs"),
+    (
+        "run under Wine via tools/macos/victory.sh doctor",
+        "apps/victory/src/doctor.rs",
+    ),
     // The processor check.
     (
         "this CPU does not support AVX2, which Xbox Series titles require;",
@@ -271,7 +281,11 @@ fn the_first_run_guide_quotes_messages_the_program_prints() {
 fn the_first_run_guide_names_what_exists() {
     let root = root();
     let guide = fs::read_to_string(root.join("docs/first-run.md")).unwrap();
-    for script in ["tools/macos/first-run.sh", "tools/macos/victory.sh"] {
+    for script in [
+        "tools/macos/first-run.sh",
+        "tools/macos/victory.sh",
+        "tools/macos/check-all.sh",
+    ] {
         assert!(guide.contains(script), "{script}");
         assert!(root.join(script).is_file(), "{script}");
     }

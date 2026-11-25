@@ -4,6 +4,19 @@ This file is for the first time a real game is started with VIctory on a Mac, an
 
 ## Before the first start
 
+First see whether the Mac itself is ready. This needs no game:
+
+```sh
+tools/macos/victory.sh doctor
+```
+
+It prints one line per item, marked `ok`, `warning`, `PROBLEM` or `not checked`: Wine and AVX2, the D3D12 device with what VIctory measures on it, the config file and the folders a run writes to, and the prebuilt shaders. Only a line marked `PROBLEM` has to be corrected before a run, and only then does the command end with status 1. Two lines to expect on a Mac today:
+
+- `warning     64-bit atomics: ...`: a known difference of D3DMetal (listed below under "Host differences"). Nothing in the setup changes it.
+- `warning     game_dir: still the example value D:\victory-data\game ...`: the `victory.toml` was copied from an older example. A run does not need `game_dir`; `tools/macos/victory.sh config` fails until the line is removed or names your folder.
+
+Started without Wine (`cargo run -p victory -- doctor`), each item that needs Windows reads `not checked ...: run under Wine via tools/macos/victory.sh doctor`.
+
 Keep the game outside the repository, for example in `~/games/<the game>`. Then run the checks, which start no title code:
 
 ```sh
@@ -39,7 +52,7 @@ The stages are in the order of `tools/macos/victory.sh` and `apps/victory/src/ru
 
 | What is printed | What it means and what to check |
 | --- | --- |
-| `victory.sh: no command given, and no game is started by default.` | The launcher was started without arguments. It builds and starts nothing. |
+| `victory.sh: no command given, and no game is started by default.` | The launcher was started without arguments. It builds and starts nothing, and goes on: `To check this Mac and the setup instead: tools/macos/victory.sh doctor`. |
 | `no Wine at <path>: run tools/macos/build-crossover-wine.sh first` | The Wine build is missing. Run `./setup.sh` again; finished steps are skipped. |
 | `D3DMetal is missing: copy the redist/lib folder ...` | Wine is there without Apple's D3DMetal. Download the Game Porting Toolkit `.dmg` into `~/Downloads` and run `./setup.sh` again. |
 | `victory.sh: started inside the VIctory source tree; the title runs in its own folder, <folder>` | Not a failure. The launcher was started from inside the repository, where a title must not run, so the title is started in its own folder. |
@@ -187,6 +200,7 @@ Differences in VIctory itself:
 
 ## What has not been tried
 
+- `tools/macos/check-all.sh` runs every check this Mac can run (policy, formatting, the native and the Wine tests in both profiles, `victory doctor`) and prints one table; `--quick` is the short form. It is for whoever changes VIctory, not for a first run, and it starts no game either (`macos.md`, "One command for every check").
 - No real game has been started on this port. Everything from stage 5 on is tested with a stand-in executable that creates no D3D12 device.
 - No test starts the launcher against the real Wine; that is done by hand.
 - `fidelityfx_dir` has not been tried under D3DMetal.

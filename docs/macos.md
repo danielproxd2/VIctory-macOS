@@ -144,7 +144,20 @@ Later work replaces the Windows host underneath the title. That needs a Rosetta 
 
 Run `./setup.sh` from the top of the repository. It checks the Mac, installs the Homebrew tools, builds checksum-verified x86_64 GMP, Nettle, GnuTLS and FreeType, builds CrossOver Wine, adds D3DMetal from the Game Porting Toolkit in Downloads, and builds VIctory. The only manual step is downloading the toolkit from Apple. A clean run on an M4 on 24 November 2026 finished without help, and the full suite then passed (343 passed, 0 failed).
 
-The setup's last step is `tools/macos/check-setup.sh`, which can be run at any time. It needs no game: `victory --version` under Wine is what proves that VIctory starts, and the step fails only if that does. It then shows `victory config`. The `victory.toml` the setup copies from `victory.example.toml` names no game, and `config` says `NOTE: game_dir is not set` for it and succeeds. A `game_dir` that is set and is not there, or a folder inside the repository, makes `config` end with status 1 (`MISSING: game_dir ... is not a directory`, `POLICY VIOLATION: ...`); the step shows that with what to change and still passes, since it is the user's file that needs correcting and not the setup. Until 24 November 2026 the example named `D:\victory-data\game` and the setup required `config` to succeed, so the upstream change that makes a missing `game_dir` an error stopped a fresh setup at its last step with "VIctory did not start under Wine". A `victory.toml` copied from the old example still holds that line: remove it or name the game's folder in the `Z:\` form.
+The setup's last step is `tools/macos/check-setup.sh`, which can be run at any time. It needs no game: `victory --version` under Wine is what proves that VIctory starts, and the step fails only if that does. It then shows `victory config`. The `victory.toml` the setup copies from `victory.example.toml` names no game, and `config` says `NOTE: game_dir is not set` for it and succeeds. A `game_dir` that is set and is not there, or a folder inside the repository, makes `config` end with status 1 (`MISSING: game_dir ... is not a directory`, `POLICY VIOLATION: ...`); the step shows that with what to change and still passes, since it is the user's file that needs correcting and not the setup. It ends by naming `tools/macos/victory.sh doctor` (below), which it does not run. Until 24 November 2026 the example named `D:\victory-data\game` and the setup required `config` to succeed, so the upstream change that makes a missing `game_dir` an error stopped a fresh setup at its last step with "VIctory did not start under Wine". A `victory.toml` copied from the old example still holds that line: remove it or name the game's folder in the `Z:\` form.
+
+### Is this Mac ready: `victory doctor`
+
+`tools/macos/victory.sh doctor` needs no game. It prints one line per item, each marked `ok`, `warning`, `PROBLEM` or `not checked`, and ends with status 1 only if a line is marked `PROBLEM`:
+
+- the host (Wine and its version) and AVX2 as `run --execute` checks it, with what `ROSETTA_ADVERTISE_AVX` holds;
+- the D3D12 device: that VIctory's runtime gets one, the adapter's name, the shader model (6.6 is required), the mesh shader tier, the verdict of the runtime's own probe of 64-bit atomics with the values it read back, and which castable formats the device refuses, asked one by one on 4 by 4 textures;
+- the configuration: the file found or not, `game_dir`, and whether the cache and data folders can be written to (they are made if missing, as a run makes them);
+- the DXIL validator, if `VICTORY_DXIL` names one, and the prebuilt clamp and depth bytecode against the hash of their sources.
+
+A `warning` is something a run does not stop on. Under D3DMetal the 64-bit atomics line is one today ("Open differences under D3DMetal" below), and so is a `game_dir` that is not there. A `game_dir` that still holds `D:\victory-data\game` from the old example is reported as "still the example value": `victory config` ends with status 1 on that value, once for the missing folder and once because the drive cannot be resolved for the policy check (`POLICY VIOLATION: cannot resolve ...`), and the doctor does neither. The native macOS build (`cargo run -p victory -- doctor`) asks Windows nothing and says `not checked ...: run under Wine via tools/macos/victory.sh doctor` for each such item; it still checks the prebuilt bytecode.
+
+The verdict on the atomics is read from what `victory-gpu` logs when it makes its device, so it is the one a run acts on; `the_runtime_still_logs_the_lines_the_doctor_reads` fails if those lines change. The castable formats are asked by the doctor itself, because the runtime asks only after a title's texture was refused. `doctor_reports_the_host_device` (`apps/victory/tests/doctor.rs`) runs the real command under Wine and checks the device lines, and prints `skipped: no host D3D12 device` without a device.
 
 ### Before the first start of a real game
 
@@ -164,6 +177,21 @@ A title never runs in a VIctory source tree now (this repository, or any folder 
 The config file is `VICTORY_CONFIG` (a relative name is taken from the user's directory), else `victory.toml` in the user's directory, else the repository's `victory.toml`, where `setup.sh` puts it.
 
 The stand-in wine of `xtask/tests/shell_scripts.rs` checks the launcher's side of this, and `run_by_file_name_alone_runs_the_title_in_its_own_folder` and `run_leaves_the_titles_relative_paths_in_the_directory_it_was_started_in` (`apps/victory/tests/run.rs`) check under Wine what `victory.exe` and a title make of the directory they are started in. No test starts the launcher itself against the real Wine; that was done by hand, with the results above.
+
+## One command for every check
+
+`tools/macos/check-all.sh` runs everything this Mac can check and prints one table: `cargo xtask policy`, `cargo xtask fmt-check`, the native tests in the dev and the release profile, the Wine tests in both profiles, and `victory doctor` under Wine. A failed step does not stop the others, and the script ends with status 1 if any step failed.
+
+```sh
+tools/macos/check-all.sh            # everything; takes long
+tools/macos/check-all.sh --quick    # policy, fmt-check and the native dev tests
+tools/macos/check-all.sh --no-wine  # everything native
+tools/macos/check-all.sh --repeat 3 # each Wine test run three times
+```
+
+The Wine runs are the proving run of "What a test run did not check": the script sets `VICTORY_REQUIRE_GPU`, `VICTORY_REQUIRE_CLAMP` and `VICTORY_REQUIRE_DEPTH` where D3DMetal is in the Wine build, and `VICTORY_REQUIRE_DXIL` and `VICTORY_REQUIRE_HLSL` where it finds `dxil.dll` and `dxc.exe` in the newest folder under `~/Library/Caches/victory-macos/dxc/*/` (or `VICTORY_DXIL_UNIX` and `VICTORY_PC_DXC_UNIX` name them). Where one is missing it says which switches it left off, before the runs and under the table. It never sets the switches for what a Mac does not have. The native runs get no switch.
+
+Each row of the table has the step's exit status, the tests passed, failed and ignored summed over cargo's `test result:` lines, and the number of `skipped:` lines; below the table those are counted per reason. The logs are in a new folder per run under `~/Library/Caches/victory-macos/check/` (or `VICTORY_CHECK_DIR`), never in the repository. `tools/macos/check-all.sh --parse-log <file>` prints what the table would say of one log. The tests in `xtask/tests/shell_scripts.rs` run the script with stand-ins for cargo and Wine, and `check_all_knows_every_require_switch` fails when the sources read a switch the script neither sets nor names.
 
 ## After merging upstream, 24 November 2026
 
