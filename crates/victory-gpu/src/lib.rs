@@ -29,6 +29,7 @@ mod draw;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;
+mod holders;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]

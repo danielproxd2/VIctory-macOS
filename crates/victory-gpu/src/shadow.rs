@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
+use crate::holders::Holders;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
@@ -398,17 +399,16 @@ struct Entry {
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
-#[derive(Default)]
 struct Buffers {
     map: BTreeMap<(u64, usize), Entry>,
-    /// The length of the longest buffer there has been: no buffer that
-    /// holds an address starts further below it.
-    longest: u64,
+    /// The same keys with their ends, for finding the buffer that holds a
+    /// range without walking past every buffer that does not.
+    holders: Holders,
 }
 
 static BUFFERS: Mutex<Buffers> = Mutex::new(Buffers {
     map: BTreeMap::new(),
-    longest: 0,
+    holders: Holders::new(),
 });
 
 fn buffers() -> std::sync::MutexGuard<'static, Buffers> {
@@ -431,7 +431,7 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
         return;
     };
     let mut buffers = buffers();
-    buffers.longest = buffers.longest.max(len);
+    buffers.holders.insert((start, resource), end);
     buffers
         .map
         .insert((start, resource), Entry { end, shadow: None });
@@ -439,7 +439,9 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().map.remove(&(start, resource));
+    let mut buffers = buffers();
+    buffers.holders.remove((start, resource));
+    buffers.map.remove(&(start, resource));
 }
 
 /// Whether the buffer registered as (`resource`, `start`) has a host copy.
@@ -452,41 +454,31 @@ pub(crate) fn copied(resource: usize, start: u64) -> bool {
         .is_some_and(|e| e.shadow.is_some())
 }
 
-/// How many buffers starting below an address are looked at before a
-/// longer search is worth a line in the log.
-const NEAR: usize = 64;
+/// How many buffers the last [`find`] on this thread looked at to tell
+/// which one holds the range.
+#[cfg(test)]
+thread_local! {
+    static LOOKED_AT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     let mut buffers = buffers();
-    // Downwards from the address, as far as a buffer holding the range can
-    // start. (This used to stop after 64 buffers: a buffer with more than
-    // that many others inside it, below the address, was not found, and
-    // its range got a second copy as loose memory.)
-    let lowest = end.saturating_sub(buffers.longest).min(address);
-    let found = buffers
-        .map
-        .range((lowest, 0)..=(address, usize::MAX))
-        .rev()
-        .enumerate()
-        .find(|(_, (_, e))| e.end >= end)
-        .map(|(i, (k, _))| (i, *k));
-    let Some((passed, key)) = found else {
+    // The buffer that starts last at or below the address and reaches the
+    // range's end. (This was a walk down from the address: first over at
+    // most 64 buffers, which missed a buffer with more than that many
+    // others inside it, then over all of them, which a title with many
+    // buffers pays on every draw, under this lock. The tree skips the
+    // buffers that end too early.)
+    let found = buffers.holders.holder(address, end);
+    #[cfg(test)]
+    LOOKED_AT.set(found.looked_at);
+    let Some(key) = found.key else {
         drop(buffers);
         return loose(address, end);
     };
-    if passed >= NEAR {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
-            tracing::info!(
-                address = format_args!("{address:#x}"),
-                passed,
-                "a title buffer found past many others inside it"
-            )
-        });
-    }
     let entry = buffers.map.get_mut(&key)?;
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
@@ -696,6 +688,40 @@ mod tests {
         // And the small ones are found as themselves.
         let found = find(at + 16 * 70 + 4, 8).map(|s| (s.start, s.len));
         assert_eq!(found, Some((at + 16 * 70, 16)));
+    }
+
+    /// The same with thousands of buffers, through `find` itself: the big
+    /// buffer is found, a range in no buffer becomes loose memory, and
+    /// neither lookup looks at more than a few of the buffers below it.
+    /// The addresses are in no test's memory: nothing here reads them.
+    #[test]
+    fn find_looks_at_few_of_many_buffers() {
+        let Some(_gpu) = crate::testing::gpu() else {
+            return;
+        };
+        const BASE: u64 = 0x7b00_0000_0000;
+        const SMALL: u64 = 5000;
+        const BIG: u64 = 1 << 20;
+        let mut registered = Registered(Vec::new());
+        registered.add(OUTER, BASE, BIG);
+        for i in 0..SMALL {
+            registered.add(INNER + i as usize, BASE + 16 * i, 16);
+        }
+        let looked_at = || LOOKED_AT.get();
+        let found = find(BASE + 16 * SMALL - 8, 16).map(|s| (s.start, s.len));
+        assert_eq!(found, Some((BASE, BIG)));
+        assert!(looked_at() <= 120, "{} buffers looked at", looked_at());
+        // Just past the big buffer, every one of them below the address.
+        let found = find(BASE + BIG - 8, 16).map(|s| (s.start, s.len));
+        assert_eq!(found, Some((BASE, WINDOW)), "loose memory");
+        assert!(looked_at() <= 120, "{} buffers looked at", looked_at());
+        // A buffer the title released is not found any more.
+        registered.0.retain(|&(resource, _)| resource != OUTER);
+        unregister(OUTER, BASE);
+        let found = find(BASE + 16 * SMALL - 8, 16).map(|s| (s.start, s.len));
+        assert_eq!(found, Some((BASE, WINDOW)), "loose memory");
+        drop(registered);
+        assert_eq!(buffers().holders.holder(BASE + 8, BASE + 9).key, None);
     }
 
     #[test]
