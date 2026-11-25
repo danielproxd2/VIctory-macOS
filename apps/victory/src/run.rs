@@ -618,6 +618,21 @@ mod tests {
         let expected_ok = true;
         assert_eq!(super::check_cpu_features().is_ok(), expected_ok);
     }
+
+    /// Under Rosetta 2 AVX2 is there for a process started with
+    /// `ROSETTA_ADVERTISE_AVX=1`, which tools/macos/victory.sh and
+    /// tools/macos/test-wine.sh set: started that way a title gets through
+    /// the check itself, without `VICTORY_SKIP_CPU_CHECK`.
+    #[test]
+    fn the_cpu_check_passes_where_rosetta_advertises_avx() {
+        let set = |name: &str| std::env::var(name).is_ok_and(|v| v == "1");
+        if !set("ROSETTA_ADVERTISE_AVX") || set(super::SKIP_CPU_CHECK_ENV) {
+            crate::testing::skip("ROSETTA_ADVERTISE_AVX is not 1, or the CPU check is off");
+            return;
+        }
+        let checked = super::check_cpu_features().map_err(|e| e.to_string());
+        assert_eq!(checked, Ok(()));
+    }
 }
 
 #[cfg(test)]

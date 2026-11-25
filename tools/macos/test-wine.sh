@@ -27,6 +27,11 @@
 # printing "skipped: DXIL validation: ...". VICTORY_REQUIRE_WARP=1 and
 # VICTORY_REQUIRE_DIFF=1 do the same for WARP and for the compilers of the
 # differential shader tests.
+# ROSETTA_ADVERTISE_AVX=1 is set for the tests unless the caller set the
+# variable: `victory run --execute` refuses a CPU without AVX2, and Rosetta 2
+# says it has AVX and AVX2 only to a process started with this variable.
+# tools/macos/victory.sh sets it for the same reason, so the tests start
+# titles the way the launcher does, through the check and not around it.
 # Cargo splits the runner on spaces, so the runner is a wrapper script in a
 # temporary folder without spaces, removed when this script ends.
 set -e
@@ -79,6 +84,9 @@ export WINEDEBUG="${WINEDEBUG:--all}"
 # A new prefix would wait on hidden Mono and Gecko install prompts, and the
 # tests need neither. Wine's crash dialog is turned off for the same reason.
 export WINEDLLOVERRIDES="mscoree,mshtml=;winedbg.exe=d$D3DMETAL${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
+# Rosetta reads this when a process starts: Wine, the tests and the
+# `victory.exe` they start all get it from here.
+export ROSETTA_ADVERTISE_AVX="${ROSETTA_ADVERTISE_AVX:-1}"
 # Wine hands its environment to the tests; said here so that it stays so.
 [ -z "${VICTORY_REQUIRE_GPU:-}" ] || export VICTORY_REQUIRE_GPU
 [ -z "${VICTORY_REQUIRE_WARP:-}" ] || export VICTORY_REQUIRE_WARP

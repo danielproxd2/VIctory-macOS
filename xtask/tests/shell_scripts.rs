@@ -125,6 +125,16 @@ fn gnullvm_cc_says_when_mingw_is_missing() {
 /// `libdir`; the stand-in cargo writes what it was started with to the file
 /// the returned path names.
 fn test_wine(name: &str, libdir: &Path, args: &[&str]) -> (Output, PathBuf) {
+    test_wine_with(name, libdir, args, None)
+}
+
+/// The same, with `ROSETTA_ADVERTISE_AVX` as given (`None`: not set).
+fn test_wine_with(
+    name: &str,
+    libdir: &Path,
+    args: &[&str],
+    rosetta: Option<&str>,
+) -> (Output, PathBuf) {
     let dir = scratch(name);
     let log = dir.join("cargo.log");
     script(&dir.join("bin/wine"), "exit 0");
@@ -138,10 +148,13 @@ fn test_wine(name: &str, libdir: &Path, args: &[&str]) -> (Output, PathBuf) {
     printf '%s\n' "cargo $*"
     printf '%s\n' "fixtures $VICTORY_FIXTURE_DIR"
     printf '%s\n' "runner $CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_RUNNER"
+    printf '%s\n' "rosetta ${ROSETTA_ADVERTISE_AVX-<unset>}"
+    printf '%s\n' "cpu check ${VICTORY_SKIP_CPU_CHECK-<unset>}"
     [ ! -x "$CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_RUNNER" ] || echo "wrapper present"
 } >> "$STAND_IN_LOG""#,
     );
-    let out = Command::new(root().join("tools/macos/test-wine.sh"))
+    let mut command = Command::new(root().join("tools/macos/test-wine.sh"));
+    command
         .args(args)
         .env(
             "PATH",
@@ -150,9 +163,12 @@ fn test_wine(name: &str, libdir: &Path, args: &[&str]) -> (Output, PathBuf) {
         .env("WINE", dir.join("bin/wine"))
         .env("STAND_IN_LOG", &log)
         .env_remove("WINEDLLOVERRIDES")
-        .output()
-        .unwrap();
-    (out, log)
+        .env_remove("ROSETTA_ADVERTISE_AVX")
+        .env_remove("VICTORY_SKIP_CPU_CHECK");
+    if let Some(rosetta) = rosetta {
+        command.env("ROSETTA_ADVERTISE_AVX", rosetta);
+    }
+    (command.output().unwrap(), log)
 }
 
 /// The lines of the stand-in cargo's log that start with `key`, without it.
@@ -260,12 +276,44 @@ fn test_wine_builds_the_fixtures_and_removes_its_wrapper() {
     }
 }
 
+/// `victory run --execute` refuses a CPU without AVX2, and under Rosetta 2
+/// only a process started with `ROSETTA_ADVERTISE_AVX=1` sees AVX2. The
+/// tests start titles through that check: the script sets Rosetta's
+/// variable for them, as victory.sh does for a real run, and does not turn
+/// the check off. Whoever sets the variable keeps their value.
+#[test]
+fn test_wine_has_rosetta_advertise_avx_and_leaves_the_cpu_check_on() {
+    let libdir = scratch("test-wine-rosetta-libdir");
+    for (name, given, expected) in [
+        ("test-wine-rosetta-default", None, "1"),
+        ("test-wine-rosetta-empty", Some(""), "1"),
+        ("test-wine-rosetta-off", Some("0"), "0"),
+        ("test-wine-rosetta-on", Some("1"), "1"),
+    ] {
+        let (out, log) = test_wine_with(name, &libdir, &["-p", "victory"], given);
+        assert!(out.status.success(), "{name}: {}", text(&out.stderr));
+        // The fixture builds, then the test run, which is the one that
+        // starts Wine.
+        let rosetta = logged(&log, "rosetta ");
+        assert_eq!(rosetta.len(), 3, "{name}: {rosetta:?}");
+        assert_eq!(rosetta[2], expected, "{name}");
+        assert_eq!(
+            logged(&log, "cpu check "),
+            ["<unset>"; 3],
+            "{name}: the check must stay on"
+        );
+    }
+}
+
 /// What victory.sh starts Wine with, from stand-ins for cargo and wine in a
 /// home folder of the test's own.
 struct Launched {
     out: Output,
     /// The stand-in wine's `VICTORY_DATA_DIR`, `None` when it had none.
     data_dir: Option<String>,
+    /// The stand-in wine's `ROSETTA_ADVERTISE_AVX` and
+    /// `VICTORY_SKIP_CPU_CHECK`, `<unset>` for one it did not have.
+    cpu: [String; 2],
     /// The arguments the stand-in wine got.
     args: Vec<String>,
     /// The home folder as Wine's Z: drive shows it.
@@ -290,6 +338,8 @@ fn victory(name: &str, data_dir: Option<&str>, config: &str, config_name: &str) 
         &dir.join("wine/bin/wine"),
         r#"{
     printf '%s\n' "data ${VICTORY_DATA_DIR-<unset>}"
+    printf '%s\n' "rosetta ${ROSETTA_ADVERTISE_AVX-<unset>}"
+    printf '%s\n' "cpu check ${VICTORY_SKIP_CPU_CHECK-<unset>}"
     printf 'arg %s\n' "$@"
 } >> "$STAND_IN_LOG""#,
     );
@@ -308,6 +358,8 @@ fn victory(name: &str, data_dir: Option<&str>, config: &str, config_name: &str) 
         .env("STAND_IN_LOG", &log)
         .env("VICTORY_CONFIG", config_name)
         .env_remove("VICTORY_DATA_DIR")
+        .env_remove("ROSETTA_ADVERTISE_AVX")
+        .env_remove("VICTORY_SKIP_CPU_CHECK")
         .env_remove("WINEPREFIX");
     if let Some(data_dir) = data_dir {
         command.env("VICTORY_DATA_DIR", data_dir);
@@ -320,9 +372,21 @@ fn victory(name: &str, data_dir: Option<&str>, config: &str, config_name: &str) 
     Launched {
         out,
         data_dir: (data[0] != "<unset>").then(|| data[0].clone()),
+        cpu: [
+            logged(&log, "rosetta ").concat(),
+            logged(&log, "cpu check ").concat(),
+        ],
         args: logged(&log, "arg "),
         home: windows(&home),
     }
+}
+
+/// The launcher starts a title through the AVX2 check of `victory run`:
+/// it has Rosetta say that AVX2 is there and leaves the check on.
+#[test]
+fn victory_sh_has_rosetta_advertise_avx_and_leaves_the_cpu_check_on() {
+    let launched = victory("victory-sh-rosetta", None, "[paths]\n", "{}");
+    assert_eq!(launched.cpu, ["1", "<unset>"]);
 }
 
 /// What titles save must not sit in the Wine prefix, which the launcher
