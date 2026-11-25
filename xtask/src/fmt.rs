@@ -2,9 +2,19 @@
 //!
 //! Upstream does not keep its tree rustfmt-clean, so a file that exists
 //! upstream keeps upstream's layout here: reformatting it would turn every
-//! touched line into a conflict at the next merge. A file is the fork's own
-//! when it is not in the tree of the last merged upstream commit, which is
-//! the merge base of `HEAD` and the remote-tracking ref `upstream/main`.
+//! touched line into a conflict at the next merge.
+//!
+//! A file is upstream's when the newest upstream commits merged here have
+//! it. Those commits are found two ways, and both count: the merge base of
+//! `HEAD` and the remote-tracking ref `upstream/main`, and the second
+//! parents of the merge commits on `HEAD`'s first-parent history. The second way does not need
+//! the ref to be there or to be current: a ref older than the last merge
+//! has an older merge base, and the files upstream added since must not
+//! look like the fork's. Every other Rust file is the fork's own.
+//!
+//! A merge commit can also bring in a branch of the fork, whose files are
+//! not upstream's. Such a commit is known by having this very file, which
+//! upstream does not have, and is left out.
 
 use std::collections::HashSet;
 use std::io::Write as _;
@@ -15,6 +25,10 @@ use anyhow::{Context, Result, bail, ensure};
 
 /// The remote-tracking ref whose history says which files are upstream's.
 const UPSTREAM: &str = "refs/remotes/upstream/main";
+
+/// A file only the fork has (this one): a commit that has it is the
+/// fork's, whatever merged it.
+const FORK_ONLY: &str = "xtask/src/fmt.rs";
 
 /// The Rust files to format, or why they cannot be told apart.
 #[derive(Debug, PartialEq, Eq)]
@@ -43,28 +57,90 @@ fn names(out: &[u8]) -> impl Iterator<Item = String> + '_ {
         .map(|n| String::from_utf8_lossy(n).into_owned())
 }
 
-/// The Rust files under `root` that the last merged upstream commit does
-/// not have: tracked ones and new ones that are not ignored.
-pub fn fork_owned(root: &Path) -> Result<Owned> {
-    if git(root, &["rev-parse", "--verify", "--quiet", UPSTREAM])?.is_none() {
-        return Ok(Owned::Unknown(
-            "there is no upstream/main here (a plain clone has no `upstream` remote), so the \
-             fork's own files cannot be told from upstream's.\nTo check formatting: git remote \
-             add upstream https://github.com/Marvisak/VIctory.git && git fetch upstream"
-                .into(),
-        ));
-    }
-    let Some(base) = git(root, &["merge-base", "HEAD", UPSTREAM])? else {
-        return Ok(Owned::Unknown(
-            "HEAD and upstream/main have no common commit here (a shallow clone?), so the \
-             fork's own files cannot be told from upstream's."
-                .into(),
-        ));
+/// Whether git succeeds in `root`.
+fn git_ok(root: &Path, args: &[&str]) -> Result<bool> {
+    Ok(git(root, args)?.is_some())
+}
+
+/// The lines of git's output.
+fn lines(out: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(out)
+        .lines()
+        .map(|l| l.trim().to_owned())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// Whether the remote-tracking ref is here.
+fn has_ref(root: &Path) -> Result<bool> {
+    git_ok(root, &["rev-parse", "--verify", "--quiet", UPSTREAM])
+}
+
+/// The newest upstream commits merged into `HEAD` (one, unless upstream's
+/// history forks), or why none is known.
+fn merged_upstream(root: &Path) -> Result<std::result::Result<Vec<String>, String>> {
+    let base = match has_ref(root)? {
+        true => git(root, &["merge-base", "HEAD", UPSTREAM])?.and_then(|b| lines(&b).pop()),
+        false => None,
     };
-    let base = String::from_utf8_lossy(&base).trim().to_owned();
-    let upstream = git(root, &["ls-tree", "-r", "-z", "--name-only", &base])?
-        .with_context(|| format!("git cannot list the files of {base}"))?;
-    let upstream: HashSet<String> = names(&upstream).collect();
+    // The commits that merges brought in: every parent but the first.
+    let merges = git(
+        root,
+        &[
+            "rev-list",
+            "--first-parent",
+            "--merges",
+            "--parents",
+            "HEAD",
+        ],
+    )?
+    .unwrap_or_default();
+    let brought: Vec<String> = lines(&merges)
+        .iter()
+        .flat_map(|l| l.split_whitespace().skip(2).map(str::to_owned))
+        .collect();
+    // Not the fork's own branches: a commit with this command is no
+    // upstream commit.
+    let mut merged = Vec::new();
+    for commit in brought {
+        if !git_ok(root, &["cat-file", "-e", &format!("{commit}:{FORK_ONLY}")])? {
+            merged.push(commit);
+        }
+    }
+    merged.extend(base);
+    if merged.is_empty() {
+        return Ok(Err(match has_ref(root)? {
+            false => "there is no upstream/main here (a plain clone has no `upstream` remote) \
+                      and no merge of upstream in HEAD's history, so the fork's own files cannot be \
+                      told from upstream's.\nTo check formatting: git remote add upstream \
+                      https://github.com/Marvisak/VIctory.git && git fetch upstream"
+                .into(),
+            true => "HEAD and upstream/main have no common commit here (a shallow clone?) and \
+                     HEAD's history has no merge of upstream, so the fork's own files cannot be told \
+                     from upstream's."
+                .into(),
+        }));
+    }
+    // Of these, the ones no other one has in its history.
+    let mut args = vec!["merge-base", "--independent"];
+    args.extend(merged.iter().map(String::as_str));
+    let newest = git(root, &args)?.context("git cannot compare the merged commits")?;
+    Ok(Ok(lines(&newest)))
+}
+
+/// The Rust files under `root` that are not upstream's (see the module's
+/// text): tracked ones and new ones that are not ignored.
+pub fn fork_owned(root: &Path) -> Result<Owned> {
+    let commits = match merged_upstream(root)? {
+        Ok(commits) => commits,
+        Err(why) => return Ok(Owned::Unknown(why)),
+    };
+    let mut upstream = HashSet::new();
+    for commit in &commits {
+        let tree = git(root, &["ls-tree", "-r", "-z", "--name-only", commit])?
+            .with_context(|| format!("git cannot list the files of {commit}"))?;
+        upstream.extend(names(&tree));
+    }
     let here = git(
         root,
         &[
@@ -316,6 +392,93 @@ mod tests {
         written.unwrap();
         assert_eq!(fork, "mod upstream;\n");
         assert_eq!(upstream, UGLY);
+    }
+
+    /// Upstream goes on from the commit `upstream/main` names: a branch
+    /// `newer` with `newer.rs`, badly laid out, which the ref does not
+    /// follow. The fork merges it with a merge commit.
+    #[cfg(unix)]
+    fn merge_newer_upstream(dir: &std::path::Path) {
+        git(
+            dir,
+            &[
+                "checkout",
+                "-q",
+                "-b",
+                "newer",
+                "refs/remotes/upstream/main",
+            ],
+        );
+        std::fs::write(dir.join("newer.rs"), UGLY).unwrap();
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", "upstream goes on"]);
+        git(dir, &["checkout", "-q", "-"]);
+        git(
+            dir,
+            &["merge", "-q", "--no-ff", "-m", "merge upstream", "newer"],
+        );
+    }
+
+    /// `upstream/main` is older than the upstream commit last merged (the
+    /// remote was not fetched), or is gone: the file upstream added since
+    /// is still upstream's, by the merge commit, and `fmt` leaves it alone.
+    /// Before, it counted as the fork's own and was reformatted.
+    #[test]
+    #[cfg(unix)]
+    fn a_stale_or_missing_upstream_ref_keeps_merged_files_upstreams() {
+        let dir = repository("stale", "fn main() {}\n");
+        merge_newer_upstream(&dir);
+        let stale = fork_owned(&dir);
+        let written = run(&dir, true);
+        let newer = std::fs::read_to_string(dir.join("newer.rs")).unwrap();
+        git(&dir, &["update-ref", "-d", "refs/remotes/upstream/main"]);
+        let missing = fork_owned(&dir);
+        let checked = run(&dir, false);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(stale.unwrap(), Owned::Files(vec!["fork.rs".into()]));
+        written.unwrap();
+        assert_eq!(newer, UGLY, "upstream's newer file was reformatted");
+        assert_eq!(missing.unwrap(), Owned::Files(vec!["fork.rs".into()]));
+        checked.unwrap();
+    }
+
+    /// A merge commit that brings in a branch of the fork's own (it has
+    /// this command's file) says nothing about upstream: the branch's
+    /// files stay the fork's, with the ref and without it.
+    #[test]
+    #[cfg(unix)]
+    fn a_merged_branch_of_the_fork_stays_the_forks() {
+        let dir = repository("own-branch", "fn main() {}\n");
+        merge_newer_upstream(&dir);
+        std::fs::create_dir_all(dir.join("xtask/src")).unwrap();
+        std::fs::write(dir.join("xtask/src/fmt.rs"), "fn main() {}\n").unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-q", "-m", "the fork's format command"]);
+        git(&dir, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(dir.join("feature.rs"), UGLY).unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-q", "-m", "a feature of the fork"]);
+        git(&dir, &["checkout", "-q", "-"]);
+        git(
+            &dir,
+            &[
+                "merge",
+                "-q",
+                "--no-ff",
+                "-m",
+                "merge the feature",
+                "feature",
+            ],
+        );
+        let with = fork_owned(&dir);
+        git(&dir, &["update-ref", "-d", "refs/remotes/upstream/main"]);
+        let without = fork_owned(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        let own: Vec<String> = ["feature.rs", "fork.rs", "xtask/src/fmt.rs"]
+            .map(Into::into)
+            .into();
+        assert_eq!(with.unwrap(), Owned::Files(own.clone()));
+        assert_eq!(without.unwrap(), Owned::Files(own));
     }
 
     /// Without an upstream to compare with (a plain clone) nothing is
