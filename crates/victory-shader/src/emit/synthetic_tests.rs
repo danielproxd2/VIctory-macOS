@@ -413,10 +413,7 @@ fn run_permute_cs(wave64: bool, body: &[u32], want: &[u32]) {
         0xBF81_0000, // s_endpgm
     ]);
     let shader = build_wave(&words, wave64).expect("lower");
-    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        v.validate(&mut shader.dxil.clone())
-            .expect("DXIL validation failed");
-    }
+    crate::testing::dxil(&shader.dxil);
     let views = [
         View::Texture(1, 1, &[[0.0; 4]]),
         View::Buffer {
@@ -425,19 +422,16 @@ fn run_permute_cs(wave64: bool, body: &[u32], want: &[u32]) {
         },
         View::RawUav(wave),
     ];
-    let _one = super::valu_tests::ONE_AT_A_TIME
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _one = crate::testing::one_gpu_test_at_a_time();
     for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
+        let Some(host) = crate::testing::host(warp) else {
             continue;
         };
         // Fixed WaveSize pipelines are refused by WARP, and WaveSize(64) by
         // 32-lane hardware adapters.
         let Ok((root, pso)) = host.compute_pipeline(&shader) else {
             assert!(warp || wave64, "{label}: no pipeline for a wave of 32");
-            eprintln!("{label}: no pipeline for a wave of {wave}; skipped");
+            crate::testing::skip(&format!("{label}: no pipeline for a wave of {wave}"));
             continue;
         };
         let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
@@ -453,6 +447,20 @@ fn run_permute_cs(wave64: bool, body: &[u32], want: &[u32]) {
                 },
             )
             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        // Measured under D3DMetal: it makes the pipeline of a program that
+        // declares a wave of 64, and its dispatch then stores nothing.
+        if wave64
+            && !warp
+            && crate::testing::d3dmetal(&host)
+            && out[0] != want
+            && out[0].iter().all(|&lane| lane == 0)
+        {
+            crate::testing::host_differs(
+                "D3DMetal runs nothing of a compute shader that declares a wave of 64 \
+                 (WaveSize(64)): the pipeline is made and the buffer is left as it was",
+            );
+            continue;
+        }
         assert_eq!(out[0], want, "{label}");
     }
 }

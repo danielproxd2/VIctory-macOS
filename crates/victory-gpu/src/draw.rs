@@ -3309,8 +3309,8 @@ void main(uint3 id : SV_DispatchThreadID) {
 
     #[test]
     fn placed_unordered_textures_write_and_read_back_through_placed_views() {
-        let Some(host) = crate::host::host() else {
-            return; // no host GPU here
+        let Some((_gpu, host)) = crate::testing::gpu() else {
+            return;
         };
         let slots = Slots::new(4);
         let _ = host.log_messages();
@@ -3335,7 +3335,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         slots.make(2, &uav2);
         slots.make(3, &srv2);
 
-        let write = compile_cs(
+        const TEST: &str =
+            "draw::placed_unordered_textures_write_and_read_back_through_placed_views";
+        let Some(write) = compile_cs(
+            TEST,
             r#"
 #define RS "DescriptorTable(UAV(u0))"
 RWTexture2D<float4> outTex : register(u0);
@@ -3345,8 +3348,11 @@ void main(uint3 id : SV_DispatchThreadID) {
     outTex[id.xy] = float4((id.x + 1.0) / 8.0, (id.y + 1.0) / 8.0, 0.5, 1.0);
 }
 "#,
-        );
-        let copy_srv_to_uav = compile_cs(
+        ) else {
+            return;
+        };
+        let Some(copy_srv_to_uav) = compile_cs(
+            TEST,
             r#"
 #define RS "DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0))"
 Texture2D<float4> inTex : register(t0);
@@ -3357,8 +3363,12 @@ void main(uint3 id : SV_DispatchThreadID) {
     outTex[id.xy] = inTex.Load(int3(id.xy, 0));
 }
 "#,
-        );
-        let read = compile_cs(READ);
+        ) else {
+            return;
+        };
+        let Some(read) = compile_cs(TEST, READ) else {
+            return;
+        };
         let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
 
         let list = host.new_list().unwrap();
@@ -3422,8 +3432,8 @@ void main(uint3 id : SV_DispatchThreadID) {
 
     #[test]
     fn explicit_and_placed_rgba8_textures_at_one_address_share_compute_writes() {
-        let Some(host) = crate::host::host() else {
-            return; // no host GPU here
+        let Some((_gpu, host)) = crate::testing::gpu() else {
+            return;
         };
         let null = std::ptr::null();
         let heap_desc: [u32; 8] = [0, 16, 1, 0, 0, 0, 0, 0];
@@ -3442,7 +3452,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         let heap_host = title_heap.host().expect("a host view heap");
         let _ = host.log_messages();
 
-        let write = compile_cs(
+        const TEST: &str =
+            "draw::explicit_and_placed_rgba8_textures_at_one_address_share_compute_writes";
+        let Some(write) = compile_cs(
+            TEST,
             r#"
 #define RS "DescriptorTable(UAV(u0))"
 RWTexture2D<unorm float4> outTex : register(u0);
@@ -3452,8 +3465,11 @@ void main(uint3 id : SV_DispatchThreadID) {
     outTex[id.xy] = float4(64.0 / 255.0, 0.0, 1.0, 1.0);
 }
 "#,
-        );
-        let read_bytes = compile_cs(
+        ) else {
+            return;
+        };
+        let Some(read_bytes) = compile_cs(
+            TEST,
             r#"
 #define RS "DescriptorTable(SRV(t0)), UAV(u1)"
 Texture2D<unorm float4> inTex : register(t0);
@@ -3465,7 +3481,9 @@ void main(uint3 id : SV_DispatchThreadID) {
     outBuf.Store4((id.y * 2 + id.x) * 16, px);
 }
 "#,
-        );
+        ) else {
+            return;
+        };
         let (out, data) = host.shared_buffer(4 * 16).unwrap();
 
         // Four pairings at one guest address in a single command list:

@@ -231,9 +231,7 @@ pub(crate) fn run(
     let err = |e: windows::core::Error| e.message().to_string();
     let (shader, _) = parts(atomic).map_err(|e| e.to_string())?;
     let user_data = user_data(&shader).ok_or("the probe reads user data it does not set")?;
-    let host = victory_shader::emit::host::Host {
-        device: device.clone(),
-    };
+    let host = victory_shader::emit::host::Host::from_device(device.clone());
     let (root, pso) = host.compute_pipeline(&shader)?;
     let dev = device;
     let sample = DXGI_SAMPLE_DESC {
