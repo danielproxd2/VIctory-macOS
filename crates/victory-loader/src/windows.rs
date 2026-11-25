@@ -228,6 +228,13 @@ impl ImportResolver for WithTitleDlls<'_> {
     fn resolve(&self, dll: &str, symbol: &ImportSymbol) -> Resolution {
         self.resolve_through(dll, symbol, 0)
     }
+
+    fn module(&self, dll: &str) -> Option<usize> {
+        self.inner.module(dll).or_else(|| {
+            let named = |(name, _): &&(String, LoadedImage)| name.eq_ignore_ascii_case(dll);
+            self.dlls.iter().find(named).map(|(_, image)| image.base())
+        })
+    }
 }
 
 /// Puts `bytes` at `path`, where another process of ours may be putting
@@ -319,7 +326,10 @@ impl LoadedImage {
     /// Fills every IAT slot of the image.
     ///
     /// Each import goes to `resolver`; whatever it cannot resolve gets an
-    /// unimplemented-import stub that behaves according to `policy`.
+    /// unimplemented-import stub that behaves according to `policy`. The
+    /// module-handle slot of a delay-load descriptor gets the base of the
+    /// title DLL of that name, if `resolver` knows one
+    /// ([`ImportResolver::module`]).
     pub fn bind_imports(
         &self,
         resolver: &dyn ImportResolver,
@@ -349,6 +359,22 @@ impl LoadedImage {
                         unresolved.push((entry.iat_slot_rva, &module.dll, &entry.symbol));
                     }
                 }
+            }
+        }
+
+        // A delay-load descriptor has a slot in which the delay-load helper
+        // keeps the DLL's module handle once it has loaded the DLL
+        // (`ImgDelayDescr::rvaHmod`; "Understanding the delay load helper
+        // function", https://learn.microsoft.com/en-us/cpp/build/reference/understanding-the-helper-function).
+        // The helper never runs here, so for a DLL the title ships the
+        // slot gets what the helper would have stored: that module. For a
+        // DLL our runtime or the host provides it stays null, as before
+        // the first call: there is no one module that is that DLL.
+        for module in &self.info.delay_imports {
+            if let Some(rva) = module.module_handle_rva
+                && let Some(base) = resolver.module(&module.dll)
+            {
+                slots.push((rva, base));
             }
         }
 
@@ -382,6 +408,8 @@ impl LoadedImage {
 
     /// Protects and restores each slot on its own: import tables can sit in
     /// sections with different protections (delay-load tables in `.didat`).
+    /// A slot need not be aligned: the parser checks that of IAT slots, not
+    /// of a delay-load descriptor's module handle.
     fn write_slots(&self, slots: &[(u32, usize)]) -> Result<()> {
         for &(rva, address) in slots {
             let slot = (self.base() + rva as usize) as *mut u64;
@@ -393,8 +421,8 @@ impl LoadedImage {
                     std::io::Error::last_os_error()
                 );
             }
-            // SAFETY: inside the image, now writable, 8-byte aligned by the PE format.
-            unsafe { slot.write_volatile(address as u64) };
+            // SAFETY: inside the image and now writable.
+            unsafe { slot.write_unaligned(address as u64) };
             let mut ignored = 0;
             // SAFETY: restoring the protection we just changed.
             unsafe { VirtualProtect(slot as *const c_void, 8, old, &mut ignored) };

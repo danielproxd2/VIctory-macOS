@@ -707,3 +707,129 @@ fn identical_bytes_under_two_names_are_two_modules() {
     assert_eq!(names(&again), ["one.dll"]);
     assert_eq!(again[0].1.base(), one.base());
 }
+
+/// What the module-handle slot of `image`'s delay-load descriptor for
+/// title_quiet.dll holds.
+fn quiet_handle_slot(image: &victory_loader::LoadedImage) -> usize {
+    let descriptor = image
+        .info()
+        .delay_imports
+        .iter()
+        .find(|m| m.dll.eq_ignore_ascii_case("title_quiet.dll"))
+        .expect("a delay-load descriptor for title_quiet.dll");
+    let rva = descriptor.module_handle_rva.expect("a module-handle slot");
+    // SAFETY: the parser checked that the slot's 8 bytes lie in the image,
+    // which is mapped.
+    unsafe { ((image.base() + rva as usize) as *const usize).read_unaligned() }
+}
+
+/// The delay-load helper keeps the handle of the DLL it loaded in a slot of
+/// the descriptor. We bind delay imports ourselves, so we store it: for a
+/// DLL the title ships, the prepared module.
+#[test]
+fn delay_handle_slot_holds_the_title_dll_base() {
+    let title = title_dir(&["title_a.dll", "title_b.dll", "title_quiet.dll"]);
+    let cache = tempfile::tempdir().unwrap();
+    let dlls = victory_loader::load_title_dll("title_b.dll", title.path(), cache.path(), &|_| true)
+        .unwrap();
+    assert_eq!(
+        names(&dlls),
+        ["title_a.dll", "title_quiet.dll", "title_b.dll"]
+    );
+    let (title_quiet, title_b) = (&dlls[1].1, &dlls[2].1);
+    assert_eq!(quiet_handle_slot(title_b), 0, "nothing is bound yet");
+
+    let resolver = victory_loader::WithTitleDlls {
+        inner: &HostOnly,
+        dlls: &dlls,
+    };
+    assert_eq!(resolver.module("Title_Quiet.DLL"), Some(title_quiet.base()));
+    assert_eq!(resolver.module("kernel32.dll"), None);
+    let report = title_b
+        .bind_imports(&resolver, UnimplementedPolicy::Trap)
+        .unwrap();
+    assert_eq!(report.missing, []);
+    assert_eq!(quiet_handle_slot(title_b), title_quiet.base());
+    // The slot is the one thing written beside the import slots: the
+    // delay-loaded function is still reached.
+    title_quiet
+        .bind_imports(&resolver, UnimplementedPolicy::Trap)
+        .unwrap();
+    // SAFETY: the export takes nothing and returns a `u32`; the one import
+    // it uses is bound, into a DLL with nothing to initialise.
+    assert_eq!(unsafe { call(title_b, "title_b_delayed") }, 0x0C00_0001);
+
+    // A resolver in front of another one that has the title's DLLs, as
+    // DLLs the title loads later are bound.
+    let none: [(String, victory_loader::LoadedImage); 0] = [];
+    let outer = victory_loader::WithTitleDlls {
+        inner: &resolver,
+        dlls: &none,
+    };
+    assert_eq!(outer.module("title_quiet.dll"), Some(title_quiet.base()));
+}
+
+extern "system" fn runtime_quiet_value() -> u32 {
+    0x5EED
+}
+
+/// Answers for title_quiet.dll as our runtime answers for a console DLL.
+struct RuntimeQuiet;
+
+impl ImportResolver for RuntimeQuiet {
+    fn resolve(&self, dll: &str, symbol: &ImportSymbol) -> Resolution {
+        if dll.eq_ignore_ascii_case("title_quiet.dll") && *symbol == named("title_quiet_value") {
+            return Resolution::Found {
+                address: runtime_quiet_value as *const () as usize,
+                provenance: Provenance::Hle,
+            };
+        }
+        HostOnly.resolve(dll, symbol)
+    }
+}
+
+/// A delay-loaded DLL that our runtime provides, or nobody, has no module
+/// of the title's to name: the slot stays as the linker left it, null, which
+/// is what the title sees before the first call of a delay-loaded function.
+#[test]
+fn delay_handle_slot_stays_null_for_hle() {
+    // The folder has no title_quiet.dll.
+    let title = title_dir(&["title_a.dll", "title_b.dll"]);
+    let cache = tempfile::tempdir().unwrap();
+    let dlls = victory_loader::load_title_dll("title_b.dll", title.path(), cache.path(), &|_| true)
+        .unwrap();
+    assert_eq!(names(&dlls), ["title_a.dll", "title_b.dll"]);
+    let title_b = &dlls[1].1;
+
+    // Nobody provides it: the import is missing, the slot null.
+    let host_only = victory_loader::WithTitleDlls {
+        inner: &HostOnly,
+        dlls: &dlls,
+    };
+    let report = title_b
+        .bind_imports(&host_only, UnimplementedPolicy::ReturnZero)
+        .unwrap();
+    let missing: Vec<_> = report
+        .missing
+        .iter()
+        .map(|m| format!("{}!{}", m.dll.to_ascii_lowercase(), m.symbol))
+        .collect();
+    assert_eq!(missing, ["title_quiet.dll!title_quiet_value"]);
+    assert_eq!(quiet_handle_slot(title_b), 0);
+
+    // Our runtime provides it: the function is bound, the slot null.
+    let runtime = victory_loader::WithTitleDlls {
+        inner: &RuntimeQuiet,
+        dlls: &dlls,
+    };
+    assert_eq!(runtime.module("title_quiet.dll"), None);
+    let report = title_b
+        .bind_imports(&runtime, UnimplementedPolicy::Trap)
+        .unwrap();
+    assert_eq!(report.missing, []);
+    assert_eq!(report.hle, 1);
+    assert_eq!(quiet_handle_slot(title_b), 0);
+    // SAFETY: the export takes nothing and returns a `u32`; its import is
+    // bound to the function above.
+    assert_eq!(unsafe { call(title_b, "title_b_delayed") }, 0x5EED);
+}

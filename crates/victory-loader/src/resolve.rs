@@ -30,4 +30,14 @@ pub enum Resolution {
 /// compare case-insensitively.
 pub trait ImportResolver {
     fn resolve(&self, dll: &str, symbol: &ImportSymbol) -> Resolution;
+
+    /// Base address of the title's own module that goes by the name `dll`,
+    /// if this resolver knows one: what `LoadLibrary(dll)` gives the title.
+    /// The loader stores it where a delay-load descriptor keeps its DLL's
+    /// module handle. `None`, the default, for every other provider: our
+    /// runtime and the host have no module the title may be handed here.
+    fn module(&self, dll: &str) -> Option<usize> {
+        let _ = dll;
+        None
+    }
 }
