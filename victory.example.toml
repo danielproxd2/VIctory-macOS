@@ -17,3 +17,18 @@ game_dir = 'D:\victory-data\game'
 # Other Xbox Series titles used to test platform-level code.
 # env: VICTORY_TEST_TITLES (separated by ';')
 test_titles = []
+
+# --- macOS (CrossOver Wine, tools/macos/victory.sh) ---
+# VIctory runs as a Windows program under Wine, so paths are Windows paths.
+# Wine shows the whole Mac as drive Z:, so /Users/<you>/victory-data is
+# Z:\Users\<you>\victory-data. Do not use D: or other letters: Wine maps
+# them to whatever volumes happen to be mounted.
+# The defaults also work: %LOCALAPPDATA% lies inside the Wine prefix, which
+# victory.sh keeps in ~/Library/Caches/victory-macos/prefix-play. A cache
+# there may be cleared by macOS tools, so name data_dir if saves matter.
+# Instead of this file the launcher's environment can name the folders:
+# VICTORY_GAME_DIR, VICTORY_CACHE_DIR and VICTORY_DATA_DIR, in the same
+# Z:\ form. Replace the [paths] values above with these:
+# game_dir = 'Z:\Users\<you>\victory-data\game'
+# cache_dir = 'Z:\Users\<you>\victory-data\cache'
+# data_dir = 'Z:\Users\<you>\victory-data\data'

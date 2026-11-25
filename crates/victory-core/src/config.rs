@@ -236,6 +236,29 @@ mod tests {
         let text = include_str!("../../../victory.example.toml");
         let parsed: FileConfig = toml::from_str(text).unwrap();
         assert!(parsed.paths.game_dir.is_some());
+
+        // The macOS section is commented out; its `key = value` lines must
+        // be a valid [paths] table that names all three folders on Z:.
+        let (_, macos) = text
+            .split_once("# --- macOS")
+            .expect("the example has a macOS section");
+        let mut table = String::from("[paths]\n");
+        for line in macos.lines().filter_map(|l| l.strip_prefix("# ")) {
+            if line.contains(" = '") {
+                table.push_str(line);
+                table.push('\n');
+            }
+        }
+        let parsed: FileConfig = toml::from_str(&table).unwrap();
+        for dir in [
+            parsed.paths.game_dir,
+            parsed.paths.cache_dir,
+            parsed.paths.data_dir,
+        ] {
+            let dir = dir.expect("the macOS section names game, cache and data");
+            let dir = dir.to_str().unwrap();
+            assert!(dir.starts_with(r"Z:\Users\"), "{dir}");
+        }
     }
 
     /// An environment made of the given pairs and nothing else.
