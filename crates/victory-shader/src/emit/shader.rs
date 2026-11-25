@@ -603,14 +603,16 @@ impl Shader {
             threads: self.threads.unwrap_or_default(),
             wave_size: self.wave_size,
         });
-        let hash = [0u8; 20];
         let psg1 = container::signature(&self.prims, false);
         let mut parts: Vec<(&[u8; 4], &[u8])> =
             vec![(b"SFI0", &sfi0), (b"ISG1", &isg1), (b"OSG1", &osg1)];
         if self.mesh.is_some() {
             parts.push((b"PSG1", &psg1));
         }
-        parts.extend([(b"PSV0", &psv0[..]), (b"HASH", &hash), (b"DXIL", &dxil)]);
+        parts.extend([(b"PSV0", &psv0[..]), (b"DXIL", &dxil)]);
+        // The shader's own digest: see `container::shader_hash`.
+        let hash = container::shader_hash(&parts);
+        parts.insert(parts.len() - 1, (b"HASH", &hash));
         container::build(&parts)
     }
 

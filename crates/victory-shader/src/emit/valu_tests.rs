@@ -868,6 +868,37 @@ fn bfe_signed_and_unsigned_match_rdna2() {
     });
 }
 
+/// Every translated shader runs as itself, whatever ran before it. D3DMetal
+/// keeps compiled shaders (in the process and in a folder per program name)
+/// under the digest of the container's `HASH` part: with one digest for all
+/// of them, a shader got the code of an earlier one of the same container
+/// length, in this run or in an older one. The three programs here differ
+/// in one instruction, so their containers have one length.
+#[test]
+fn shaders_of_one_container_length_keep_their_own_results() {
+    let (a, b) = (0b1100_u32, 0b1010_u32);
+    let ops = [
+        ("v_and_b32", a & b),
+        ("v_or_b32", a | b),
+        ("v_xor_b32", a ^ b),
+    ];
+    let shaders = ops.map(|(name, _)| build_valu_cs(&asm::vop2(name, 0, asm::vgpr(1), 2)));
+    let lengths = shaders.each_ref().map(|s| s.dxil.len());
+    assert!(
+        lengths.iter().all(|&l| l == lengths[0]),
+        "the programs no longer give containers of one length ({lengths:?}): pick others"
+    );
+    let mut wrong = Vec::new();
+    for (shader, (name, want)) in shaders.iter().zip(ops) {
+        run_cases(shader, &[[a, b, 0, 0]], |backend, _, _, got| {
+            if got != want {
+                wrong.push(format!("{backend}: {name} = {got:#x}, want {want:#x}"));
+            }
+        });
+    }
+    assert_eq!(wrong, Vec::<String>::new());
+}
+
 #[test]
 fn v_cmp_class_f16_matches_rdna2() {
     // v_cmp_class_f16_e64 s6, v1, v2 (VOP3 opcode 0x08f); v_cndmask_b32_e64 v0, 0, 1, s6

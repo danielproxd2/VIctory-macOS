@@ -942,6 +942,40 @@ mod tests {
         testkit::container(&testkit::compute_with_uav(&words), &[], &[])
     }
 
+    /// Each translated container carries its own digest in `HASH`: the one
+    /// `container::shader_hash` gives for its other parts, so two programs
+    /// that differ in one instruction (and give containers of one length)
+    /// differ in it, and one program always gets the same.
+    #[test]
+    fn translated_containers_carry_their_own_shader_hash() {
+        let program = |name: &str| {
+            let sources = [asm::sgpr(0), asm::sgpr(1)];
+            let op = asm::vop3(name, 0, &sources, asm::Vop3Mods::default());
+            translated(&compute(&[op]))
+        };
+        let hash_of = |shader: &HostShader| {
+            let host = Container::parse(&shader.dxil).unwrap();
+            let hash: [u8; 20] = host.part(FourCC::HASH).unwrap().data.try_into().unwrap();
+            let others: Vec<([u8; 4], &[u8])> = host
+                .parts
+                .iter()
+                .filter(|p| p.fourcc != FourCC::HASH)
+                .map(|p| (p.fourcc.0, p.data))
+                .collect();
+            let others: Vec<(&[u8; 4], &[u8])> = others.iter().map(|(n, d)| (n, *d)).collect();
+            assert_eq!(hash, container::shader_hash(&others));
+            assert_eq!(hash[..4], [0; 4], "flags");
+            hash
+        };
+        let (and, or) = (program("v_and_b32"), program("v_or_b32"));
+        assert_eq!(and.dxil.len(), or.dxil.len(), "pick other programs");
+        assert_ne!(and.dxil, or.dxil);
+        let (h_and, h_or) = (hash_of(&and), hash_of(&or));
+        assert_ne!(h_and[4..], [0; 16]);
+        assert_ne!(h_and, h_or);
+        assert_eq!(h_and, hash_of(&program("v_and_b32")));
+    }
+
     /// The whole path a title's shader takes, on containers assembled here:
     /// container, `DXIL` part, XDAT index, packed blob, stage record, code,
     /// signatures, and out comes a host shader that binds what the program

@@ -337,6 +337,43 @@ pub(crate) fn hash(data: &[u8]) -> [u8; 16] {
     out
 }
 
+/// Standard MD5 (RFC 1321) of `data`.
+fn md5(data: &[u8]) -> [u8; 16] {
+    let (blocks, rest) = data.as_chunks::<64>();
+    let mut tail = rest.to_vec();
+    tail.push(0x80);
+    tail.resize(if rest.len() < 56 { 56 } else { 120 }, 0);
+    tail.extend(((data.len() as u64) << 3).to_le_bytes());
+    let mut state = [0x6745_2301u32, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
+    for block in blocks.iter().chain(tail.as_chunks::<64>().0) {
+        md5_block(&mut state, block);
+    }
+    let mut out = [0; 16];
+    for (o, s) in out.as_chunks_mut::<4>().0.iter_mut().zip(state) {
+        o.copy_from_slice(&s.to_le_bytes());
+    }
+    out
+}
+
+/// The `HASH` part of a container made of `parts`: flags (0: no source
+/// went into it), then a digest that names the shader. D3D12 does not
+/// check the digest, but it has to differ between shaders: D3DMetal keeps
+/// compiled shaders under it, in the process and on disk, and with one
+/// digest for all of them a shader ran the code of an earlier one of the
+/// same container length. The digest here is the MD5 of the other parts,
+/// names and contents in order; it is ours, not what a compiler writes.
+pub(crate) fn shader_hash(parts: &[(&[u8; 4], &[u8])]) -> [u8; 20] {
+    let mut all = Vec::new();
+    for (name, data) in parts {
+        all.extend(*name);
+        all.extend((data.len() as u32).to_le_bytes());
+        all.extend(*data);
+    }
+    let mut out = [0; 20];
+    out[4..].copy_from_slice(&md5(&all));
+    out
+}
+
 fn md5_block(state: &mut [u32; 4], block: &[u8; 64]) {
     const S: [u32; 16] = [7, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16, 23, 6, 10, 15, 21];
     let x: Vec<u32> = block
@@ -385,6 +422,66 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(hex, "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// The test vectors of RFC 1321, and lengths on both sides of the
+    /// point where the bit count needs a block of its own.
+    #[test]
+    fn md5_matches_the_rfc_1321_test_suite() {
+        let cases: [(&[u8], &str); 5] = [
+            (b"", "d41d8cd98f00b204e9800998ecf8427e"),
+            (b"a", "0cc175b9c0f1b6a831c399e269772661"),
+            (b"abc", "900150983cd24fb0d6963f7d28e17f72"),
+            (b"message digest", "f96b697d7cb7938d525a2f31aaf161d0"),
+            (
+                b"12345678901234567890123456789012345678901234567890123456789012345678901234567890",
+                "57edf4a22be3c955ac49da2e2107b67a",
+            ),
+        ];
+        for (data, want) in cases {
+            assert_eq!(
+                hex(&md5(data)),
+                want,
+                "{:?}",
+                data.escape_ascii().to_string()
+            );
+        }
+        // 55, 56 and 64 bytes: one padded block, then two.
+        let lengths = [
+            (55, "ef1772b6dff9a122358552954ad0df65"),
+            (56, "3b0c8ac703f828b04c6c197006d17218"),
+            (64, "014842d480b571495a4a0363793f7367"),
+        ];
+        for (len, want) in lengths {
+            assert_eq!(hex(&md5(&vec![b'a'; len])), want, "{len} bytes");
+        }
+    }
+
+    /// The shader hash: no flags, and a digest that follows every part's
+    /// name, length and contents.
+    #[test]
+    fn shader_hash_follows_every_part() {
+        let base = shader_hash(&[(b"PSV0", &[1, 2, 3]), (b"DXIL", &[4, 5])]);
+        assert_eq!(base[..4], [0; 4], "flags");
+        assert_ne!(base[4..], [0; 16], "digest");
+        assert_eq!(
+            base,
+            shader_hash(&[(b"PSV0", &[1, 2, 3]), (b"DXIL", &[4, 5])])
+        );
+        let others: [&[(&[u8; 4], &[u8])]; 5] = [
+            &[(b"PSV0", &[1, 2, 3]), (b"DXIL", &[4, 6])],
+            &[(b"PSV0", &[1, 2, 7]), (b"DXIL", &[4, 5])],
+            &[(b"PSV0", &[1, 2]), (b"DXIL", &[3, 4, 5])],
+            &[(b"PSG1", &[1, 2, 3]), (b"DXIL", &[4, 5])],
+            &[(b"DXIL", &[4, 5]), (b"PSV0", &[1, 2, 3])],
+        ];
+        for other in others {
+            assert_ne!(shader_hash(other)[4..], base[4..], "{other:?}");
+        }
     }
 
     /// The hash's last block depends on whether the tail leaves room for
