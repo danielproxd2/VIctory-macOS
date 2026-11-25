@@ -494,42 +494,145 @@ unsafe fn instruction_bytes(at: usize) -> String {
 const CPP_EXCEPTION: i32 = 0xE06D_7363_u32 as i32;
 const CPP_MAGIC: usize = 0x1993_0520;
 
+/// Catchable types looked at for `std::exception`; a class has one for
+/// itself and one for each base it can be caught as.
+const MAX_CATCHABLE_TYPES: usize = 64;
+/// Bytes of a type name or a message quoted in a report.
+const MAX_TEXT: usize = 256;
+
+/// The `T` (no larger than a page) at `address`, if all of it can be read.
+fn peek<T: Copy>(address: usize) -> Option<T> {
+    let last = address.checked_add(size_of::<T>().checked_sub(1)?)?;
+    if !page_is_readable(address) || !page_is_readable(last) {
+        return None;
+    }
+    // SAFETY: the pages holding its first and last byte were just found
+    // readable; a title thread unmapping them meanwhile is not ruled out,
+    // as for everything a crash report reads.
+    Some(unsafe { (address as *const T).read_unaligned() })
+}
+
+/// The NUL-terminated text at `address`, cut (and marked `...`) after
+/// `limit` bytes; `None` if it runs into memory that cannot be read.
+fn text_at(address: usize, limit: usize) -> Option<String> {
+    let mut bytes = Vec::new();
+    for i in 0..limit {
+        let at = address.checked_add(i)?;
+        if (i == 0 || at & 0xfff == 0) && !page_is_readable(at) {
+            return None;
+        }
+        // SAFETY: `at`'s page was found readable when the text entered it.
+        match unsafe { (at as *const u8).read() } {
+            0 => return Some(String::from_utf8_lossy(&bytes).into_owned()),
+            b => bytes.push(b),
+        }
+    }
+    Some(format!("{}...", String::from_utf8_lossy(&bytes)))
+}
+
+/// A mapped image: the range the RVAs of a throw must stay in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Image {
+    base: usize,
+    size: usize,
+}
+
+impl Image {
+    /// The image mapped at exactly `base`, by the size in its own header.
+    fn loaded_at(base: usize) -> Option<Image> {
+        /// `IMAGE_OPTIONAL_HEADER64::SizeOfImage`.
+        const OPT_SIZE_OF_IMAGE: usize = 56;
+        use victory_pe::layout::{DOS_E_LFANEW, FILE_HEADER_SIZE, NT_SIGNATURE_SIZE};
+        let mut module: HMODULE = std::ptr::null_mut();
+        // SAFETY: looks up the module containing `base`; no reference taken.
+        let found = unsafe {
+            GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                    | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                base as *const u16,
+                &mut module,
+            )
+        };
+        if found == 0 || module as usize != base {
+            return None;
+        }
+        let nt = peek::<u32>(base.checked_add(DOS_E_LFANEW)?)? as usize;
+        let optional = base
+            .checked_add(nt)?
+            .checked_add(NT_SIGNATURE_SIZE + FILE_HEADER_SIZE)?;
+        let size = peek::<u32>(optional.checked_add(OPT_SIZE_OF_IMAGE)?)? as usize;
+        Some(Image { base, size })
+    }
+
+    /// The address of the `len` bytes at `rva`, if they are in the image.
+    fn at(self, rva: usize, len: usize) -> Option<usize> {
+        let end = rva.checked_add(len)?;
+        if end > self.size {
+            return None;
+        }
+        self.base.checked_add(rva)
+    }
+
+    /// The RVA stored at `rva`.
+    fn rva_at(self, rva: usize) -> Option<usize> {
+        peek::<u32>(self.at(rva, 4)?).map(|v| v as usize)
+    }
+
+    /// The text at `rva`, no further than the image's end.
+    fn text(self, rva: usize) -> Option<String> {
+        let at = self.at(rva, 1)?;
+        text_at(at, MAX_TEXT.min(self.size - rva))
+    }
+}
+
 /// What a C++ throw threw: the decorated name of its type, then its value
 /// where that names the cause (an integer, e.g. an HRESULT; a standard
-/// exception's message).
-///
-/// # Safety
-/// `p` are the parameters of a live MSVC throw (`p[0]` the magic).
-unsafe fn thrown(p: &[usize]) -> String {
-    // SAFETY: the throw's ThrowInfo, its RVAs relative to `p[3]`: catchable
-    // type array at +12 (count, then type RVAs), each type's descriptor at
-    // +4, whose decorated name starts at +16; the object is at `p[1]`.
-    unsafe {
-        let rva = |at: usize| (at as *const u32).read_unaligned() as usize;
-        let types = p[3] + rva(p[2] + 12);
-        let name = |i: usize| {
-            let descriptor = p[3] + rva(p[3] + rva(types + 4 + 4 * i) + 4);
-            std::ffi::CStr::from_ptr((descriptor + 16) as *const std::ffi::c_char).to_string_lossy()
-        };
-        let first = name(0);
-        let value = match &*first {
-            // int, unsigned, long (HRESULT), unsigned long
-            ".H" | ".I" | ".J" | ".K" if p[1] != 0 => {
-                format!(" = {:#010x}", (p[1] as *const u32).read_unaligned())
-            }
-            // std::exception keeps its message after the table pointer.
-            _ if (0..rva(types)).any(|i| name(i) == ".?AVexception@std@@") => {
-                let message = (p[1] as *const *const std::ffi::c_char).add(1).read();
-                if message.is_null() {
-                    String::new()
-                } else {
-                    format!(": {}", std::ffi::CStr::from_ptr(message).to_string_lossy())
-                }
-            }
-            _ => String::new(),
-        };
-        format!("{first}{value}")
+/// exception's message). `p` are the exception's parameters (`p[0]` the
+/// magic). `None` if the throw's tables cannot be read: `p[3]` is not a
+/// loaded image, an RVA leads outside it, or there is no type name.
+fn thrown(p: &[usize; 15]) -> Option<String> {
+    thrown_in(p, Image::loaded_at(p[3])?)
+}
+
+/// [`thrown`], the RVAs being relative to `image`. Everything here is the
+/// title's and may be anything (a title can raise this exception code by
+/// hand): no pointer is followed that was not checked, and no count is
+/// believed.
+fn thrown_in(p: &[usize; 15], image: Image) -> Option<String> {
+    // The ThrowInfo at `p[2]` has the RVA of its catchable type array at
+    // +12 (a count, then type RVAs); each type has its descriptor's RVA at
+    // +4, and the descriptor its decorated name at +16. The object thrown
+    // is at `p[1]`, anywhere (usually on the thrower's stack).
+    let throw_info = p[2].checked_sub(image.base)?;
+    let types = image.rva_at(throw_info.checked_add(12)?)?;
+    let count = image.rva_at(types)?.min(MAX_CATCHABLE_TYPES);
+    let name = |i: usize| {
+        // `i` is below the cap and the others are 32-bit: no overflow.
+        let descriptor = image.rva_at(image.rva_at(types + 4 + 4 * i)? + 4)?;
+        image.text(descriptor + 16)
+    };
+    if count == 0 {
+        return None;
     }
+    // An empty name is what tables that are not a throw's read as.
+    let first = name(0).filter(|name| !name.is_empty())?;
+    let value = match &*first {
+        // int, unsigned, long (HRESULT), unsigned long
+        ".H" | ".I" | ".J" | ".K" => peek::<u32>(p[1]).map(|v| format!(" = {v:#010x}")),
+        // std::exception keeps its message after the table pointer.
+        _ if (0..count)
+            .map_while(name)
+            .any(|n| n == ".?AVexception@std@@") =>
+        {
+            p[1].checked_add(size_of::<usize>())
+                .and_then(peek::<usize>)
+                .filter(|&message| message != 0)
+                .and_then(|message| text_at(message, MAX_TEXT))
+                .map(|message| format!(": {message}"))
+        }
+        _ => None,
+    };
+    Some(format!("{first}{}", value.unwrap_or_default()))
 }
 
 /// # Safety
@@ -548,8 +651,8 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         };
         format!(" ({kind} {:#x}: {})", p[1], memory_at(p[1]))
     } else if code == CPP_EXCEPTION && record.NumberParameters >= 4 && p[0] == CPP_MAGIC {
-        // SAFETY: a live MSVC throw.
-        format!(" (C++ {} thrown)", unsafe { thrown(&p) })
+        let what = thrown(&p).unwrap_or_else(|| "exception of an unreadable type".into());
+        format!(" (C++ {what} thrown)")
     } else if code == EXCEPTION_ILLEGAL_INSTRUCTION || code == EXCEPTION_PRIV_INSTRUCTION {
         // SAFETY: the CPU refused the instruction at `at`, so it fetched it.
         format!(" (code {})", unsafe { instruction_bytes(at) })
@@ -1329,6 +1432,205 @@ mod tests {
             emulate_as(EXCEPTION_ACCESS_VIOLATION, &clzero, 0, &mut xmm),
             None
         );
+    }
+
+    /// Where [`throw_image`] puts things.
+    const THROW_INFO: usize = 0x10;
+    const TYPE_ARRAY: usize = 0x40;
+    const TYPES: usize = 0x400;
+    const DESCRIPTORS: usize = 0x1000;
+
+    /// The tables of a C++ throw as MSVC lays them out, with one catchable
+    /// type for each of `names` and `count` as the array's count: a
+    /// ThrowInfo, the catchable type array, the types (0x20 apart) and
+    /// their descriptors (0x40 apart). Written here, like a compiler would.
+    fn throw_image(names: &[&str], count: u32) -> Vec<u8> {
+        let mut image = vec![0u8; DESCRIPTORS + 0x40 * names.len() + 0x40];
+        let mut put = |at: usize, value: usize| {
+            image[at..at + 4].copy_from_slice(&(value as u32).to_le_bytes());
+        };
+        put(THROW_INFO + 12, TYPE_ARRAY);
+        put(TYPE_ARRAY, count as usize);
+        for i in 0..names.len() {
+            put(TYPE_ARRAY + 4 + 4 * i, TYPES + 0x20 * i);
+            put(TYPES + 0x20 * i + 4, DESCRIPTORS + 0x40 * i);
+        }
+        for (i, name) in names.iter().enumerate() {
+            let at = DESCRIPTORS + 0x40 * i + 16;
+            image[at..at + name.len()].copy_from_slice(name.as_bytes());
+        }
+        image
+    }
+
+    /// What the report says of a throw of `object` with the tables `image`.
+    fn thrown_from(image: &[u8], object: usize) -> Option<String> {
+        let base = image.as_ptr() as usize;
+        let mut p = [0usize; 15];
+        p[..4].copy_from_slice(&[CPP_MAGIC, object, base + THROW_INFO, base]);
+        let size = image.len();
+        thrown_in(&p, Image { base, size })
+    }
+
+    const RUNTIME_ERROR: &str = ".?AVruntime_error@std@@";
+    const STD_EXCEPTION: &str = ".?AVexception@std@@";
+
+    /// A `std::exception` object: the table pointer, then the message.
+    fn exception_object(message: &std::ffi::CStr) -> [usize; 2] {
+        [0, message.as_ptr() as usize]
+    }
+
+    #[test]
+    fn thrown_reads_an_int_and_a_std_exception() {
+        let hresult = 0x8007_0057_u32;
+        let int = throw_image(&[".H"], 1);
+        let object = &raw const hresult as usize;
+        assert_eq!(
+            thrown_from(&int, object).as_deref(),
+            Some(".H = 0x80070057")
+        );
+        let long = throw_image(&[".J"], 1);
+        assert_eq!(
+            thrown_from(&long, object).as_deref(),
+            Some(".J = 0x80070057")
+        );
+
+        let object = exception_object(c"boom");
+        let error = throw_image(&[RUNTIME_ERROR, STD_EXCEPTION], 2);
+        let said = thrown_from(&error, object.as_ptr() as usize);
+        assert_eq!(said.as_deref(), Some(".?AVruntime_error@std@@: boom"));
+        // An exception without a message, and a class that is not one.
+        let silent = [0usize; 2];
+        let said = thrown_from(&error, silent.as_ptr() as usize);
+        assert_eq!(said.as_deref(), Some(RUNTIME_ERROR));
+        let other = throw_image(&[".?AVTitleError@@"], 1);
+        let said = thrown_from(&other, object.as_ptr() as usize);
+        assert_eq!(said.as_deref(), Some(".?AVTitleError@@"));
+    }
+
+    #[test]
+    fn thrown_with_a_huge_type_count_is_bounded() {
+        let object = exception_object(c"boom");
+        let object = object.as_ptr() as usize;
+        let names = |exception_at: usize| {
+            let mut names = [".?AVTitleError@@"; 80];
+            names[exception_at] = STD_EXCEPTION;
+            names
+        };
+        // The last type that is looked at, and one past the cap that is
+        // not, whatever the count says.
+        let inside = throw_image(&names(MAX_CATCHABLE_TYPES - 1), u32::MAX);
+        let said = thrown_from(&inside, object);
+        assert_eq!(said.as_deref(), Some(".?AVTitleError@@: boom"));
+        let outside = throw_image(&names(MAX_CATCHABLE_TYPES + 6), u32::MAX);
+        assert_eq!(
+            thrown_from(&outside, object).as_deref(),
+            Some(".?AVTitleError@@")
+        );
+        // A count larger than the array: the search ends with the image.
+        let short = throw_image(&[".?AVTitleError@@"], u32::MAX);
+        assert_eq!(
+            thrown_from(&short, object).as_deref(),
+            Some(".?AVTitleError@@")
+        );
+        // A message with no end in sight is cut.
+        let long = vec![b'a'; 2 * MAX_TEXT];
+        let endless = [0, long.as_ptr() as usize];
+        let error = throw_image(&[STD_EXCEPTION], 1);
+        let said = thrown_from(&error, endless.as_ptr() as usize).unwrap();
+        assert_eq!(said.len(), STD_EXCEPTION.len() + 2 + MAX_TEXT + 3);
+        assert!(said.ends_with("aaa..."), "{said}");
+    }
+
+    #[test]
+    fn thrown_with_rvas_outside_the_module_is_declined() {
+        let object = exception_object(c"boom");
+        let object = object.as_ptr() as usize;
+        let good = throw_image(&[RUNTIME_ERROR, STD_EXCEPTION], 2);
+        let put = |at: usize, value: u32| {
+            let mut image = good.clone();
+            image[at..at + 4].copy_from_slice(&value.to_le_bytes());
+            image
+        };
+        let size = good.len() as u32;
+        // The type array, the first type and its descriptor, each outside
+        // the image or with its last byte outside.
+        for (at, what) in [
+            (THROW_INFO + 12, "type array"),
+            (TYPE_ARRAY + 4, "type"),
+            (TYPES + 4, "descriptor"),
+        ] {
+            for rva in [
+                size,
+                size - 3,
+                size - 16,
+                0x7fff_fff0,
+                0xffff_fff0,
+                u32::MAX,
+            ] {
+                let said = thrown_from(&put(at, rva), object);
+                assert_eq!(said, None, "{what} at {rva:#x}");
+            }
+        }
+        // No catchable types at all.
+        assert_eq!(thrown_from(&put(TYPE_ARRAY, 0), object), None);
+        // A second type that leads outside ends the search for the
+        // standard exception: the name is reported without a message.
+        let said = thrown_from(&put(TYPE_ARRAY + 8, 0xffff_fff0), object);
+        assert_eq!(said.as_deref(), Some(RUNTIME_ERROR));
+        // A ThrowInfo that is not in the image.
+        let base = good.as_ptr() as usize;
+        let image = Image {
+            base,
+            size: good.len(),
+        };
+        for throw_info in [
+            0,
+            base - 1,
+            base + good.len() - 15,
+            base + good.len(),
+            usize::MAX,
+        ] {
+            let mut p = [0usize; 15];
+            p[..4].copy_from_slice(&[CPP_MAGIC, object, throw_info, base]);
+            assert_eq!(thrown_in(&p, image), None, "ThrowInfo at {throw_info:#x}");
+        }
+        // An object, or a message, where nothing can be read: the type
+        // is still named.
+        for object in [0, 8, usize::MAX - 2, usize::MAX] {
+            let said = thrown_from(&good, object);
+            assert_eq!(said.as_deref(), Some(RUNTIME_ERROR), "object {object:#x}");
+            let int = throw_image(&[".H"], 1);
+            assert_eq!(thrown_from(&int, object).as_deref(), Some(".H"));
+        }
+        for message in [8, usize::MAX] {
+            let wild = [0, message];
+            let said = thrown_from(&good, wild.as_ptr() as usize);
+            assert_eq!(said.as_deref(), Some(RUNTIME_ERROR), "message {message:#x}");
+        }
+        // A base that is no loaded image, as the report gets it.
+        let mut p = [0usize; 15];
+        p[..4].copy_from_slice(&[CPP_MAGIC, object, base + THROW_INFO, base]);
+        assert_eq!(thrown(&p), None);
+        p[2..4].copy_from_slice(&[0, 0]);
+        assert_eq!(thrown(&p), None);
+    }
+
+    #[test]
+    fn a_loaded_image_is_found_by_its_base_only() {
+        use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+        // SAFETY: asks for this program's own module.
+        let base = unsafe { GetModuleHandleW(std::ptr::null()) } as usize;
+        let image = Image::loaded_at(base).expect("the test program");
+        let here = a_loaded_image_is_found_by_its_base_only as *const () as usize;
+        assert!(image.base == base && here - base < image.size, "{image:x?}");
+        assert_eq!(image.at(image.size - 4, 4), Some(base + image.size - 4));
+        assert_eq!(image.at(image.size - 3, 4), None);
+        assert_eq!(image.at(usize::MAX, 4), None);
+        // An address inside it is not its base; nor is unmapped memory.
+        assert_eq!(Image::loaded_at(here), None);
+        assert_eq!(Image::loaded_at(base + 0x1000), None);
+        assert_eq!(Image::loaded_at(0), None);
+        assert_eq!(Image::loaded_at(usize::MAX), None);
     }
 
     #[test]
