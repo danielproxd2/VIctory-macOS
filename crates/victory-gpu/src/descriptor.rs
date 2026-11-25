@@ -844,6 +844,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn records_copied_as_bytes_are_made_at_the_next_sync() {
+        // The heap has a host heap where there is a device.
+        let _gpu = crate::testing::serial();
         let memory = crate::watch::tests::pool(1);
         let desc = HeapDesc {
             kind: SAMPLERS,

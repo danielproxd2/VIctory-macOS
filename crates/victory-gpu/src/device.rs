@@ -596,6 +596,8 @@ mod tests {
 
     #[test]
     fn a_healthy_device_reports_no_removal() {
+        // The answer is the host device's where there is one.
+        let _gpu = crate::testing::serial();
         let device = device();
         let reason = slot::<extern "system" fn(This) -> HRESULT>(device, 0x128);
         assert_eq!(reason(device), S_OK);

@@ -630,10 +630,10 @@ mod tests {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::core::s;
         const N: usize = 48;
-        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok())
-        else {
-            return; // no host GPU here
+        let Some((_gpu, host)) = crate::testing::gpu() else {
+            return;
         };
+        let device: ID3D12Device1 = host.device.cast().expect("a device with libraries");
         let shader = |i: usize| {
             let source = format!(
                 "#define RS \"UAV(u0)\"\nRWByteAddressBuffer b : register(u0);\n\
