@@ -199,11 +199,9 @@ fn try_build_valu_cs_storing(body: &[u32], stores: u8) -> Result<HostShader, cra
 /// Runs `shader` on every available SM 6.6 host (hardware GPU and WARP) for
 /// each 4-dword input set and invokes `check(backend, case_index, inputs, result_dword)`.
 /// A host that is missing is a printed skip, or a failure with
-/// `VICTORY_REQUIRE_GPU=1` (hardware) or `VICTORY_REQUIRE_WARP=1` (WARP):
-/// with neither host and neither switch, `check` is never called and the
-/// test passes having compared nothing. So a run that is meant to prove
-/// these tests' results must set `VICTORY_REQUIRE_GPU=1`; without it, a
-/// green result says only that the hosts that were there agreed.
+/// `VICTORY_REQUIRE_GPU=1` (hardware) or `VICTORY_REQUIRE_WARP=1` (WARP).
+/// With neither host the test fails whatever the switches say, as
+/// upstream wrote it: `check` was never called, and nothing was compared.
 fn run_cases(
     shader: &HostShader,
     cases: &[[u32; 4]],
@@ -221,6 +219,7 @@ fn run_cases_reading<const N: usize>(
     mut check: impl FnMut(&str, usize, [u32; 4], [u32; N]),
 ) {
     let _one = crate::testing::one_gpu_test_at_a_time();
+    let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Some(host) = crate::testing::host(warp) else {
             continue;
@@ -252,6 +251,10 @@ fn run_cases_reading<const N: usize>(
             let read: [u32; N] = out[0][..N].try_into().expect("the UAV has N dwords");
             check(label, i, inputs, read);
         }
+        ran += 1;
+    }
+    if let Err(why) = crate::testing::some_device_ran(ran) {
+        panic!("{why}");
     }
 }
 

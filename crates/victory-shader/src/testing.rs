@@ -23,13 +23,16 @@
 //! validation from [`dxil`] (`emit::validator::check`), upstream's tests
 //! included, so the switches cover all of them. Some of upstream's tests
 //! also fail when no device at all ran them (`assert!(ran > 0)`, the
-//! waterfall and semantics tests): that is kept as upstream wrote it.
+//! VALU tests' [`some_device_ran`], the waterfall and semantics tests):
+//! that is kept as upstream wrote it, whatever the switches say. The
+//! tests that upstream lets pass on a machine without a device (the
+//! hardware-only checks among them) pass here too, after their skip
+//! lines.
 //!
-//! Without its switch a test that lacks what it needs passes having
-//! checked nothing, and no test here fails for that: a run that is meant
-//! to prove the device tests must set `VICTORY_REQUIRE_GPU=1` (and
-//! `VICTORY_REQUIRE_DXIL=1` to prove validation), and is otherwise judged
-//! by its `skipped:` lines.
+//! Without its switch such a test passes having checked nothing: a run
+//! that is meant to prove the device tests must set
+//! `VICTORY_REQUIRE_GPU=1` (and `VICTORY_REQUIRE_DXIL=1` to prove
+//! validation), and is otherwise judged by its `skipped:` lines.
 
 use std::collections::HashSet;
 use std::sync::Mutex;
@@ -99,12 +102,26 @@ pub(crate) fn one_gpu_test_at_a_time() -> std::sync::MutexGuard<'static, ()> {
     ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// What a test that runs on every device there is (the hardware adapter
+/// and WARP, each a skip where it is missing) ends with, `ran` being the
+/// number of devices it ran on: upstream's
+/// `assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available")`
+/// as a value. A test that ran on no device has compared nothing and
+/// fails, with or without a `VICTORY_REQUIRE_*` switch.
+pub(crate) fn some_device_ran(ran: usize) -> Result<(), &'static str> {
+    if ran > 0 {
+        Ok(())
+    } else {
+        Err("neither hardware nor WARP SM 6.6 device available")
+    }
+}
+
 /// The host's SM 6.6 device for a test: the hardware adapter, or WARP
 /// with `warp`. Without one the test goes on without it after a skip
 /// line; `VICTORY_REQUIRE_GPU=1` (hardware) and `VICTORY_REQUIRE_WARP=1`
-/// (WARP) make that a failure. D3DMetal under Wine has no WARP. A caller
-/// that gets no device from either call has run nothing, so proving runs
-/// set `VICTORY_REQUIRE_GPU=1`.
+/// (WARP) make that a failure. D3DMetal under Wine has no WARP. Whether
+/// a caller that gets no device from either call fails is the caller's
+/// matter ([`some_device_ran`], where upstream's test fails).
 #[cfg(windows)]
 pub(crate) fn host(warp: bool) -> Option<crate::emit::host::Host> {
     let (var, what) = if warp {
@@ -210,6 +227,18 @@ mod tests {
         let line = skip_line("no host D3D12 device", "emit::tests::a_test");
         assert_eq!(line, "skipped: no host D3D12 device (emit::tests::a_test)");
         assert!(line.starts_with("skipped: "));
+    }
+
+    /// A test that ran on no device fails with upstream's message; one
+    /// device is enough.
+    #[test]
+    fn a_test_that_ran_on_no_device_fails() {
+        assert_eq!(
+            some_device_ran(0),
+            Err("neither hardware nor WARP SM 6.6 device available")
+        );
+        assert_eq!(some_device_ran(1), Ok(()));
+        assert_eq!(some_device_ran(2), Ok(()));
     }
 
     /// The switches read the run's own environment; what they say follows
