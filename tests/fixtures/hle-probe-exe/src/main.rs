@@ -14,6 +14,14 @@
 //! tests run it bare, on a host that has neither. It writes nothing unless
 //! it found the package file first, so on such a host it writes nothing.
 //!
+//! It also says which directory it runs in (the length and checksum of what
+//! `GetCurrentDirectoryW` answers) and uses a path with no drive and no
+//! folder, as a title does that expects to be started in its own folder: it
+//! reads `standin-relative.txt` and, only if that file is there, writes
+//! what it read to `standin-relative-out.txt`. Where the first file is
+//! not in the current directory nothing is written, so the tests that run
+//! it inside the source tree leave nothing there.
+//!
 //! It has no C runtime and no `std`: a runtime's start code ends in `exit`
 //! and sets up state shared with the process that hosts it, and what a
 //! runtime does at start differs between toolchains. Everything here is
@@ -40,6 +48,8 @@ const FAILED_THREADS: u32 = 0xE002;
 const FAILED_WRITE: u32 = 0xE003;
 /// The package file was there and the temporary file could not be written.
 const FAILED_TEMP: u32 = 0xE004;
+/// The relative file was there and the one beside it could not be written.
+const FAILED_RELATIVE: u32 = 0xE005;
 /// The process's exit code if this code panics (it has no reason to).
 const PANICKED: u32 = 0xE0FF;
 
@@ -82,6 +92,7 @@ unsafe extern "system" {
     fn LoadLibraryW(name: *const u16) -> Handle;
     fn GetProcAddress(module: Handle, name: *const u8) -> *const c_void;
     fn GetEnvironmentVariableW(name: *const u16, value: *mut u16, len: u32) -> u32;
+    fn GetCurrentDirectoryW(len: u32, buffer: *mut u16) -> u32;
     fn CreateThread(
         security: *const c_void,
         stack: usize,
@@ -288,6 +299,8 @@ pub extern "system" fn probe_exe_entry() -> u32 {
     // Before the threads below start: a DLL that is loaded hears of them.
     let late = load_late_dll();
     let files = copy_package_to_temp();
+    let here = current_directory();
+    let relative = copy_relative_file();
 
     let block = local();
     // SAFETY: this thread's block, as large as the template.
@@ -364,11 +377,24 @@ pub extern "system" fn probe_exe_entry() -> u32 {
     text.pair("temp_bytes", files.back.into());
     text.pair("temp_sum", files.back_sum.into());
     written &= write_log(&text);
+    let mut text = Text::new();
+    text.pair("cwd_units", here.units.into());
+    text.pair("cwd_sum", here.sum.into());
+    text.pair("relative_found", relative.found.into());
+    text.pair("relative_bytes", relative.read.into());
+    text.pair("relative_sum", relative.read_sum.into());
+    text.pair("relative_written", relative.written.into());
+    text.pair("relative_back", relative.back.into());
+    text.pair("relative_back_sum", relative.back_sum.into());
+    written &= write_log(&text);
     if !written {
         return FAILED_WRITE;
     }
     if files.found && (files.written != files.read || files.back != files.read) {
         return FAILED_TEMP;
+    }
+    if relative.found && (relative.written != relative.read || relative.back != relative.read) {
+        return FAILED_RELATIVE;
     }
     EXIT_BASE.wrapping_add(runtime as u32)
 }
@@ -438,16 +464,17 @@ const TEMP_FILE: [u16; 20] = wide(b"T:\\standin-temp.txt\0");
 /// As much of either file as is read.
 const FILE_ROOM: usize = 256;
 
-/// What came of reading [`PACKAGE_FILE`] and copying it to [`TEMP_FILE`].
+/// What came of reading one file and copying it to another: [`PACKAGE_FILE`]
+/// to [`TEMP_FILE`], or [`RELATIVE_FILE`] to [`RELATIVE_OUT`].
 struct Files {
-    /// The package file could be opened.
+    /// The first file could be opened.
     found: bool,
     /// The bytes read from it, and their checksum ([`sum`]).
     read: u32,
     read_sum: u32,
-    /// The bytes written to the temporary file.
+    /// The bytes written to the second file.
     written: u32,
-    /// The bytes read back from the temporary file, and their checksum.
+    /// The bytes read back from the second file, and their checksum.
     back: u32,
     back_sum: u32,
 }
@@ -456,6 +483,52 @@ struct Files {
 /// temporary file and reads that back. Without the package file nothing is
 /// written anywhere.
 fn copy_package_to_temp() -> Files {
+    copy(&PACKAGE_FILE, &TEMP_FILE)
+}
+
+/// A file named without a drive or a folder, which is looked for in the
+/// current directory, and the one written beside it.
+const RELATIVE_FILE: [u16; 21] = wide(b"standin-relative.txt\0");
+const RELATIVE_OUT: [u16; 25] = wide(b"standin-relative-out.txt\0");
+
+/// The same copy by relative paths: from [`RELATIVE_FILE`] to
+/// [`RELATIVE_OUT`], both in the directory the title runs in. Without the
+/// first nothing is written.
+fn copy_relative_file() -> Files {
+    copy(&RELATIVE_FILE, &RELATIVE_OUT)
+}
+
+/// What `GetCurrentDirectoryW` answered.
+struct Here {
+    /// Its length in UTF-16 units; 0 if the call failed or the path is
+    /// longer than the room here.
+    units: u32,
+    /// The checksum ([`sum`]) of those units, each as its low byte and then
+    /// its high byte. apps/victory/tests/run.rs has the same.
+    sum: u32,
+}
+
+/// The directory the title runs in, as the title is told.
+fn current_directory() -> Here {
+    const ROOM: usize = 512;
+    let mut path = [0u16; ROOM];
+    // SAFETY: a buffer of as many units as the call is told.
+    let units = unsafe { GetCurrentDirectoryW(ROOM as u32, path.as_mut_ptr()) };
+    if units == 0 || units as usize >= ROOM {
+        return Here { units: 0, sum: 0 };
+    }
+    let mut sum = 0x811C_9DC5u32;
+    for unit in path.iter().take(units as usize) {
+        for byte in unit.to_le_bytes() {
+            sum = (sum ^ u32::from(byte)).wrapping_mul(0x0100_0193);
+        }
+    }
+    Here { units, sum }
+}
+
+/// Reads the file `from` names and, if it is there, writes what it holds
+/// to the file `to` names and reads that back.
+fn copy(from: &[u16], to: &[u16]) -> Files {
     const CREATE_ALWAYS: u32 = 2;
     let mut files = Files {
         found: false,
@@ -466,7 +539,7 @@ fn copy_package_to_temp() -> Files {
         back_sum: 0,
     };
     let mut bytes = [0u8; FILE_ROOM];
-    let Some(read) = read_file(&PACKAGE_FILE, &mut bytes) else {
+    let Some(read) = read_file(from, &mut bytes) else {
         return files;
     };
     files.found = true;
@@ -475,7 +548,7 @@ fn copy_package_to_temp() -> Files {
     // SAFETY: a NUL-terminated path; the handle is closed below.
     let temp = unsafe {
         CreateFileW(
-            TEMP_FILE.as_ptr(),
+            to.as_ptr(),
             GENERIC_WRITE,
             0,
             core::ptr::null(),
@@ -499,7 +572,7 @@ fn copy_package_to_temp() -> Files {
         CloseHandle(temp);
     }
     let mut back = [0u8; FILE_ROOM];
-    if let Some(read) = read_file(&TEMP_FILE, &mut back) {
+    if let Some(read) = read_file(to, &mut back) {
         files.back = read as u32;
         files.back_sum = sum(&back[..read]);
     }

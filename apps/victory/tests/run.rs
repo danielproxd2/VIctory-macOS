@@ -43,9 +43,14 @@ impl Home {
 
     /// The same, with what titles save under `data`.
     fn victory_with_data(&self, data: &Path, args: &[&std::ffi::OsStr]) -> Run {
+        self.victory_in(&self.path("cwd"), data, args)
+    }
+
+    /// The same, started in the directory `cwd`.
+    fn victory_in(&self, cwd: &Path, data: &Path, args: &[&std::ffi::OsStr]) -> Run {
         let out = Command::new(env!("CARGO_BIN_EXE_victory"))
             .args(args)
-            .current_dir(self.path("cwd"))
+            .current_dir(cwd)
             .env_remove("VICTORY_CONFIG")
             .env_remove("VICTORY_GAME_DIR")
             .env_remove("VICTORY_TEST_TITLES")
@@ -663,6 +668,115 @@ mod with_the_stand_in_title {
         assert_eq!(names(&home.path("cwd")), [""; 0]);
     }
 
+    /// The file the stand-in looks for by its name alone, the one it then
+    /// writes beside it, and what the tests put into the first.
+    const RELATIVE_FILE: &str = "standin-relative.txt";
+    const RELATIVE_OUT: &str = "standin-relative-out.txt";
+    const RELATIVE_TEXT: &[u8] = b"a file the stand-in title names without a folder\r\n";
+
+    /// The stand-in's checksum of a path: [`sum`] over its UTF-16 units,
+    /// each as its low byte and then its high byte.
+    fn path_sum(path: &str) -> u64 {
+        let bytes: Vec<u8> = path.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        sum(&bytes)
+    }
+
+    /// A title started by its file name alone, from its own folder, as a
+    /// user does who has changed into the game's folder: the name is found
+    /// there, the folder is the title's `G:` drive and its current
+    /// directory, and a path the title names without a drive or a folder
+    /// is a file of that folder. (tools/macos/victory.sh starts victory.exe
+    /// in the directory the launcher was started in for this.)
+    #[test]
+    fn run_by_file_name_alone_runs_the_title_in_its_own_folder() {
+        let home = Home::new();
+        install(&home, "hle-probe-exe.exe");
+        let folder = home.path("title");
+        std::fs::write(folder.join(PACKAGE_FILE), PACKAGE_TEXT).unwrap();
+        std::fs::write(folder.join(RELATIVE_FILE), RELATIVE_TEXT).unwrap();
+        let run = home.victory_in(
+            &folder,
+            &home.path("data"),
+            &[
+                "run".as_ref(),
+                "--execute".as_ref(),
+                "hle-probe-exe.exe".as_ref(),
+            ],
+        );
+        assert_eq!(run.code, Some(EXIT_BASE), "{run:#?}");
+        let log = std::fs::read_to_string(home.title_log())
+            .unwrap_or_else(|e| panic!("the title left no log ({e}): {run:#?}"));
+        // Its folder is its package drive: the file beside it is on `G:`.
+        assert_eq!(seen(&log, "package_found"), Some(1), "{log}");
+        assert_eq!(seen(&log, "package_sum"), Some(sum(PACKAGE_TEXT)), "{log}");
+        // The title is in that folder, which it is told by the drive's name.
+        assert_eq!(seen(&log, "cwd_units"), Some(3), "{log}");
+        assert_eq!(seen(&log, "cwd_sum"), Some(path_sum("G:\\")), "{log}");
+        // The file it names without a folder is the one in its folder, and
+        // what it writes that way lands beside it.
+        let len = RELATIVE_TEXT.len() as u64;
+        assert_eq!(seen(&log, "relative_found"), Some(1), "{log}");
+        assert_eq!(seen(&log, "relative_bytes"), Some(len), "{log}");
+        assert_eq!(
+            seen(&log, "relative_sum"),
+            Some(sum(RELATIVE_TEXT)),
+            "{log}"
+        );
+        assert_eq!(seen(&log, "relative_written"), Some(len), "{log}");
+        assert_eq!(seen(&log, "relative_back"), Some(len), "{log}");
+        let written = std::fs::read(folder.join(RELATIVE_OUT)).unwrap();
+        assert_eq!(written, RELATIVE_TEXT);
+        assert_eq!(
+            names(&folder),
+            [
+                "hle-probe-exe.exe",
+                PACKAGE_FILE,
+                RELATIVE_OUT,
+                RELATIVE_FILE
+            ]
+        );
+        assert_eq!(names(&home.path("cwd")), [""; 0]);
+    }
+
+    /// A title started from another directory by a path: that directory,
+    /// and not the title's folder, is where a path without a drive or a
+    /// folder is looked for and written. This is what makes the directory
+    /// a title is started in matter: started in the source tree, the title
+    /// would read and write there (tools/macos/victory.sh never starts one
+    /// there).
+    #[test]
+    fn run_leaves_the_titles_relative_paths_in_the_directory_it_was_started_in() {
+        let home = Home::new();
+        let title = install(&home, "hle-probe-exe.exe");
+        let started_in = home.path("cwd");
+        std::fs::write(started_in.join(RELATIVE_FILE), RELATIVE_TEXT).unwrap();
+        let run = home.victory(&["run".as_ref(), "--execute".as_ref(), title.as_os_str()]);
+        assert_eq!(run.code, Some(EXIT_BASE), "{run:#?}");
+        let log = std::fs::read_to_string(home.title_log())
+            .unwrap_or_else(|e| panic!("the title left no log ({e}): {run:#?}"));
+        let len = RELATIVE_TEXT.len() as u64;
+        assert_eq!(seen(&log, "relative_found"), Some(1), "{log}");
+        assert_eq!(
+            seen(&log, "relative_sum"),
+            Some(sum(RELATIVE_TEXT)),
+            "{log}"
+        );
+        assert_eq!(seen(&log, "relative_written"), Some(len), "{log}");
+        assert_eq!(names(&started_in), [RELATIVE_OUT, RELATIVE_FILE]);
+        let written = std::fs::read(started_in.join(RELATIVE_OUT)).unwrap();
+        assert_eq!(written, RELATIVE_TEXT);
+        // Nothing of it is in the title's folder, and the directory the
+        // title is told is the host's, not its package drive.
+        assert_eq!(names(&home.path("title")), ["hle-probe-exe.exe"]);
+        let here = started_in.to_str().expect("a temporary folder's path");
+        assert_eq!(
+            seen(&log, "cwd_units"),
+            Some(here.encode_utf16().count() as u64),
+            "{here}: {log}"
+        );
+        assert_eq!(seen(&log, "cwd_sum"), Some(path_sum(here)), "{here}: {log}");
+    }
+
     /// Without the DLL and the package file beside it, the title is told
     /// that neither is there, and nothing is written to its drives.
     #[test]
@@ -679,6 +793,11 @@ mod with_the_stand_in_title {
         assert!(dll_notices(&log).is_empty(), "{log}");
         assert_eq!(seen(&log, "package_found"), Some(0), "{log}");
         assert_eq!(seen(&log, "temp_written"), Some(0), "{log}");
+        // Nor by a path without a folder: the directory it was started in
+        // does not hold the file it looks for, and stays empty.
+        assert_eq!(seen(&log, "relative_found"), Some(0), "{log}");
+        assert_eq!(seen(&log, "relative_written"), Some(0), "{log}");
+        assert_eq!(names(&home.path("cwd")), [""; 0]);
         let temp = home.path("data").join("00000000").join("temp");
         assert_eq!(names(&temp), [""; 0], "{run:#?}");
         assert_eq!(names(&home.path("title")), ["hle-probe-exe.exe"]);

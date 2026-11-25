@@ -103,6 +103,21 @@ Run `./setup.sh` from the top of the repository. It checks the Mac, installs the
 
 The setup's last step is `tools/macos/check-setup.sh`, which can be run at any time. It needs no game: `victory --version` under Wine is what proves that VIctory starts, and the step fails only if that does. It then shows `victory config`. The `victory.toml` the setup copies from `victory.example.toml` names no game, and `config` says `NOTE: game_dir is not set` for it and succeeds. A `game_dir` that is set and is not there, or a folder inside the repository, makes `config` end with status 1 (`MISSING: game_dir ... is not a directory`, `POLICY VIOLATION: ...`); the step shows that with what to change and still passes, since it is the user's file that needs correcting and not the setup. Until 24 November 2026 the example named `D:\victory-data\game` and the setup required `config` to succeed, so the upstream change that makes a missing `game_dir` an error stopped a fresh setup at its last step with "VIctory did not start under Wine". A `victory.toml` copied from the old example still holds that line: remove it or name the game's folder in the `Z:\` form.
 
+### The directory VIctory runs in
+
+`tools/macos/victory.sh` starts `victory.exe` in the directory the launcher itself was started in, which is what happens on Windows, where `victory` is started in the user's directory and nothing changes it. Two things follow.
+
+- A path on the command line is taken from that directory. `cd <the game's folder>; <repository>/tools/macos/victory.sh run --execute game.exe` finds `game.exe` there, and the folder is the title's `G:` drive and its current directory.
+- Every path a title opens without a drive or a folder is read and written in that directory.
+
+Until 24 November 2026 the launcher changed into the repository before it started Wine. Measured with the stand-in title under the CrossOver Wine build: a start by file name from the title's folder ended with `Error: reading hle-probe-exe.exe` / `File not found. (os error 2)`, and a title started by its full path was told `Z:\Users\...\<repository>` as its current directory, read `standin-relative.txt` from the repository's root and wrote `standin-relative-out.txt` there, among the sources, where nothing a title writes may be (`asset-policy.md`).
+
+A title never runs in a VIctory source tree now (this repository, or any folder with its `.victory-root` file above it). Started from inside one, `run` starts the title in the title's own folder, which is the first case above, and says `victory.sh: started inside the VIctory source tree; the title runs in its own folder, <folder>`; the executable is still the one the path named from where the launcher was started. If the title's folder is inside a source tree as well, the launcher ends with status 1 and `victory.sh: refusing to run a title in <folder>: it is inside a VIctory source tree ...` before it builds or starts anything. Commands that run no title (`config`, `inspect`, `translate` and the others) stay in the user's directory.
+
+The config file is `VICTORY_CONFIG` (a relative name is taken from the user's directory), else `victory.toml` in the user's directory, else the repository's `victory.toml`, where `setup.sh` puts it.
+
+The stand-in wine of `xtask/tests/shell_scripts.rs` checks the launcher's side of this, and `run_by_file_name_alone_runs_the_title_in_its_own_folder` and `run_leaves_the_titles_relative_paths_in_the_directory_it_was_started_in` (`apps/victory/tests/run.rs`) check under Wine what `victory.exe` and a title make of the directory they are started in. No test starts the launcher itself against the real Wine; that was done by hand, with the results above.
+
 ## After merging upstream, 24 November 2026
 
 Upstream VIctory (`940d32f`) was merged into this port. What follows is what the merge changed for a Mac, measured on an M5 (macOS 27.0 beta) with the CrossOver Wine build.

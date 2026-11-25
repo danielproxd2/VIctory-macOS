@@ -324,6 +324,8 @@ fn exe_fixture_is_not_a_dll_and_has_tls() {
         "kernel32.dll!LoadLibraryW",
         "kernel32.dll!GetProcAddress",
         "kernel32.dll!ReadFile",
+        // What it asks where it runs with.
+        "kernel32.dll!GetCurrentDirectoryW",
     ] {
         assert!(imports.iter().any(|i| i == wanted), "{wanted}: {imports:?}");
     }
@@ -408,6 +410,11 @@ fn the_exe_goes_on_without_its_late_dll_and_its_package() {
     assert_eq!(seen("package_found"), Some(0), "{run:#?}");
     assert_eq!(seen("temp_written"), Some(0), "{run:#?}");
     assert_eq!(seen("temp_bytes"), Some(0), "{run:#?}");
+    // It was told a current directory, and the file it looks for there by
+    // name alone is not in it: nothing is written by a relative path.
+    assert!(seen("cwd_units").is_some_and(|n| n > 0), "{run:#?}");
+    assert_eq!(seen("relative_found"), Some(0), "{run:#?}");
+    assert_eq!(seen("relative_written"), Some(0), "{run:#?}");
     let expected = EXIT_BASE + RUNTIME as u64;
     assert_eq!(run.code, Some(expected as i32), "{run:#?}");
 }

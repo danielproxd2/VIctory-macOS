@@ -23,6 +23,30 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
+/// An empty folder for the test `name` outside every VIctory source tree,
+/// by its real path: the scratch folders above are in the tree's target
+/// folder, and where the launcher is started decides what it does.
+fn outside(name: &str) -> PathBuf {
+    let base = std::env::temp_dir().join("victory-xtask-tests");
+    fs::create_dir_all(&base).unwrap();
+    let dir = base.canonicalize().unwrap().join(name);
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    for above in dir.ancestors() {
+        assert!(
+            !above.join(".victory-root").exists() && above != root(),
+            "{} is inside a source tree",
+            dir.display()
+        );
+    }
+    dir
+}
+
+/// `path` as Wine names it: it shows `/` as `Z:`.
+fn windows(path: &Path) -> String {
+    format!("Z:{}", path.display().to_string().replace('/', "\\"))
+}
+
 /// Writes the executable shell script `body` to `path`.
 fn script(path: &Path, body: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -318,66 +342,121 @@ struct Launched {
     args: Vec<String>,
     /// The home folder as Wine's Z: drive shows it.
     home: String,
+    /// The directory the stand-in wine was started in.
+    cwd: PathBuf,
+    /// The stand-in wine's `VICTORY_CONFIG`, `<unset>` when it had none.
+    config: String,
+    /// How often the stand-in cargo was started.
+    builds: usize,
 }
+
+/// The stand-in wine of the launcher's tests: it writes what it was started
+/// with, and where, to the file `STAND_IN_LOG` names.
+const WINE_LOG: &str = r#"{
+    printf '%s\n' "data ${VICTORY_DATA_DIR-<unset>}"
+    printf '%s\n' "rosetta ${ROSETTA_ADVERTISE_AVX-<unset>}"
+    printf '%s\n' "cpu check ${VICTORY_SKIP_CPU_CHECK-<unset>}"
+    printf '%s\n' "config ${VICTORY_CONFIG-<unset>}"
+    printf '%s\n' "cwd $(pwd -P)"
+    printf 'arg %s\n' "$@"
+} >> "$STAND_IN_LOG""#;
 
 /// Runs victory.sh with `VICTORY_DATA_DIR` and `VICTORY_CONFIG` as given.
 /// `config` is the text of a config file in the test's folder; the script
 /// is told about it by `config_name`, in which `{}` stands for the file's
 /// macOS path. (Without `VICTORY_CONFIG` the script would read the
-/// victory.toml of whoever runs the tests.)
+/// victory.toml of whoever runs the tests.) The launcher is started in a
+/// folder outside the source tree, as a user starts it.
 fn victory(name: &str, data_dir: Option<&str>, config: &str, config_name: &str) -> Launched {
+    // Not the folder of the stand-ins, which `launch` empties.
+    let dir = scratch(&format!("{name}-config"));
+    let file = dir.join("victory config.toml");
+    fs::write(&file, config).unwrap();
+    let config_name = config_name
+        .replace("{Z}", &windows(&file))
+        .replace("{}", &file.display().to_string());
+    let launched = launch(
+        name,
+        &outside(name),
+        &["run", "--execute", "a title.exe"],
+        Some(&config_name),
+        data_dir,
+    );
+    let out = &launched.out;
+    assert!(out.status.success(), "{name}: {}", text(&out.stderr));
+    launched
+}
+
+/// Runs victory.sh in the directory `started_in` with `args`, with
+/// stand-ins for cargo and wine in a home folder of the test's own, and
+/// with `VICTORY_CONFIG` and `VICTORY_DATA_DIR` as given (`None`: not set).
+/// Where the launcher starts Wine, it built once and started it once.
+fn launch(
+    name: &str,
+    started_in: &Path,
+    args: &[&str],
+    config: Option<&str>,
+    data_dir: Option<&str>,
+) -> Launched {
     let dir = scratch(name);
     let log = dir.join("wine.log");
     let home = dir.join("home");
     fs::create_dir_all(dir.join("wine/lib/external/D3DMetal.framework")).unwrap();
     script(
         &dir.join("bin/cargo"),
-        r#"echo "cargo $*" >> "$STAND_IN_LOG""#,
+        r#"echo "cargo $* in $(pwd -P)" >> "$STAND_IN_LOG""#,
     );
-    script(
-        &dir.join("wine/bin/wine"),
-        r#"{
-    printf '%s\n' "data ${VICTORY_DATA_DIR-<unset>}"
-    printf '%s\n' "rosetta ${ROSETTA_ADVERTISE_AVX-<unset>}"
-    printf '%s\n' "cpu check ${VICTORY_SKIP_CPU_CHECK-<unset>}"
-    printf 'arg %s\n' "$@"
-} >> "$STAND_IN_LOG""#,
-    );
-    let file = dir.join("victory config.toml");
-    fs::write(&file, config).unwrap();
-    let windows = |path: &Path| format!("Z:{}", path.display().to_string().replace('/', "\\"));
-    let config_name = config_name
-        .replace("{Z}", &windows(&file))
-        .replace("{}", &file.display().to_string());
+    script(&dir.join("wine/bin/wine"), WINE_LOG);
     let mut command = Command::new(root().join("tools/macos/victory.sh"));
     command
-        .args(["run", "--execute", "a title.exe"])
+        .args(args)
+        .current_dir(started_in)
         .env("CARGO", dir.join("bin/cargo"))
         .env("WINE", dir.join("wine/bin/wine"))
         .env("HOME", &home)
         .env("STAND_IN_LOG", &log)
-        .env("VICTORY_CONFIG", config_name)
+        .env_remove("VICTORY_CONFIG")
         .env_remove("VICTORY_DATA_DIR")
         .env_remove("ROSETTA_ADVERTISE_AVX")
         .env_remove("VICTORY_SKIP_CPU_CHECK")
         .env_remove("WINEPREFIX");
+    if let Some(config) = config {
+        command.env("VICTORY_CONFIG", config);
+    }
     if let Some(data_dir) = data_dir {
         command.env("VICTORY_DATA_DIR", data_dir);
     }
     let out = command.output().unwrap();
-    assert!(out.status.success(), "{name}: {}", text(&out.stderr));
-    assert_eq!(logged(&log, "cargo ").len(), 1, "{name}: built once");
-    let data = logged(&log, "data ");
-    assert_eq!(data.len(), 1, "{name}: wine started once");
+    let logged = |key: &str| {
+        if log.exists() {
+            logged(&log, key)
+        } else {
+            Vec::new()
+        }
+    };
+    let data = logged("data ");
+    if out.status.success() {
+        // The build is the one thing done in the source tree.
+        let built = logged("cargo ");
+        assert_eq!(built.len(), 1, "{name}: built once");
+        assert!(
+            built[0].ends_with(&format!(" in {}", root().canonicalize().unwrap().display())),
+            "{name}: {built:?}"
+        );
+        assert_eq!(data.len(), 1, "{name}: wine started once");
+    }
     Launched {
-        out,
-        data_dir: (data[0] != "<unset>").then(|| data[0].clone()),
-        cpu: [
-            logged(&log, "rosetta ").concat(),
-            logged(&log, "cpu check ").concat(),
-        ],
-        args: logged(&log, "arg "),
+        data_dir: data
+            .first()
+            .filter(|data| *data != "<unset>")
+            .map(String::clone),
+        cpu: [logged("rosetta ").concat(), logged("cpu check ").concat()],
+        args: logged("arg "),
         home: windows(&home),
+        cwd: PathBuf::from(logged("cwd ").concat()),
+        config: logged("config ").concat(),
+        builds: logged("cargo ").len(),
+        out,
     }
 }
 
@@ -454,6 +533,247 @@ fn victory_sh_keeps_saved_data_out_of_the_cache_folder() {
     );
 }
 
+/// VIctory runs in the directory the launcher was started in, as it does on
+/// Windows, where the user starts it in theirs: a path on the command line
+/// is taken from there, by victory.exe itself, and it is the title's current
+/// directory. (Before, the launcher changed into the repository first: a
+/// relative path was looked for among the sources, and the title read and
+/// wrote its relative paths there.)
+#[test]
+fn victory_sh_runs_in_the_directory_it_was_started_in() {
+    let config = scratch("victory-sh-cwd-config").join("victory.toml");
+    fs::write(&config, "").unwrap();
+    let config = config.display().to_string();
+    for (name, args) in [
+        // A title by its file name alone, from its own folder.
+        ("victory-sh-cwd-run", &["run", "--execute", "game.exe"][..]),
+        ("victory-sh-cwd-bind", &["run", "sub folder/game.exe"][..]),
+        ("victory-sh-cwd-inspect", &["inspect", "game.exe"][..]),
+    ] {
+        let here = outside(name);
+        let launched = launch(name, &here, args, Some(&config), None);
+        assert!(launched.out.status.success(), "{name}");
+        assert_eq!(launched.cwd, here, "{name}");
+        // The arguments are the user's, untouched.
+        assert_eq!(launched.args[1..], *args, "{name}");
+        assert_eq!(text(&launched.out.stderr), "", "{name}");
+    }
+}
+
+/// The one directory a title never runs in is a VIctory source tree: what
+/// it writes by a relative path would land among the sources. Started from
+/// inside the tree, `run` starts the title in the title's own folder (what
+/// a start by file name from that folder gives) and says so; the executable
+/// is the one the path named from where the launcher was started.
+#[test]
+fn victory_sh_never_runs_a_title_inside_the_source_tree() {
+    let config = scratch("victory-sh-tree-config").join("victory.toml");
+    fs::write(&config, "").unwrap();
+    let config = config.display().to_string();
+    let game = outside("victory-sh-tree-game");
+    fs::create_dir_all(game.join("the game")).unwrap();
+    let exe = game.join("the game/game.exe");
+    let exe_windows = windows(&exe);
+    let relative = |from: &Path| {
+        let ups = from.components().count() - 1;
+        format!("{}{}", "../".repeat(ups), &exe.display().to_string()[1..])
+    };
+    let inside = root().canonicalize().unwrap().join("tools");
+    // Every way of naming the executable from inside the tree, and the
+    // options of `run` around it: those with a value do not hide it, and
+    // what follows `--` is the title's and stays as it is.
+    for (name, args) in [
+        (
+            "victory-sh-tree-absolute",
+            vec!["run", "--execute", exe.to_str().unwrap()],
+        ),
+        (
+            "victory-sh-tree-z",
+            vec!["run", &exe_windows, "--execute", "--strict"],
+        ),
+        (
+            "victory-sh-tree-relative",
+            vec!["run", "--execute", &relative(&inside)],
+        ),
+        (
+            "victory-sh-tree-options",
+            vec![
+                "run",
+                "--console",
+                "series-s",
+                "--unimplemented",
+                "zero",
+                "--console=series-x",
+                exe.to_str().unwrap(),
+                "--",
+                "title.exe",
+                "run",
+            ],
+        ),
+    ] {
+        let launched = launch(name, &inside, &args, Some(&config), None);
+        assert!(launched.out.status.success(), "{name}");
+        assert_eq!(launched.cwd, game.join("the game"), "{name}");
+        // Only the executable's argument changed: to its full path, which
+        // names the same file from the title's folder.
+        let expected: Vec<&str> = args
+            .iter()
+            .map(|a| {
+                let is_exe = *a == exe.to_str().unwrap() || *a == relative(&inside);
+                if is_exe { exe_windows.as_str() } else { a }
+            })
+            .collect();
+        assert_eq!(launched.args[1..], expected, "{name}");
+        let said = text(&launched.out.stderr);
+        assert!(
+            said.contains("the title runs in its own folder")
+                && said.contains(&game.join("the game").display().to_string()),
+            "{name}: {said}"
+        );
+    }
+    // A command that runs no title stays where the user is.
+    let launched = launch(
+        "victory-sh-tree-inspect",
+        &inside,
+        &["inspect", "victory.sh"],
+        Some(&config),
+        None,
+    );
+    assert_eq!(launched.cwd, inside);
+    assert_eq!(launched.args[1..], ["inspect", "victory.sh"]);
+    assert_eq!(text(&launched.out.stderr), "");
+    // `run` without an executable is victory.exe's to refuse.
+    let launched = launch(
+        "victory-sh-tree-no-exe",
+        &inside,
+        &["run", "--execute", "--", "game.exe"],
+        Some(&config),
+        None,
+    );
+    assert_eq!(launched.cwd, inside);
+    assert_eq!(launched.args[1..], ["run", "--execute", "--", "game.exe"]);
+}
+
+/// Where the title's folder is inside a source tree as well, there is no
+/// directory to run it in: nothing is built and nothing is started. A
+/// source tree is this repository or any folder that holds its marker
+/// file, as for victory_core::ensure_outside_repo.
+#[test]
+fn victory_sh_refuses_a_title_that_lies_inside_a_source_tree() {
+    let config = scratch("victory-sh-refuse-config").join("victory.toml");
+    fs::write(&config, "").unwrap();
+    let config = config.display().to_string();
+    let inside = root().canonicalize().unwrap().join("tools/macos");
+    // Another copy of the sources, with a game dropped into it.
+    let copy = outside("victory-sh-refuse-copy");
+    fs::write(copy.join(".victory-root"), "").unwrap();
+    fs::create_dir_all(copy.join("game")).unwrap();
+    let in_copy = copy.join("game/game.exe");
+    for (name, started_in, exe, shown) in [
+        (
+            "victory-sh-refuse-here",
+            &inside,
+            "victory.sh",
+            inside.clone(),
+        ),
+        (
+            "victory-sh-refuse-copy-from-tree",
+            &inside,
+            in_copy.to_str().unwrap(),
+            copy.join("game"),
+        ),
+        (
+            "victory-sh-refuse-copy-from-copy",
+            &copy,
+            "game/game.exe",
+            copy.join("game"),
+        ),
+    ] {
+        let launched = launch(
+            name,
+            started_in,
+            &["run", "--execute", exe],
+            Some(&config),
+            None,
+        );
+        assert_eq!(launched.out.status.code(), Some(1), "{name}");
+        assert_eq!(launched.args, [""; 0], "{name}: nothing is started");
+        assert_eq!(launched.builds, 0, "{name}: nothing is built");
+        let said = text(&launched.out.stderr);
+        assert!(
+            said.contains(&format!(
+                "refusing to run a title in {}: it is inside a VIctory source tree",
+                shown.display()
+            )),
+            "{name}: {said}"
+        );
+    }
+    // A path macOS cannot follow to the title's folder, and a folder that
+    // is not there: refused by name as well.
+    for (name, exe, shown) in [
+        (
+            "victory-sh-refuse-drive",
+            "D:\\games\\game.exe",
+            "is not a path macOS can follow",
+        ),
+        (
+            "victory-sh-refuse-absent",
+            "/victory-no-such-folder/game.exe",
+            "no folder at /victory-no-such-folder",
+        ),
+    ] {
+        let launched = launch(
+            name,
+            &inside,
+            &["run", "--execute", exe],
+            Some(&config),
+            None,
+        );
+        assert_eq!(launched.out.status.code(), Some(1), "{name}");
+        assert_eq!(launched.args, [""; 0], "{name}: nothing is started");
+        assert_eq!(launched.builds, 0, "{name}: nothing is built");
+        let said = text(&launched.out.stderr);
+        assert!(said.contains(shown), "{name}: {said}");
+    }
+}
+
+/// The config file is the user's `VICTORY_CONFIG`, a relative name taken
+/// from the directory the launcher was started in; else victory.toml in
+/// that directory; else the repository's, where setup.sh puts it. What the
+/// launcher found, and a relative name, reach victory.exe as full paths,
+/// since it may be started in another directory.
+#[test]
+fn victory_sh_finds_the_config_file_from_the_users_directory() {
+    let here = outside("victory-sh-config-here");
+    fs::write(here.join("victory.toml"), "").unwrap();
+    fs::write(here.join("mine.toml"), "").unwrap();
+    let args = ["run", "game.exe"];
+    let launched = launch("victory-sh-config-here", &here, &args, None, None);
+    assert_eq!(launched.config, windows(&here.join("victory.toml")));
+    let launched = launch(
+        "victory-sh-config-relative",
+        &here,
+        &args,
+        Some("mine.toml"),
+        None,
+    );
+    assert_eq!(launched.config, windows(&here.join("mine.toml")));
+    // A full path stays as the user wrote it.
+    let named = here.join("mine.toml").display().to_string();
+    let launched = launch("victory-sh-config-full", &here, &args, Some(&named), None);
+    assert_eq!(launched.config, named);
+    // No file in the user's directory: the repository's, if it has one
+    // (it is git-ignored, and whoever runs the tests may have none).
+    let empty = outside("victory-sh-config-none");
+    let launched = launch("victory-sh-config-none", &empty, &args, None, None);
+    let of_the_repository = root().canonicalize().unwrap().join("victory.toml");
+    if of_the_repository.is_file() {
+        assert_eq!(launched.config, windows(&of_the_repository));
+    } else {
+        assert_eq!(launched.config, "<unset>");
+    }
+}
+
 /// No game is started by default: without arguments the launcher says
 /// what to pass and fails, and builds and starts nothing.
 #[test]
@@ -520,6 +840,7 @@ exit {code}"#
         fs::write(&config, "").unwrap();
         let out = Command::new(root().join("tools/macos/victory.sh"))
             .args(["run", "--execute", "a title.exe"])
+            .current_dir(outside(&format!("victory-sh-exit-{code}")))
             .env("CARGO", dir.join("bin/cargo"))
             .env("WINE", dir.join("wine/bin/wine"))
             .env("HOME", dir.join("home"))
