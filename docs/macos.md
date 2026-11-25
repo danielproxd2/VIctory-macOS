@@ -18,7 +18,7 @@ Run the tests under Wine with this command.
 WINE=/path/to/wine tools/macos/test-wine.sh --workspace --no-fail-fast
 ```
 
-The loader probe passes, so the stand-in title is mapped, bound, delay loaded and run with its thread callbacks. The HLE tests pass (86 of 86), and `victory.exe --help` runs. Wine lacks three network exports (`WSAConnectByList`, `GetAddrInfoExA` and `WinHttpGetProxySettingsEx`), and VIctory now fails those calls cleanly. Two kinds of test still fail under Wine.
+The loader probe passes, so the stand-in title is mapped, bound, delay loaded and run with its thread callbacks. The HLE tests pass (86 of 86), and `victory.exe --help` runs. Wine lacks three network exports (`WSAConnectByList`, `GetAddrInfoExA` and `WinHttpGetProxySettingsEx`). VIctory does the first two itself from functions Wine has, for loopback only, and answers the third without the host. Two kinds of test still fail under Wine.
 
 - Seven shader tests need a D3D12 device with shader model 6.6. The Wine build has no D3D12 that works on Metal, so this is the GPU gap that D3DMetal has to fill.
 - The xtask policy test starts git from inside Wine. Run `cargo xtask policy` natively instead.
