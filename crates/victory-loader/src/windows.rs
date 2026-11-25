@@ -26,6 +26,8 @@ pub struct LoadedImage {
     module: HMODULE,
     path: PathBuf,
     info: ImageInfo,
+    /// See [`LoadedImage::redirected_tls_loads`].
+    redirected_tls_loads: usize,
 }
 
 // SAFETY: HMODULE is a process-wide handle (the base address); using it from
@@ -74,15 +76,16 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
             }
         );
     }
-    let loaded = LoadedImage {
+    let mut loaded = LoadedImage {
         module,
         path,
         info: prepared.info.clone(),
+        redirected_tls_loads: 0,
     };
     // A DLL indexes its TLS properly; only an exe assumes index 0.
     if !loaded.info.is_dll() {
         // SAFETY: just mapped, and no title code has run.
-        unsafe { crate::tls::redirect(loaded.base(), &loaded.info) }?;
+        loaded.redirected_tls_loads = unsafe { crate::tls::redirect(loaded.base(), &loaded.info) }?;
     }
     tracing::info!(
         base = format_args!("{:#x}", loaded.base()),
@@ -200,6 +203,13 @@ impl LoadedImage {
     /// Parsed from the original image (imports, entry point, TLS callbacks).
     pub fn info(&self) -> &ImageInfo {
         &self.info
+    }
+
+    /// How many loads of the TLS array in the image's code were rewritten
+    /// when it was mapped (see `tls`): 0 for a DLL, for an image without
+    /// static TLS, and for an executable the OS gave TLS index 0.
+    pub fn redirected_tls_loads(&self) -> usize {
+        self.redirected_tls_loads
     }
 
     /// Address of an export of the image, if it has one by that name.
