@@ -87,18 +87,35 @@ pub struct SpaceInfo {
     pub total: u64,
 }
 
+/// The bytes of the files under `dir`. Links are not followed and count
+/// nothing: a link to a folder (a symbolic link, a junction) can lead back
+/// into the tree or out of the title's storage, and following it would
+/// count files twice, or without end. Without links a folder tree is
+/// finite; it is walked with a list, not by recursion, so its depth costs
+/// no stack. The sum stops at `u64::MAX`.
 fn used_bytes(dir: &Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    entries
-        .flatten()
-        .map(|e| match e.metadata() {
-            Ok(m) if m.is_dir() => used_bytes(&e.path()),
-            Ok(m) => m.len(),
-            Err(_) => 0,
-        })
-        .sum()
+    let mut used = 0u64;
+    let mut folders = vec![dir.to_owned()];
+    while let Some(folder) = folders.pop() {
+        let Ok(entries) = std::fs::read_dir(&folder) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            // The entry's own type and size: `metadata` would follow links.
+            match std::fs::symlink_metadata(entry.path()) {
+                Ok(m) if m.file_type().is_symlink() => {}
+                Ok(m) if m.is_dir() => folders.push(entry.path()),
+                Ok(m) => used = total([used, m.len()]),
+                Err(_) => {}
+            }
+        }
+    }
+    used
+}
+
+/// A sum of sizes that stops at `u64::MAX`.
+fn total(sizes: impl IntoIterator<Item = u64>) -> u64 {
+    sizes.into_iter().fold(0, u64::saturating_add)
 }
 
 /// What the host disk under `dir` has free (unlimited if unknown).
@@ -238,5 +255,46 @@ mod tests {
             assert_eq!(xasync::XAsyncGetStatus(&mut block, true), expect);
             assert_eq!(result(this, &mut block), expect, "{bytes} bytes");
         }
+    }
+
+    #[test]
+    fn a_sum_of_sizes_stops_at_the_largest_number() {
+        assert_eq!(total([1, 2, 3]), 6);
+        assert_eq!(total([u64::MAX, 1]), u64::MAX);
+        assert_eq!(total([u64::MAX - 1, 1, 1]), u64::MAX);
+        assert_eq!(total([]), 0);
+    }
+
+    /// A link to a folder inside the tree, leading back to the tree's
+    /// root. Followed, it has every file counted again on each turn, until
+    /// the host refuses the path.
+    #[test]
+    fn a_link_loop_does_not_hang_the_size_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = dir.path().join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        std::fs::write(dir.path().join("save.dat"), [0u8; 100]).unwrap();
+        std::fs::write(inner.join("more.dat"), [0u8; 20]).unwrap();
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(dir.path(), inner.join("loop"));
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_dir(dir.path(), inner.join("loop"));
+        if let Err(error) = linked {
+            // Windows wants a privilege or developer mode for links.
+            return crate::testing::skip(&format!("no folder links here: {error}"));
+        }
+        assert!(
+            inner.join("loop/inner/more.dat").is_file(),
+            "the link works"
+        );
+        assert_eq!(used_bytes(dir.path()), 120);
+        // A link to a file counts nothing either: its target is counted
+        // where it lies, or lies outside the title's storage.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.path().join("save.dat"), inner.join("alias")).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(dir.path().join("save.dat"), inner.join("alias"))
+            .unwrap();
+        assert_eq!(used_bytes(dir.path()), 120);
     }
 }
