@@ -1572,6 +1572,7 @@ mod tests {
     /// over it is the current directory, not the current drive's root.
     #[test]
     fn an_empty_root_is_the_current_directory() {
+        let _cwd = in_this_directory();
         let letter = mount(Path::new("")).unwrap();
         let path = format!(r"{letter}:\a.rpf");
         let host = translate(&w(&path)[..path.len()]).map(|v| text(&v));
@@ -2141,6 +2142,14 @@ mod tests {
         assert_eq!(units(&buffer, n), units(&theirs, theirs_n));
     }
 
+    /// The process has one current directory: a test that changes it and a
+    /// test that reads it hold this, so that neither sees the other's.
+    static CURRENT_DIRECTORY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn in_this_directory() -> std::sync::MutexGuard<'static, ()> {
+        CURRENT_DIRECTORY.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Puts the process's current directory back.
     struct Cwd(std::path::PathBuf);
 
@@ -2152,6 +2161,7 @@ mod tests {
 
     #[test]
     fn current_directory_round_trips_on_a_virtual_drive() {
+        let _cwd = in_this_directory();
         let d = Drive::new();
         std::fs::create_dir(d.host("sub")).unwrap();
         // Dropped before `d`: the folder cannot go while the process is in it.
