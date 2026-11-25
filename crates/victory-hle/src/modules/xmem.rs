@@ -406,6 +406,15 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     if handle.is_null() {
         let error = std::io::Error::last_os_error();
         tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
+        // Under Wine this is where the memory is asked for (`commit` has
+        // nothing left to do there), so this is the failure to explain.
+        if on_wine() {
+            report(&section_refused_message(
+                size,
+                &error,
+                system_commit().as_ref(),
+            ));
+        }
         // SAFETY: checked non-null.
         unsafe { count.write(0) };
         return 0;
@@ -748,17 +757,33 @@ fn commit(base: usize, len: usize) -> bool {
     }
     let error = std::io::Error::last_os_error();
     if error.raw_os_error() == Some(ERROR_COMMITMENT_LIMIT as i32) {
-        let mut info = PERFORMANCE_INFORMATION {
-            cb: size_of::<PERFORMANCE_INFORMATION>() as u32,
-            ..Default::default()
-        };
-        // SAFETY: the buffer and size describe a writable PERFORMANCE_INFORMATION.
-        let queried = unsafe { K32GetPerformanceInfo(&mut info, info.cb) } != 0;
-        victory_loader::log_crash(&commit_limit_message(len, &error, queried.then_some(&info)));
+        report(&commit_limit_message(len, &error, system_commit().as_ref()));
     } else {
         tracing::warn!(len, %error, "committing physical pages failed");
     }
     false
+}
+
+/// The system's commit charge and limit, if it tells.
+fn system_commit() -> Option<PERFORMANCE_INFORMATION> {
+    let mut info = PERFORMANCE_INFORMATION {
+        cb: size_of::<PERFORMANCE_INFORMATION>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: the buffer and size describe a writable PERFORMANCE_INFORMATION.
+    let queried = unsafe { K32GetPerformanceInfo(&mut info, info.cb) } != 0;
+    queried.then_some(info)
+}
+
+/// A memory failure the user can act on goes to the crash log, as the
+/// title is unlikely to survive it.
+fn report(message: &str) {
+    #[cfg(test)]
+    tests::REPORTED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(message.to_owned());
+    victory_loader::log_crash(message);
 }
 
 fn commit_limit_message(
@@ -769,20 +794,40 @@ fn commit_limit_message(
     let mut message = format!(
         "VIctory: Windows commit limit reached while committing {len} bytes of physical pages: {error}.\n"
     );
-    if let Some(info) = info {
-        use std::fmt::Write;
-
-        let committed = info.CommitTotal * info.PageSize / MIB;
-        let limit = info.CommitLimit * info.PageSize / MIB;
-        let _ = writeln!(
-            message,
-            "System commit: {committed} MiB of {limit} MiB in use."
-        );
-    }
+    push_system_commit(&mut message, info);
     message.push_str(
         "Close other applications or increase the Windows paging file size, then retry.\n",
     );
     message
+}
+
+/// What to say when Wine refuses the section behind physical pages: the
+/// request, the error, and what the system has committed.
+fn section_refused_message(
+    size: usize,
+    error: &std::io::Error,
+    info: Option<&PERFORMANCE_INFORMATION>,
+) -> String {
+    let mut message = format!(
+        "VIctory: Wine could not create a section for {size} bytes of physical pages: {error}.\n"
+    );
+    push_system_commit(&mut message, info);
+    message
+        .push_str("The pages are a sparse file there: free memory and disk space, then retry.\n");
+    message
+}
+
+fn push_system_commit(message: &mut String, info: Option<&PERFORMANCE_INFORMATION>) {
+    use std::fmt::Write;
+
+    let Some(info) = info else { return };
+    // Saturating: the figures are the host's, and a report must not fail.
+    let committed = info.CommitTotal.saturating_mul(info.PageSize) / MIB;
+    let limit = info.CommitLimit.saturating_mul(info.PageSize) / MIB;
+    let _ = writeln!(
+        message,
+        "System commit: {committed} MiB of {limit} MiB in use."
+    );
 }
 
 /// Returns `[base, base + len)` to placeholders; views reaching past it
@@ -927,6 +972,14 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What `report` sent to the crash log, for the tests that expect it.
+    pub(super) static REPORTED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    fn reported(part: &str) -> Vec<String> {
+        let all = REPORTED.lock().unwrap_or_else(|e| e.into_inner());
+        all.iter().filter(|m| m.contains(part)).cloned().collect()
+    }
 
     fn query(address: *const c_void) -> BasicInformation {
         // SAFETY: plain data; zero is a valid value.
@@ -1305,6 +1358,70 @@ mod tests {
         assert_eq!(XMemMapPhysicalPages(a, 2, std::ptr::null()), a);
         assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
         assert!(!known());
+    }
+
+    #[test]
+    fn a_request_the_host_cannot_meet_fails_and_is_reported() {
+        // More bytes than any section has, on any host.
+        let mut requests = vec![usize::MAX / PAGE];
+        if on_wine() {
+            // Wine refuses this one for want of memory (measured: it
+            // creates sections up to 2^48 bytes, sparse).
+            requests.push(1 << 40);
+        }
+        for n in requests {
+            let (mut count, mut pages) = (n, [7usize; 1]);
+            assert_eq!(
+                XMemAllocatePhysicalPages(0, &mut count, pages.as_mut_ptr()),
+                0,
+                "{n:#x}"
+            );
+            assert_eq!(count, 0, "{n:#x}: pages given");
+            assert_eq!(pages, [7], "{n:#x}: no page number written");
+            if on_wine() {
+                // The Wine-only path: the section is where memory is asked
+                // for, so its failure is what the crash log explains.
+                let bytes = format!("{} bytes of physical pages", n * PAGE);
+                let said = reported(&bytes);
+                assert_eq!(said.len(), 1, "{n:#x}: {said:?}");
+                assert!(said[0].starts_with("VIctory: Wine could not create a section for"));
+                assert!(said[0].contains("os error"), "{said:?}");
+                assert!(said[0].contains("free memory and disk space"), "{said:?}");
+            }
+        }
+        // A count that is no size at all is no failure of the host's:
+        // nothing is asked of it and nothing reported.
+        let (mut count, mut pages) = (WRAPS, [7usize; 1]);
+        assert_eq!(
+            XMemAllocatePhysicalPages(0, &mut count, pages.as_mut_ptr()),
+            0
+        );
+        assert_eq!((count, pages), (WRAPS, [7]));
+    }
+
+    #[test]
+    fn section_refusal_report_names_request_error_and_commit() {
+        let error = std::io::Error::from_raw_os_error(8);
+        let info = PERFORMANCE_INFORMATION {
+            CommitTotal: 512,
+            CommitLimit: 768,
+            PageSize: 4096,
+            ..Default::default()
+        };
+        let report = section_refused_message(6 << 30, &error, Some(&info));
+        assert!(report.contains("6442450944 bytes of physical pages"));
+        assert!(report.contains("os error 8"));
+        assert!(report.contains("System commit: 2 MiB of 3 MiB in use."));
+        assert!(!section_refused_message(PAGE, &error, None).contains("System commit:"));
+        // Figures that do not multiply still make a report.
+        let absurd = PERFORMANCE_INFORMATION {
+            CommitTotal: usize::MAX,
+            CommitLimit: usize::MAX,
+            PageSize: 4096,
+            ..Default::default()
+        };
+        let report = commit_limit_message(PAGE, &error, Some(&absurd));
+        assert!(report.contains("System commit: 17592186044415 MiB of"));
     }
 
     /// `n` pages of one new allocation.
