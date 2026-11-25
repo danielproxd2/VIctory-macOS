@@ -87,23 +87,28 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
         write(&mut bytes, at, &[0; layout::DATA_DIRECTORY_SIZE])?;
     }
 
+    // With callbacks there is a pointer to clear. With base relocations
+    // there may be an entry on the field even when it is 0 already, which
+    // the loader would turn into a pointer just the same.
     if let Some(tls) = &info.tls
-        && tls.callbacks_va != 0
+        && (tls.callbacks_va != 0 || info.has_relocations)
     {
-        let at = info
-            .rva_to_file_offset(tls.directory_rva)
-            .ok_or(PrepareError::Patch("TLS directory is not file-backed"))?;
         // Header values are untrusted: a directory in a section placed at
         // the top of the 32-bit address space overflows here.
         let field_rva = u32::try_from(layout::TLS64_ADDRESS_OF_CALLBACKS)
             .ok()
             .and_then(|offset| tls.directory_rva.checked_add(offset))
             .ok_or(PrepareError::Patch(CALLBACKS_FIELD_OVERFLOW))?;
-        write_u64(
-            &mut bytes,
-            at as usize + layout::TLS64_ADDRESS_OF_CALLBACKS,
-            0,
-        )?;
+        if tls.callbacks_va != 0 {
+            let at = info
+                .rva_to_file_offset(tls.directory_rva)
+                .ok_or(PrepareError::Patch("TLS directory is not file-backed"))?;
+            write_u64(
+                &mut bytes,
+                at as usize + layout::TLS64_ADDRESS_OF_CALLBACKS,
+                0,
+            )?;
+        }
         // The field's base relocation would turn the 0 into `delta` whenever
         // the loader maps the copy away from its preferred base (Wine always
         // does for DYNAMIC_BASE images), and the loader then reads callbacks
@@ -128,7 +133,7 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
             // A pointer in a relocatable image always has its DIR64 entry.
             // Without one the table is not what the image was linked with,
             // and nothing we wrote above can be trusted to stay.
-            if !neutralised {
+            if tls.callbacks_va != 0 && !neutralised {
                 return Err(PrepareError::Patch(CALLBACKS_FIELD_NOT_RELOCATED));
             }
         }
@@ -619,13 +624,50 @@ mod tests {
             .build()
             .unwrap();
         assert!(prepare(&stripped.bytes).is_ok());
-        // Nor does an image without callbacks, whatever its table says.
+        // Nor does an image whose callbacks field is 0 to begin with.
         let no_callbacks = title()
             .tls_without_callbacks()
             .reloc_block(0xFFFF_FFFF, &[(reloc::HIGHLOW, 0x18)])
             .build()
             .unwrap();
         assert!(prepare(&no_callbacks.bytes).is_ok());
+    }
+
+    /// A callbacks field that is 0 in the file but has a base relocation is
+    /// a pointer once the loader has rebased the image.
+    #[test]
+    fn a_relocated_null_callbacks_field_is_disarmed() {
+        let with = |kind: u8| {
+            let built = title().tls_without_callbacks().build().unwrap();
+            let page = built.tls_directory_rva.unwrap();
+            assert_eq!(page, tls_directory_page());
+            let built = title()
+                .tls_without_callbacks()
+                .reloc_block(page, &[(reloc::DIR64, 0), (kind, 0x18)])
+                .build()
+                .unwrap();
+            let info = ImageInfo::parse(&built.bytes).unwrap();
+            assert_eq!(info.tls.unwrap().callbacks_va, 0);
+            (prepare(&built.bytes), first_relocation_entry(&built.bytes))
+        };
+        let (prepared, entry) = with(reloc::DIR64);
+        let entries = &prepared.unwrap().bytes[entry..entry + 4];
+        // The directory's first field keeps its relocation.
+        assert_eq!(entries, [0x00, 0xA0, 0, 0]);
+        assert_eq!(
+            patch_error(with(reloc::HIGHLOW).0),
+            CALLBACKS_FIELD_ODD_RELOCATION
+        );
+        // An unreadable table is refused here too: the entry may be in it.
+        let built = title()
+            .tls_without_callbacks()
+            .reloc_block(0x1000, &[(reloc::DIR64, 0)])
+            .build()
+            .unwrap();
+        let mut bytes = built.bytes;
+        let block_size = first_relocation_entry(&bytes) - 4;
+        write_u32(&mut bytes, block_size, 7).unwrap();
+        assert_eq!(patch_error(prepare(&bytes)), RELOCATION_BLOCK_MALFORMED);
     }
 
     #[test]
