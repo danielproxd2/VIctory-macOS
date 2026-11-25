@@ -920,10 +920,10 @@ pub(crate) fn copied(resource: usize, start: u64) -> bool {
         .is_some_and(|e| e.shadow.is_some())
 }
 
-/// How many buffers the last [`find`] on this thread looked at to tell
-/// which one holds the range.
 #[cfg(test)]
 thread_local! {
+    /// How many buffers the last [`find`] on this thread looked at to tell
+    /// which one holds the range.
     static LOOKED_AT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
