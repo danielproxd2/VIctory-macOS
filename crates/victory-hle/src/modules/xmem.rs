@@ -614,8 +614,12 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     let Some(layout) = layout(size, attributes) else {
         return std::ptr::null_mut();
     };
-    // shortcut: the host heap's addresses lie above 2^40, unlike the
-    // console's; nothing seen builds ray-tracing structures in this memory
+    // shortcut: the block lies wherever the host's heap puts it, with no
+    // address limit of ours, unlike the console's. Under CrossOver Wine the
+    // blocks measured lay below 2^40 (0x147470 for 100 bytes, 0x1612000 for
+    // 3 MiB; `default_blocks_come_from_the_host_heap_today` prints them),
+    // which nothing promises; where the heap lies on Windows was not
+    // measured. Nothing seen builds ray-tracing structures in this memory
     // (Grand Theft Auto VI uses its GPU heap). Sub-allocate from a
     // reservation below 2^40 if one does.
     // SAFETY: the layout has a non-zero size.
