@@ -51,6 +51,11 @@ pub struct ImportModule {
     /// DLL name exactly as written in the image (case preserved).
     pub dll: String,
     pub entries: Vec<ImportEntry>,
+    /// Delay imports only: RVA of the 8-byte slot in which the delay-load
+    /// helper caches the module's `HMODULE` (`ModuleHandleRVA`). `None` for
+    /// eager imports and for a descriptor without one. The slot is checked
+    /// to lie inside the image, not to be aligned.
+    pub module_handle_rva: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -305,6 +310,7 @@ fn parse_imports(
             entries: entries(table.thunks(int_rva)?, iat_rva, size_of_image, |t| {
                 table.import::<ImageNtHeaders64>(t)
             })?,
+            module_handle_rva: None,
         });
     }
     Ok(modules)
@@ -320,14 +326,33 @@ fn parse_delay_imports(
     let mut modules = Vec::new();
     let mut descriptors = table.descriptors()?;
     while let Some(desc) = descriptors.next()? {
+        let dll = utf8(table.name(desc.dll_name_rva.get(LE))?);
+        // Without this attribute the descriptor's fields are virtual
+        // addresses, the layout of old linkers. Read as RVAs they would
+        // name other places in the image, or none.
+        if desc.attributes.get(LE) & pe::IMAGE_DELAYLOAD_RVA_BASED == 0 {
+            return Err(PeError::Unsupported(format!(
+                "delay-load descriptor for {dll} holds virtual addresses, not RVAs"
+            )));
+        }
+        let module_handle_rva = match desc.module_handle_rva.get(LE) {
+            0 => None,
+            rva if rva.checked_add(8).is_some_and(|end| end <= size_of_image) => Some(rva),
+            rva => {
+                return Err(PeError::Malformed(format!(
+                    "delay-load module handle at {rva:#x} is outside the image"
+                )));
+            }
+        };
         modules.push(ImportModule {
-            dll: utf8(table.name(desc.dll_name_rva.get(LE))?),
+            dll,
             entries: entries(
                 table.thunks(desc.import_name_table_rva.get(LE))?,
                 desc.import_address_table_rva.get(LE),
                 size_of_image,
                 |t| table.import::<ImageNtHeaders64>(t),
             )?,
+            module_handle_rva,
         });
     }
     Ok(modules)
@@ -736,6 +761,82 @@ mod tests {
         data[text + 8..text + 12].copy_from_slice(&0x10_0000u32.to_le_bytes());
         let why = malformed(ImageInfo::parse(&data));
         assert!(why.contains("not in an executable section"), "{why}");
+    }
+
+    /// [`sample`] with one delay-loaded DLL, and the file offset of its
+    /// `IMAGE_DELAYLOAD_DESCRIPTOR`.
+    fn delay_sample(attributes: u32) -> (Vec<u8>, usize) {
+        let data = sample()
+            .delay_import("late.dll", attributes, &[by_name(1, "Later")])
+            .build()
+            .unwrap()
+            .bytes;
+        let directory = layout::data_directory_offset(&data, dir::DELAY_IMPORT).unwrap();
+        let descriptor_rva = layout::read_u32(&data, directory).unwrap();
+        // The delay section is the fourth, after `.text`, `.pdata` and
+        // `.idata`, and starts with the descriptor table. Its place is read
+        // from the section header, because an image with attributes 0 no
+        // longer parses.
+        let header = crate::testing::section_header_offset(&data, 3).unwrap();
+        assert_eq!(&data[header..header + 6], b".didat");
+        assert_eq!(layout::read_u32(&data, header + 12), Some(descriptor_rva));
+        let at = layout::read_u32(&data, header + 20).unwrap() as usize;
+        (data, at)
+    }
+
+    #[test]
+    fn rejects_va_based_delay_descriptor() {
+        // Attributes 0: the fields would be virtual addresses.
+        let (data, at) = delay_sample(0);
+        assert_eq!(layout::read_u32(&data, at), Some(0));
+        match ImageInfo::parse(&data) {
+            Err(PeError::Unsupported(why)) => assert_eq!(
+                why,
+                "delay-load descriptor for late.dll holds virtual addresses, not RVAs"
+            ),
+            other => panic!("expected PeError::Unsupported, got {other:?}"),
+        }
+        // Other attribute bits do not stand in for the RVA one.
+        let (mut data, at) = delay_sample(DELAYLOAD_RVA_BASED);
+        assert!(ImageInfo::parse(&data).is_ok());
+        data[at..at + 4].copy_from_slice(&0xFFFF_FFFEu32.to_le_bytes());
+        assert!(matches!(
+            ImageInfo::parse(&data),
+            Err(PeError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn delay_descriptor_reports_module_handle_slot() {
+        let (mut data, at) = delay_sample(DELAYLOAD_RVA_BASED);
+        let handle = layout::read_u32(&data, at + 8).unwrap();
+        let info = ImageInfo::parse(&data).unwrap();
+        let late = &info.delay_imports[0];
+        assert_ne!(handle, 0);
+        assert_eq!(late.module_handle_rva, Some(handle));
+        // The slot is its own: not a slot of the delay IAT.
+        assert!(late.entries.iter().all(|e| e.iat_slot_rva != handle));
+        assert!(handle + 8 <= late.entries[0].iat_slot_rva);
+        // Eager imports have no such slot.
+        assert!(info.imports.iter().all(|m| m.module_handle_rva.is_none()));
+
+        // A descriptor without a slot is allowed and says so.
+        data[at + 8..at + 12].copy_from_slice(&0u32.to_le_bytes());
+        let info = ImageInfo::parse(&data).unwrap();
+        assert_eq!(info.delay_imports[0].module_handle_rva, None);
+        // A slot that does not fit in the image is an error.
+        let last = info.size_of_image - 8;
+        data[at + 8..at + 12].copy_from_slice(&last.to_le_bytes());
+        let info = ImageInfo::parse(&data).unwrap();
+        assert_eq!(info.delay_imports[0].module_handle_rva, Some(last));
+        for rva in [last + 1, info.size_of_image, 0xFFFF_FFF9] {
+            data[at + 8..at + 12].copy_from_slice(&rva.to_le_bytes());
+            let why = malformed(ImageInfo::parse(&data));
+            assert_eq!(
+                why,
+                format!("delay-load module handle at {rva:#x} is outside the image")
+            );
+        }
     }
 
     #[test]
