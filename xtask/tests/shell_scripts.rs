@@ -463,6 +463,83 @@ fn test_wine_lists_and_hands_on_every_require_switch() {
     }
 }
 
+/// The compiler for the test shaders Wine's own cannot build is named by
+/// its macOS path (`VICTORY_PC_DXC_UNIX`), as the validator is, and the
+/// tests get it as `VICTORY_PC_DXC`, the path Wine knows it by. A name
+/// that is no file, or no absolute path, ends the run before any test;
+/// without the variable the tests get none.
+#[test]
+fn test_wine_hands_on_a_dxc_by_its_wine_path() {
+    let libdir = scratch("test-wine-dxc-libdir");
+    let dir = scratch("test-wine-dxc");
+    let log = dir.join("cargo.log");
+    script(&dir.join("bin/wine"), "exit 0");
+    script(
+        &dir.join("bin/rustc"),
+        &format!("echo '{}'", libdir.display()),
+    );
+    script(
+        &dir.join("bin/cargo"),
+        r#"printf '%s\n' "dxc ${VICTORY_PC_DXC-<unset>}" >> "$STAND_IN_LOG""#,
+    );
+    let dxc = dir.join("dxc/dxc.exe");
+    fs::create_dir_all(dxc.parent().unwrap()).unwrap();
+    fs::write(&dxc, "").unwrap();
+    let run = |unix: Option<&str>| {
+        let _ = fs::remove_file(&log);
+        let mut command = Command::new(root().join("tools/macos/test-wine.sh"));
+        command
+            .args(["-p", "victory-pe"])
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", dir.join("bin").display()),
+            )
+            .env("WINE", dir.join("bin/wine"))
+            .env("STAND_IN_LOG", &log)
+            .env_remove("WINEDLLOVERRIDES")
+            .env_remove("VICTORY_PC_DXC")
+            .env_remove("VICTORY_PC_DXC_UNIX");
+        if let Some(unix) = unix {
+            command.env("VICTORY_PC_DXC_UNIX", unix);
+        }
+        command.output().unwrap()
+    };
+    let out = run(Some(dxc.to_str().unwrap()));
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let wine_path = format!("Z:{}", dxc.display().to_string().replace('/', "\\"));
+    let seen = logged(&log, "dxc ");
+    assert!(
+        !seen.is_empty() && seen.iter().all(|s| *s == wine_path),
+        "{seen:?}"
+    );
+
+    let out = run(None);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let seen = logged(&log, "dxc ");
+    assert!(
+        !seen.is_empty() && seen.iter().all(|s| s == "<unset>"),
+        "{seen:?}"
+    );
+
+    let missing = dir.join("dxc/none.exe");
+    for (unix, said) in [
+        (
+            missing.to_str().unwrap(),
+            "VICTORY_PC_DXC_UNIX: no file at ",
+        ),
+        // A file there is, named from the repository's root.
+        (
+            "tools/macos/test-wine.sh",
+            "VICTORY_PC_DXC_UNIX must be an absolute path",
+        ),
+    ] {
+        let out = run(Some(unix));
+        assert_eq!(out.status.code(), Some(1), "{unix}");
+        assert!(text(&out.stderr).contains(said), "{}", text(&out.stderr));
+        assert!(!log.exists(), "{unix}: cargo was started");
+    }
+}
+
 /// What victory.sh starts Wine with, from stand-ins for cargo and wine in a
 /// home folder of the test's own.
 struct Launched {

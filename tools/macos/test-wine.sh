@@ -24,11 +24,13 @@
 #                             prebuilt bytecode is current, or the host can
 #                             compile clamp.hlsl; "skipped: the prebuilt
 #                             clamp bytecode is older than clamp.hlsl ...".
-#   VICTORY_REQUIRE_HLSL=1    a host HLSL compiler that builds the shaders
-#                             some device tests write themselves; Wine's
-#                             (vkd3d-shader) does not, so on a Mac this
-#                             fails those tests: "skipped: the host HLSL
-#                             compiler cannot build this test shader".
+#   VICTORY_REQUIRE_HLSL=1    a compiler that builds the shaders some
+#                             device tests write themselves; Wine's
+#                             (vkd3d-shader) does not, so on a Mac those
+#                             tests need the DXC that VICTORY_PC_DXC_UNIX
+#                             names (below); without one: "skipped: the
+#                             host HLSL compiler cannot build this test
+#                             shader", and this switch fails them.
 #   VICTORY_REQUIRE_WARP=1    the WARP software device, which D3DMetal does
 #                             not have; "skipped: no SM 6.6 WARP device".
 #   VICTORY_REQUIRE_DIFF=1    the console and PC shader compilers of the
@@ -38,8 +40,8 @@
 #   VICTORY_REQUIRE_PC_GPU=1  the PC hardware's results where D3DMetal is
 #                             known to give others (docs/macos.md, "Open
 #                             differences under D3DMetal"); "skipped:
-#                             D3DMetal ...". Fails four shader tests on a
-#                             Mac today.
+#                             D3DMetal ...". Fails four shader tests and
+#                             one of victory-gpu on a Mac today.
 #   VICTORY_REQUIRE_NTFS=1    a temporary folder on NTFS, for its limit of
 #                             hard links; "skipped: no NTFS link limit".
 #   VICTORY_REQUIRE_IDLE=1    a machine idle enough to start a thread
@@ -55,15 +57,18 @@
 #                             "skipped: Wine starts no git".
 #   VICTORY_REQUIRE_RECONNECT=1  a host that connects a socket again after
 #                             a refused attempt, which this Wine does not.
-# A run that is meant to prove something on a Mac sets these four:
+# A run that is meant to prove something on a Mac sets these five:
 #   VICTORY_DXIL_UNIX="$HOME/Library/Caches/victory-macos/dxc/v1.9.2609/dxil.dll" \
 #   VICTORY_REQUIRE_DXIL=1 VICTORY_REQUIRE_GPU=1 VICTORY_REQUIRE_CLAMP=1 \
 #   VICTORY_REQUIRE_DEPTH=1 \
+#   VICTORY_PC_DXC_UNIX="$HOME/Library/Caches/victory-macos/dxc/v1.9.2609/dxc.exe" \
+#   VICTORY_REQUIRE_HLSL=1 \
 #   tools/macos/test-wine.sh --workspace --no-fail-fast
 # and again with --release. Without them a machine with no device, no
-# validator or a stale clamp passes those tests without running them. The
-# other six name things a Mac does not have (HLSL, WARP, DIFF, PC_GPU, NTFS)
-# or cannot promise (IDLE).
+# validator, a stale clamp or no compiler for the tests' own shaders passes
+# those tests without running them. The others name things a Mac does not
+# have (WARP, DIFF, PC_GPU, NTFS, FIDELITYFX, POLICY, RECONNECT) or cannot
+# promise (IDLE).
 # The stand-in title and its DLLs (tests/fixtures) are built here, once, in
 # the profile the tests are built in, and VICTORY_FIXTURE_DIR tells the tests
 # where they are: cargo cannot be started inside Wine.
@@ -73,6 +78,13 @@
 # VICTORY_DXIL_UNIX names a dxil.dll (Microsoft's DXIL validator, kept
 # outside the repository) by its macOS path; the tests get it as
 # VICTORY_DXIL, the Z: path Wine knows it by.
+# VICTORY_PC_DXC_UNIX names a dxc.exe (Microsoft's DirectX Shader Compiler,
+# from the same release, with its dxcompiler.dll and dxil.dll beside it and
+# kept outside the repository as well) by its macOS path; the tests get it
+# as VICTORY_PC_DXC. victory-gpu's device tests that compile shaders of
+# their own have it build the ones Wine's D3DCompile refuses, as shader
+# model 6.0, and say so in one line that starts with "note: "; a host whose
+# D3DCompile builds them never starts it.
 # ROSETTA_ADVERTISE_AVX=1 is set for the tests unless the caller set the
 # variable: `victory run --execute` refuses a CPU without AVX2, and Rosetta 2
 # says it has AVX and AVX2 only to a process started with this variable.
@@ -156,6 +168,15 @@ if [ -n "${VICTORY_DXIL_UNIX:-}" ]; then
     esac
     VICTORY_DXIL="Z:$(printf '%s' "$VICTORY_DXIL_UNIX" | tr / '\\')"
     export VICTORY_DXIL
+fi
+if [ -n "${VICTORY_PC_DXC_UNIX:-}" ]; then
+    [ -f "$VICTORY_PC_DXC_UNIX" ] || { echo "VICTORY_PC_DXC_UNIX: no file at $VICTORY_PC_DXC_UNIX" >&2; exit 1; }
+    case "$VICTORY_PC_DXC_UNIX" in
+        /*) ;;
+        *) echo "VICTORY_PC_DXC_UNIX must be an absolute path" >&2; exit 1 ;;
+    esac
+    VICTORY_PC_DXC="Z:$(printf '%s' "$VICTORY_PC_DXC_UNIX" | tr / '\\')"
+    export VICTORY_PC_DXC
 fi
 export CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_RUNNER="$LINK"
 cargo build --quiet --locked --manifest-path tests/fixtures/Cargo.toml \
