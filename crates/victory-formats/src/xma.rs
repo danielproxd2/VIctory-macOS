@@ -1190,6 +1190,415 @@ mod tests {
         assert_eq!(c.next, None);
     }
 
+    /// A string of bits, MSB first.
+    #[derive(Default, Clone)]
+    struct BitString {
+        bytes: Vec<u8>,
+        bits: usize,
+    }
+
+    impl BitString {
+        fn put(&mut self, n: u32, value: u32) -> &mut Self {
+            self.bytes.resize((self.bits + n as usize).div_ceil(8), 0);
+            put_bits(&mut self.bytes, self.bits, n, value);
+            self.bits += n as usize;
+            self
+        }
+
+        fn bit(&self, i: usize) -> bool {
+            self.bytes[i / 8] >> (7 - i % 8) & 1 == 1
+        }
+    }
+
+    /// A frame: its 15-bit length, what `body` writes, then `tail` more bits
+    /// (at least the two FFmpeg expects after the last subframe), which no
+    /// decoder reads; they alternate so a walk that picks up the wrong bits
+    /// shows.
+    fn frame_bits(tail: usize, body: impl FnOnce(&mut BitString)) -> BitString {
+        let mut f = BitString::default();
+        f.put(LENGTH_BITS, 0);
+        body(&mut f);
+        for i in 0..tail {
+            f.put(1, (i % 3 == 0) as u32);
+        }
+        assert!(f.bits < 0x7fff, "a frame's length is 15 bits");
+        put_bits(&mut f.bytes, 0, LENGTH_BITS, f.bits as u32);
+        f
+    }
+
+    /// The frame header for a fixed layout of `FRAME_SAMPLES >> shift`
+    /// sample subframes in every channel: the tile header, no
+    /// post-processing transform, a zero gain and no trimming.
+    fn fixed_header(f: &mut BitString, channels: usize, shift: u32) {
+        f.put(1, 1);
+        let subframe = FRAME_SAMPLES >> shift;
+        let mut offset = 0;
+        while offset < FRAME_SAMPLES {
+            // The last smallest subframe's size is implied.
+            if offset != FRAME_SAMPLES - MIN_SUBFRAME {
+                match shift {
+                    0 => f.put(1, 0),
+                    _ => f.put(1, 1).put(1, shift - 1),
+                };
+            }
+            offset += subframe;
+        }
+        if channels > 1 {
+            f.put(1, 0);
+        }
+        f.put(8, 0).put(1, 0);
+    }
+
+    /// A subframe header up to its "coefficients follow" bits: no fill
+    /// bits, the reserved bit clear and, in stereo, left and right coded
+    /// as they are.
+    fn subframe_header(f: &mut BitString, channels: usize, transmit: bool) {
+        f.put(1, 0).put(1, 0);
+        if channels > 1 {
+            f.put(1, 0).put(1, 1).put(1, 0);
+        }
+        f.put(
+            channels as u32,
+            if transmit { (1 << channels) - 1 } else { 0 },
+        );
+    }
+
+    /// A frame that transmits no coefficients in any subframe.
+    fn silent_frame(channels: usize, shift: u32, tail: usize) -> BitString {
+        frame_bits(tail, |f| {
+            fixed_header(f, channels, shift);
+            for _ in 0..1 << shift {
+                subframe_header(f, channels, false);
+            }
+        })
+    }
+
+    /// Lays each stream's frames back to back into its own packets, the
+    /// streams' packets taking turns, and fills what is left of a stream's
+    /// last packet with ones. Returns the buffer and, per stream, the bit
+    /// each frame starts at.
+    fn packets(streams: &[Vec<BitString>]) -> (Vec<u8>, Vec<Vec<usize>>) {
+        const PAYLOAD: usize = PACKET_BITS - HEADER_BITS;
+        let count = |frames: &Vec<BitString>| {
+            frames
+                .iter()
+                .map(|f| f.bits)
+                .sum::<usize>()
+                .div_ceil(PAYLOAD)
+        };
+        let per_stream = count(&streams[0]);
+        assert!(streams.iter().all(|s| count(s) == per_stream));
+        let mut data = vec![0xffu8; per_stream * streams.len() * PACKET_BYTES];
+        let mut starts = vec![];
+        for (index, frames) in streams.iter().enumerate() {
+            // Where payload bit `p` of this stream is in the buffer.
+            let place = |p: usize| {
+                (p / PAYLOAD * streams.len() + index) * PACKET_BITS + HEADER_BITS + p % PAYLOAD
+            };
+            let mut begun = vec![(0u32, None); per_stream];
+            let mut at = 0;
+            let mut stream_starts = vec![];
+            for frame in frames {
+                let (n, first) = &mut begun[at / PAYLOAD];
+                *n += 1;
+                first.get_or_insert((at % PAYLOAD) as u32);
+                stream_starts.push(place(at));
+                for i in 0..frame.bits {
+                    let p = place(at + i);
+                    data[p / 8] &= !(1 << (7 - p % 8));
+                    data[p / 8] |= (frame.bit(i) as u8) << (7 - p % 8);
+                }
+                at += frame.bits;
+            }
+            for (packet, (frames, first)) in begun.into_iter().enumerate() {
+                let first = first.expect("a frame begins in every packet");
+                let header = frames << 26 | first << 11 | (streams.len() as u32 - 1);
+                let base = (packet * streams.len() + index) * PACKET_BYTES;
+                data[base..base + 4].copy_from_slice(&header.to_be_bytes());
+            }
+            starts.push(stream_starts);
+        }
+        (data, starts)
+    }
+
+    fn xorshift(seed: &mut u64) -> u64 {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        *seed
+    }
+
+    /// A frame that says no channel has coefficients in any subframe is
+    /// silence, whatever the subframe layout, and stays silence through the
+    /// overlap into the next frame.
+    #[test]
+    fn a_silent_frame_decodes_to_zeros() {
+        for channels in [1, 2] {
+            for rate in [24_000, 32_000, 44_100, 48_000] {
+                let mut decoder = Decoder::new(channels, rate);
+                assert_eq!(decoder.channels(), channels);
+                let mut pcm = vec![];
+                for shift in [0, 1, 2, 0, 2, 1] {
+                    let frame = silent_frame(channels, shift, 2);
+                    assert_eq!(
+                        decoder.decode(&frame.bytes, frame.bits, &mut pcm),
+                        Ok(()),
+                        "{channels} channels, {rate} Hz, subframes of {}",
+                        FRAME_SAMPLES >> shift
+                    );
+                }
+                decoder.flush(&mut pcm);
+                assert_eq!(
+                    pcm.len(),
+                    (6 * FRAME_SAMPLES + FRAME_SAMPLES / 2) * channels
+                );
+                assert!(pcm.iter().all(|&s| s == 0));
+            }
+        }
+    }
+
+    /// What the decoder refuses is an error by name, and the frame still
+    /// takes its time in the output: a frame of silence.
+    #[test]
+    fn a_refused_frame_is_an_error_and_a_frame_of_silence() {
+        let reserved = frame_bits(2, |f| {
+            fixed_header(f, 1, 0);
+            f.put(1, 0).put(1, 1).put(1, 0);
+        });
+        // 256 samples, then 512 more.
+        let long = frame_bits(2, |f| {
+            f.put(1, 1).put(2, 0b10).put(1, 0);
+        });
+        let silent = silent_frame(1, 0, 2);
+        let cut = (silent.bytes.clone(), silent.bits - 4);
+        let short_length = {
+            let mut f = silent.clone();
+            f.bytes[0] = 0;
+            f.bytes[1] &= 1;
+            put_bits(&mut f.bytes, 0, LENGTH_BITS, 20);
+            (f.bytes, f.bits)
+        };
+        for (what, (bytes, bits), error) in [
+            (
+                "reserved bit",
+                (reserved.bytes, reserved.bits),
+                "reserved bit",
+            ),
+            ("cut short", cut, "subframe overread"),
+            ("length field too small", short_length, "frame overread"),
+            ("empty", (vec![], 0), "tile header"),
+            (
+                "too many samples",
+                (long.bytes, long.bits),
+                "channel longer than a frame",
+            ),
+        ] {
+            let mut decoder = Decoder::new(1, 48_000);
+            let mut pcm = vec![];
+            assert_eq!(
+                decoder.decode(&bytes, bits, &mut pcm),
+                Err(Error(error)),
+                "{what}"
+            );
+            assert_eq!(pcm, vec![0i16; FRAME_SAMPLES], "{what}");
+        }
+    }
+
+    /// `reset` forgets the overlap and writes nothing; `flush` writes the
+    /// half frame of overlap, 256 samples per channel, and resets.
+    #[test]
+    fn reset_and_flush_append_their_fixed_sample_counts() {
+        for channels in [1, 2] {
+            let mut decoder = Decoder::new(channels, 44_100);
+            let mut pcm = vec![];
+            decoder.flush(&mut pcm);
+            assert_eq!(pcm.len(), FRAME_SAMPLES / 2 * channels, "a new decoder");
+
+            // Leave something in the overlap: noise after a header that
+            // transmits coefficients.
+            let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+            let mut left = false;
+            for _ in 0..64 {
+                let frame = frame_bits(600, |f| {
+                    fixed_header(f, channels, 0);
+                    subframe_header(f, channels, true);
+                    for _ in 0..40 {
+                        f.put(32, xorshift(&mut seed) as u32);
+                    }
+                });
+                pcm.clear();
+                let _ = decoder.decode(&frame.bytes, frame.bits, &mut pcm);
+                assert_eq!(pcm.len(), FRAME_SAMPLES * channels);
+                left = decoder.ch.iter().any(|c| c.out.iter().any(|&v| v != 0.0));
+                if left {
+                    break;
+                }
+            }
+            assert!(left, "no frame of the 64 left an overlap");
+
+            let mut copy = decoder.clone();
+            pcm.clear();
+            copy.flush(&mut pcm);
+            assert_eq!(pcm.len(), FRAME_SAMPLES / 2 * channels);
+            assert!(pcm.iter().any(|&s| s != 0), "the overlap comes out");
+            // Flushed, there is nothing left to flush.
+            pcm.clear();
+            copy.flush(&mut pcm);
+            assert_eq!(pcm, vec![0i16; FRAME_SAMPLES / 2 * channels]);
+
+            // Reset writes nothing, and what follows starts from silence.
+            pcm.clear();
+            decoder.reset();
+            assert!(pcm.is_empty());
+            let silent = silent_frame(channels, 0, 2);
+            assert_eq!(decoder.decode(&silent.bytes, silent.bits, &mut pcm), Ok(()));
+            decoder.flush(&mut pcm);
+            assert_eq!(
+                pcm,
+                vec![0i16; (FRAME_SAMPLES + FRAME_SAMPLES / 2) * channels]
+            );
+        }
+    }
+
+    /// Random bytes, random bit counts (short of the buffer, past it), and
+    /// frames that are well formed up to their coefficients and noise from
+    /// there, 200 in a row through one decoder so what it keeps between
+    /// frames (overlap, scale factors, steps) piles up: every call returns,
+    /// and adds exactly one frame of samples.
+    #[test]
+    fn decoder_noise_never_panics_and_keeps_the_frame_size() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let (mut accepted, mut refused) = (0, 0);
+        for channels in [1usize, 2] {
+            for rate in [24_000, 32_000, 44_100, 48_000] {
+                let mut decoder = Decoder::new(channels, rate);
+                let mut pcm = vec![];
+                for round in 0..200usize {
+                    let len = xorshift(&mut seed) as usize % 4097;
+                    let mut data: Vec<u8> = (0..len).map(|_| xorshift(&mut seed) as u8).collect();
+                    let mut bits = match round % 4 {
+                        0 => len * 8,
+                        1 => xorshift(&mut seed) as usize % (len * 8 + 1),
+                        2 => len * 8 + xorshift(&mut seed) as usize % 4096,
+                        _ => xorshift(&mut seed) as usize % 0x8000,
+                    };
+                    if round % 2 == 1 {
+                        // Well formed as far as the first subframe's
+                        // coefficients; the noise is the rest.
+                        let shift = (round / 2 % 3) as u32;
+                        let head = frame_bits(0, |f| {
+                            fixed_header(f, channels, shift);
+                            subframe_header(f, channels, true);
+                            if round % 4 == 1 {
+                                // Every coefficient is vector coded.
+                                f.put(1, 0);
+                            }
+                        });
+                        data.resize(data.len().max(head.bytes.len()), 0);
+                        for i in 0..head.bits {
+                            data[i / 8] &= !(1 << (7 - i % 8));
+                            data[i / 8] |= (head.bit(i) as u8) << (7 - i % 8);
+                        }
+                        bits = data.len() * 8;
+                        let length = (bits as u32).min(0x7ffe);
+                        data[0] = 0;
+                        data[1] &= 1;
+                        put_bits(&mut data, 0, LENGTH_BITS, length);
+                    }
+                    let before = pcm.len();
+                    match decoder.decode(&data, bits, &mut pcm) {
+                        Ok(()) => accepted += 1,
+                        Err(_) => refused += 1,
+                    }
+                    assert_eq!(
+                        pcm.len() - before,
+                        FRAME_SAMPLES * channels,
+                        "{channels} channels, {rate} Hz, round {round}"
+                    );
+                }
+                decoder.flush(&mut pcm);
+                assert_eq!(
+                    pcm.len(),
+                    (200 * FRAME_SAMPLES + FRAME_SAMPLES / 2) * channels
+                );
+            }
+        }
+        // Both ways out were taken, so the frames got past their headers.
+        assert!(
+            accepted > 0 && refused > 0,
+            "{accepted} accepted, {refused} refused"
+        );
+    }
+
+    /// Two streams in one buffer, their packets taking turns, each header
+    /// saying one packet of the other stream follows. The mono stream has a
+    /// frame that starts in its first packet and ends in its second, with
+    /// the other stream's packet between; the stereo stream has a frame
+    /// that ends exactly where its packet does. Each walk gives its own
+    /// stream's frames, bit for bit and in order, and stops at the padding
+    /// after the last.
+    #[test]
+    fn interleaved_streams_with_a_header_skip_walk_in_order() {
+        const PAYLOAD: usize = PACKET_BITS - HEADER_BITS;
+        let mono = vec![
+            silent_frame(1, 0, 2),
+            silent_frame(1, 2, PAYLOAD),
+            silent_frame(1, 1, 300),
+            silent_frame(1, 0, 2),
+        ];
+        let first = silent_frame(2, 0, 2).bits;
+        let fill = silent_frame(2, 1, 2).bits;
+        let stereo = vec![
+            silent_frame(2, 0, 2),
+            // Ends on the last bit of the packet.
+            silent_frame(2, 1, 2 + PAYLOAD - first - fill),
+            silent_frame(2, 2, 2),
+            silent_frame(2, 0, 1000),
+        ];
+        assert_eq!(stereo[0].bits + stereo[1].bits, PAYLOAD);
+        let streams = [mono, stereo];
+        let (data, starts) = packets(&streams);
+        assert_eq!(data.len(), 4 * PACKET_BYTES);
+        for index in 0..4 {
+            assert_eq!(packet(&data, index).unwrap().skip, 1);
+        }
+        // The long mono frame starts in packet 0 and ends in packet 2.
+        assert_eq!(starts[0][1] / PACKET_BITS, 0);
+        assert_eq!(starts[0][2] / PACKET_BITS, 2);
+        assert_eq!(packet(&data, 2).unwrap().frames, 2);
+        assert_ne!(packet(&data, 2).unwrap().first_frame_bit, 0);
+        // The stereo stream's third frame starts its second packet.
+        assert_eq!(starts[1][2], 3 * PACKET_BITS + HEADER_BITS);
+
+        for (index, frames) in streams.iter().enumerate() {
+            let channels = index + 1;
+            let header = packet(&data, index).unwrap();
+            let mut at = Some(index * PACKET_BITS + HEADER_BITS + header.first_frame_bit as usize);
+            let mut decoder = Decoder::new(channels, 48_000);
+            let mut pcm = vec![];
+            for (number, built) in frames.iter().enumerate() {
+                let start = at.unwrap_or_else(|| panic!("stream {index}: no frame {number}"));
+                assert_eq!(
+                    start, starts[index][number],
+                    "stream {index} frame {number}"
+                );
+                let frame = read_frame(&data, start).expect("a frame");
+                assert_eq!((frame.start, frame.bits), (start, built.bits));
+                assert!(
+                    frame.data == built.bytes,
+                    "stream {index} frame {number}: bits"
+                );
+                assert_eq!(decoder.decode(&frame.data, frame.bits, &mut pcm), Ok(()));
+                at = frame.next;
+            }
+            assert_eq!(at, None, "stream {index}: nothing after the last frame");
+            assert_eq!(pcm, vec![0i16; frames.len() * FRAME_SAMPLES * channels]);
+            // The padding is not a frame.
+            let end = starts[index][frames.len() - 1] + frames[frames.len() - 1].bits;
+            assert!(read_frame(&data, end).is_none());
+        }
+    }
+
     /// Walks and decodes saved input buffers (`VICTORY_XMA_STREAMS=<dir>` of
     /// `*.xma` files with their `*.ctx` context words, made outside the
     /// repository): the frames walked from the first packet must be the
@@ -1237,22 +1646,45 @@ mod tests {
 
     /// Decodes a stream's packets and compares with a reference decode of
     /// the same file (16-bit PCM): `VICTORY_XMA_REFERENCE=<dir>` holding
-    /// `mono.xmadata`/`mono.ref` and `stereo.xmadata`/`stereo.ref` (made
-    /// outside the repository).
+    /// pairs named for their layout and sample rate, `mono-48000.xmadata`
+    /// with `mono-48000.ref`, `stereo-32000.xmadata` and so on (made outside
+    /// the repository).
     #[test]
     #[ignore = "needs reference files outside the repository"]
     fn matches_a_reference_decoder() {
         let dir = std::path::PathBuf::from(std::env::var("VICTORY_XMA_REFERENCE").unwrap());
-        for (name, channels) in [("mono", 1), ("stereo", 2)] {
-            let data = std::fs::read(dir.join(format!("{name}.xmadata"))).unwrap();
-            let reference: Vec<i16> = std::fs::read(dir.join(format!("{name}.ref")))
+        let mut cases = 0;
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|e| e != "xmadata") {
+                continue;
+            }
+            let name = path.file_stem().unwrap().to_str().unwrap().to_owned();
+            let (layout, rate) = name
+                .split_once('-')
+                .unwrap_or_else(|| panic!("{name}: expected <mono|stereo>-<rate>"));
+            let channels = match layout {
+                "mono" => 1,
+                "stereo" => 2,
+                _ => panic!("{name}: expected mono or stereo"),
+            };
+            let rate: u32 = rate
+                .parse()
+                .unwrap_or_else(|_| panic!("{name}: expected a sample rate"));
+            assert!(
+                [24_000, 32_000, 44_100, 48_000].contains(&rate),
+                "{name}: not an XMA sample rate"
+            );
+            cases += 1;
+            let data = std::fs::read(&path).unwrap();
+            let reference: Vec<i16> = std::fs::read(path.with_extension("ref"))
                 .unwrap()
                 .as_chunks::<2>()
                 .0
                 .iter()
                 .map(|&b| i16::from_le_bytes(b))
                 .collect();
-            let mut decoder = Decoder::new(channels, 48_000);
+            let mut decoder = Decoder::new(channels, rate);
             let mut pcm = Vec::new();
             let mut at = Some(HEADER_BITS + packet(&data, 0).unwrap().first_frame_bit as usize);
             let mut errors = 0;
@@ -1280,5 +1712,9 @@ mod tests {
             );
             assert!(errors == 0 && snr > 40.0);
         }
+        assert!(
+            cases > 0,
+            "VICTORY_XMA_REFERENCE contains no .xmadata files"
+        );
     }
 }
