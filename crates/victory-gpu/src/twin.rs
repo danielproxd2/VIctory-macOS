@@ -658,7 +658,8 @@ mod tests {
     /// (measured: "E5005: Method 'Load' is not defined on type
     /// 'RWByteAddressBuffer'"): there, and only there, the test says
     /// "skipped" with the compiler's text, or fails with
-    /// `VICTORY_REQUIRE_HLSL=1`.
+    /// `VICTORY_REQUIRE_HLSL=1`, unless the run names a DXC to build the
+    /// source in that compiler's place (`crate::testing::built_by_dxc`).
     #[test]
     fn the_systems_compiler_builds_the_depth_conversion() {
         let test = "twin::the_systems_compiler_builds_the_depth_conversion";
@@ -674,7 +675,16 @@ mod tests {
             Err((e, text)) => {
                 let text = format!("{e}: {}", text.trim_end_matches(['\0', '\n', '\r']));
                 assert!(crate::test_support::under_wine(), "{test}: {text}");
-                crate::test_support::no_hlsl(test, &text);
+                // With a DXC named for the run (`VICTORY_PC_DXC`), the
+                // same source as that compiler builds it, held to the same:
+                // its root signature inside, and the host takes it.
+                let stage = (c"main", c"cs_5_1");
+                let built = crate::testing::built_by_dxc(test, SOURCE, stage, 0, true, &text);
+                if let Some(bytes) = built {
+                    assert!(crate::root::holds_a_root_signature(&bytes), "no RTS0 part");
+                    let made = from_bytecode(&host.device, &bytes).map(|_| ());
+                    assert_eq!(made, Ok(()));
+                }
             }
         }
     }
