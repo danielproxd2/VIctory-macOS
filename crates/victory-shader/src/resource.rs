@@ -3650,7 +3650,15 @@ pub(crate) mod tests {
         let r = global_load_at_sum(false).unwrap();
         assert_eq!((r.scalar[0].1.param, r.scalar[0].1.offset), (0, 0));
         assert!(r.scalar[0].1.dynamic.is_some());
-        // The sum clamps at 2^32 - 1: it is not base + index.
-        assert!(global_load_at_sum(true).is_err());
+        // The sum clamps at 2^32 - 1: it is not base + index, so the load
+        // is not one of parameter 0's table at a computed index. An
+        // address that is traced to no root parameter is title memory at
+        // whatever the program computed ([`MEMORY`]).
+        let r = global_load_at_sum(true).unwrap();
+        let address = r.scalar[0].1;
+        assert_eq!(
+            (address.param, address.offset, address.dynamic),
+            (MEMORY, 0, None)
+        );
     }
 }
