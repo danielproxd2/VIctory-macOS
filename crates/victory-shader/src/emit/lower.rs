@@ -86,6 +86,17 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
             what: "a thread group size outside the D3D12 limits",
         });
     }
+    // A mesh program's shared memory is declared in dwords and written to
+    // PSV0 in bytes again: a size within three bytes of 4 GiB has no such
+    // rounded size.
+    if let StageIo::Ms(ms) = &parts.native.io
+        && ms.lds_bytes.checked_next_multiple_of(4).is_none()
+    {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "a mesh shader's shared memory size past 32 bits",
+        });
+    }
     let mut bad = HashMap::new();
     loop {
         match Lower::new(parts, &bad).run() {

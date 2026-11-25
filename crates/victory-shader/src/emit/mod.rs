@@ -1152,6 +1152,43 @@ mod tests {
         testkit::container(&program, &[], osg1)
     }
 
+    /// A mesh program's shared-memory size is a dword of the title's
+    /// container. It is rounded up to dwords for the module and multiplied
+    /// back to bytes for PSV0: within three bytes of 4 GiB that product
+    /// overflowed (a panic with overflow checks, a size of 0 in PSV0
+    /// without; found by random-input testing). Such a size is refused.
+    #[test]
+    fn a_mesh_shared_memory_size_past_32_bits_is_refused() {
+        let translate = |lds_bytes: u32| {
+            let program = NativeProgram {
+                wave64: false,
+                vgprs: 8,
+                io: StageIo::Ms(crate::native::MeshIo {
+                    outputs: vec![],
+                    clip_cntl: 0,
+                    threads: 32,
+                    max_vertices: 24,
+                    max_primitives: 16,
+                    topology: 2,
+                    lds_bytes,
+                }),
+                ..testkit::bare_program(HwStage::Ms, &asm::bytes(&[asm::S_ENDPGM]))
+            };
+            translate(&testkit::container(&program, &[], &[])).map(|s| s.stage)
+        };
+        let refused = Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "a mesh shader's shared memory size past 32 bits",
+        });
+        for lds_bytes in [u32::MAX, u32::MAX - 1, u32::MAX - 2] {
+            assert_eq!(translate(lds_bytes), refused, "{lds_bytes:#x}");
+        }
+        // The largest size that rounds, and sizes a program has.
+        for lds_bytes in [u32::MAX - 3, 16, 0] {
+            assert_eq!(translate(lds_bytes), Ok(HwStage::Ms), "{lds_bytes:#x}");
+        }
+    }
+
     /// A signature row for the two tests below: `system_value` is the
     /// `D3D_NAME`, `component` 1 for uint and 3 for float.
     fn row(
