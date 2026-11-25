@@ -570,9 +570,10 @@ mod tests {
         let (base, size) = (image.base, image.info.size_of_image as usize);
         // Memory of ours that is not the image's: it must not be read as
         // the index, nor set to 0.
-        let ours = 3u32;
+        // A `Cell`, so that the check below reads memory and not a constant.
+        let ours = std::cell::Cell::new(3u32);
         let outside = [
-            &raw const ours as usize,
+            ours.as_ptr() as usize,
             base - 4,
             base + size,
             base + size - 3,
@@ -586,7 +587,7 @@ mod tests {
             );
             assert_eq!(image.refusal(), expected);
         }
-        assert_eq!(ours, 3);
+        assert_eq!(std::hint::black_box(&ours).get(), 3);
         assert_eq!(image.code(), title_code(), "nothing was patched");
     }
 
