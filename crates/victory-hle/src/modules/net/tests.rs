@@ -2,19 +2,24 @@
 //! that is refused before the host hears of it. Nothing in this file
 //! opens a connection to another machine.
 
-use std::net::{Ipv4Addr, TcpListener};
+use std::net::{Ipv4Addr, Ipv6Addr, TcpListener, UdpSocket};
+use std::time::Duration;
 
+use victory_loader::Provenance;
 use victory_pe::ImportSymbol;
 use windows_sys::Win32::Foundation::GetLastError;
 
-use super::addr::AF_INET;
+use super::addr::{AF_INET, AF_INET6};
 use super::*;
 
 const WSAECONNREFUSED: i32 = 10061;
+const ERROR_INVALID_HANDLE: u32 = 6;
 
 // TEST-NET-1 (192.0.2.0/24): never routed, and never tried here.
 const AWAY: [u8; 4] = [192, 0, 2, 1];
 const HOME: [u8; 4] = [127, 0, 0, 1];
+/// The documentation prefix 2001:db8::/32: never routed, never tried.
+const AWAY6: [u8; 16] = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
 
 const STREAM: i32 = 1;
 const DATAGRAM: i32 = 2;
@@ -27,8 +32,23 @@ fn v4(ip: [u8; 4], port: u16) -> [u8; 16] {
     a
 }
 
+fn v6(ip: [u8; 16], port: u16) -> [u8; 28] {
+    let mut a = [0u8; 28];
+    a[..2].copy_from_slice(&AF_INET6.to_le_bytes());
+    a[2..4].copy_from_slice(&port.to_be_bytes());
+    a[8..24].copy_from_slice(&ip);
+    a
+}
+
 fn utf16(text: &str) -> Vec<u16> {
     text.encode_utf16().chain([0]).collect()
+}
+
+fn named(name: &str) -> ImportSymbol {
+    ImportSymbol::Name {
+        hint: 0,
+        name: name.into(),
+    }
 }
 
 /// A loopback listener. Making it also starts Winsock for the raw calls
@@ -101,6 +121,11 @@ fn refusing() -> u16 {
 fn win32_error() -> u32 {
     // SAFETY: no arguments.
     unsafe { GetLastError() }
+}
+
+fn clear_win32_error() {
+    // SAFETY: no pointers.
+    unsafe { SetLastError(0) };
 }
 
 /// The DLL a title imports `export` of `module` from.
@@ -306,6 +331,309 @@ fn every_override_names_an_export_of_its_dll() {
     }
 }
 
+/// What a title's import is bound to, by name: ours where a call could
+/// leave the machine, the host's own for the rest of the same DLLs.
+#[test]
+fn imports_that_could_leave_the_machine_are_ours() {
+    let resolver = crate::HleResolver::default();
+    for (dll, name) in [
+        ("ws2_32.dll", "connect"),
+        ("WS2_32.dll", "WSAConnectByList"),
+        ("ws2_32.dll", "GetAddrInfoExA"),
+        ("ws2_32.dll", "FreeAddrInfoEx"),
+        ("ws2_32.dll", "WSASendMsg"),
+        ("winhttp.dll", "WinHttpOpen"),
+    ] {
+        assert_eq!(
+            resolver.classify(dll, &named(name)),
+            Some(Provenance::Hle),
+            "{dll}!{name}"
+        );
+    }
+    for (dll, name) in [
+        ("ws2_32.dll", "recv"),
+        ("ws2_32.dll", "FreeAddrInfoExW"),
+        ("iphlpapi.dll", "IcmpCreateFile"),
+        ("iphlpapi.dll", "GetAdaptersAddresses"),
+        ("crypt32.dll", "CertOpenStore"),
+        ("crypt32.dll", "CertFreeCertificateChain"),
+        (
+            "api-ms-win-core-winrt-string-l1-1-0.dll",
+            "WindowsCreateString",
+        ),
+    ] {
+        assert_eq!(
+            resolver.classify(dll, &named(name)),
+            Some(Provenance::Host),
+            "{dll}!{name}"
+        );
+    }
+    // The Winsock ordinals are Winsock's: number 4 of another DLL is not
+    // our `connect`.
+    for dll in [
+        "iphlpapi.dll",
+        "crypt32.dll",
+        "api-ms-win-core-winrt-l1-1-0.dll",
+    ] {
+        assert_ne!(
+            resolver.classify(dll, &ImportSymbol::Ordinal(4)),
+            Some(Provenance::Hle),
+            "{dll} #4"
+        );
+    }
+    assert_eq!(
+        resolver.classify("ws2_32.dll", &ImportSymbol::Ordinal(4)),
+        Some(Provenance::Hle)
+    );
+}
+
+#[test]
+fn bind_any_is_narrowed_to_loopback() {
+    let _winsock = listener();
+    let s = Sock::new(AF_INET, STREAM);
+    assert_eq!(bind(s.0, v4([0; 4], 0).as_ptr(), 16), 0);
+    let local = s.local().unwrap();
+    assert_eq!(local.ip(), IpAddr::from(HOME));
+    assert_ne!(local.port(), 0);
+
+    // A loopback address is bound as the title gave it.
+    let s = Sock::new(AF_INET, DATAGRAM);
+    assert_eq!(bind(s.0, v4(HOME, 0).as_ptr(), 16), 0);
+    assert_eq!(s.local().map(|a| a.ip()), Some(IpAddr::from(HOME)));
+
+    let s = Sock::try_new(AF_INET6, STREAM);
+    if s.0 == INVALID_SOCKET {
+        crate::testing::skip("no IPv6 sockets on this host");
+        return;
+    }
+    assert_eq!(bind(s.0, v6([0; 16], 0).as_ptr(), 28), 0);
+    assert_eq!(
+        s.local().map(|a| a.ip()),
+        Some(IpAddr::from(Ipv6Addr::LOCALHOST))
+    );
+}
+
+#[test]
+fn bind_elsewhere_is_refused() {
+    let _winsock = listener();
+    let s = Sock::new(AF_INET, STREAM);
+    let refused = |name: &[u8], len: i32| {
+        wsa_error(0);
+        (bind(s.0, name.as_ptr(), len), last_error())
+    };
+    let no = (SOCKET_ERROR, WSAEADDRNOTAVAIL);
+    assert_eq!(refused(&v4(AWAY, 0), 16), no);
+    assert_eq!(refused(&v4([10, 0, 0, 1], 8080), 16), no);
+    assert_eq!(refused(&v6(AWAY6, 0), 28), no);
+    // Not an address we can read: another family, or cut short.
+    let mut other = [0u8; 28];
+    other[0] = 1;
+    assert_eq!(refused(&other, 28), no);
+    assert_eq!(refused(&v4(HOME, 0), 15), no);
+    // The socket was never bound.
+    assert_eq!(s.local(), None);
+}
+
+#[test]
+fn wsa_connect_and_join_leaf_away_are_refused() {
+    let (listener, port) = listener();
+    let null = std::ptr::null_mut::<c_void>();
+    let s = Sock::new(AF_INET, STREAM);
+
+    wsa_error(0);
+    assert_eq!(
+        WSAConnect(s.0, v4(AWAY, 80).as_ptr(), 16, null, null, null, null),
+        SOCKET_ERROR
+    );
+    assert_eq!(last_error(), WSAENETUNREACH);
+
+    wsa_error(0);
+    assert_eq!(
+        WSAConnect(s.0, v6(AWAY6, 80).as_ptr(), 28, null, null, null, null),
+        SOCKET_ERROR
+    );
+    assert_eq!(last_error(), WSAENETUNREACH);
+
+    wsa_error(0);
+    assert_eq!(
+        WSAJoinLeaf(s.0, v4(AWAY, 80).as_ptr(), 16, null, null, null, null, 0),
+        INVALID_SOCKET
+    );
+    assert_eq!(last_error(), WSAENETUNREACH);
+
+    // By name: a name needs a lookup, an address a route.
+    let by_name = |node: &str| {
+        let (node, service) = (utf16(node), utf16("80"));
+        wsa_error(0);
+        let n = std::ptr::null_mut();
+        let connected = WSAConnectByNameW(
+            s.0,
+            node.as_ptr(),
+            service.as_ptr(),
+            n,
+            null,
+            n,
+            null,
+            null,
+            null,
+        );
+        (connected, last_error())
+    };
+    assert_eq!(by_name("example.com"), (0, WSAHOST_NOT_FOUND));
+    assert_eq!(by_name("192.0.2.1"), (0, WSAENETUNREACH));
+    assert_eq!(by_name("2001:db8::1"), (0, WSAENETUNREACH));
+    wsa_error(0);
+    let n = std::ptr::null_mut();
+    assert_eq!(
+        WSAConnectByNameA(
+            s.0,
+            c"192.0.2.1".as_ptr(),
+            c"80".as_ptr(),
+            n,
+            null,
+            n,
+            null,
+            null,
+            null
+        ),
+        0
+    );
+    assert_eq!(last_error(), WSAENETUNREACH);
+
+    // None of that reached the listener; a loopback connect does.
+    assert!(!connected(&listener));
+    assert_eq!(
+        WSAConnect(s.0, v4(HOME, port).as_ptr(), 16, null, null, null, null),
+        0
+    );
+    assert!(connected(&listener));
+}
+
+/// A `WSABUF`.
+#[repr(C)]
+struct Buffer {
+    len: u32,
+    bytes: *const u8,
+}
+
+/// A `WSAMSG`.
+#[repr(C)]
+struct Message {
+    name: *const u8,
+    name_len: i32,
+    buffers: *const Buffer,
+    buffer_count: u32,
+    control: Buffer,
+    flags: u32,
+}
+
+#[test]
+fn udp_sends_away_are_refused() {
+    let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+    receiver
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let port = receiver.local_addr().unwrap().port();
+    let received = || {
+        let mut datagram = [0u8; 8];
+        let n = receiver.recv(&mut datagram).unwrap();
+        datagram[..n].to_vec()
+    };
+    let null = std::ptr::null_mut::<c_void>();
+    let u = Sock::new(AF_INET, DATAGRAM);
+    let (away, home) = (v4(AWAY, 9), v4(HOME, port));
+
+    let send_to = |bytes: &'static [u8], to: &[u8; 16]| {
+        let buffer = Buffer {
+            len: bytes.len() as u32,
+            bytes: bytes.as_ptr(),
+        };
+        let mut sent = 0u32;
+        wsa_error(0);
+        let result = WSASendTo(
+            u.0,
+            (&raw const buffer).cast(),
+            1,
+            &mut sent,
+            0,
+            to.as_ptr(),
+            16,
+            null,
+            null,
+        );
+        (result, sent, last_error())
+    };
+    assert_eq!(send_to(b"a", &away), (SOCKET_ERROR, 0, WSAENETUNREACH));
+    assert_eq!(send_to(b"b", &home), (0, 1, 0));
+    assert_eq!(received(), b"b");
+
+    let send_message = |bytes: &'static [u8], to: &[u8; 16]| {
+        let buffer = Buffer {
+            len: bytes.len() as u32,
+            bytes: bytes.as_ptr(),
+        };
+        let message = Message {
+            name: to.as_ptr(),
+            name_len: 16,
+            buffers: &buffer,
+            buffer_count: 1,
+            control: Buffer {
+                len: 0,
+                bytes: std::ptr::null(),
+            },
+            flags: 0,
+        };
+        let mut sent = 0u32;
+        wsa_error(0);
+        let result = WSASendMsg(u.0, (&raw const message).cast(), 0, &mut sent, null, null);
+        (result, sent, last_error())
+    };
+    assert_eq!(send_message(b"c", &away), (SOCKET_ERROR, 0, WSAENETUNREACH));
+    assert_eq!(send_message(b"d", &home), (0, 1, 0));
+    // Nothing refused arrived in between.
+    assert_eq!(received(), b"d");
+
+    // `WSASendMsg` as `WSAIoctl` hands it out is the vetted one.
+    let (mut f, mut size) = (0usize, 0u32);
+    let guid = WSAID_WSASENDMSG;
+    let got = WSAIoctl(
+        u.0,
+        SIO_GET_EXTENSION_FUNCTION_POINTER,
+        (&raw const guid).cast(),
+        16,
+        (&raw mut f).cast(),
+        8,
+        &mut size,
+        null,
+        null,
+    );
+    assert_eq!((got, f), (0, WSASendMsg as *const () as usize));
+}
+
+/// The multi-pointer query would hand out Registered I/O, whose sends
+/// take any address.
+#[test]
+fn multiple_extension_pointers_are_refused() {
+    let _winsock = listener();
+    let s = Sock::new(AF_INET, STREAM);
+    let null = std::ptr::null_mut::<c_void>();
+    let (mut table, mut size) = ([0usize; 16], 0u32);
+    wsa_error(0);
+    let got = WSAIoctl(
+        s.0,
+        SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER,
+        null,
+        0,
+        table.as_mut_ptr().cast(),
+        128,
+        &mut size,
+        null,
+        null,
+    );
+    assert_eq!((got, last_error()), (SOCKET_ERROR, WSAEINVAL));
+    assert_eq!((table, size), ([0; 16], 0));
+}
+
 /// The loopback addresses of an `ADDRINFOEX` list, of either encoding.
 fn addresses(list: *const c_void) -> Vec<SocketAddr> {
     let mut found = Vec::new();
@@ -319,6 +647,153 @@ fn addresses(list: *const c_void) -> Vec<SocketAddr> {
 }
 
 const NS_DNS: u32 = 12;
+
+#[test]
+fn name_lookups_only_know_loopback() {
+    let _winsock = listener();
+    let null = std::ptr::null_mut::<c_void>();
+    let no = std::ptr::null::<c_void>();
+
+    // `GetAddrInfoExW`.
+    let lookup = |name: &str| {
+        let name = utf16(name);
+        let mut list = null;
+        let code = GetAddrInfoExW(
+            name.as_ptr(),
+            std::ptr::null(),
+            NS_DNS,
+            no,
+            no,
+            &mut list,
+            no,
+            null,
+            no,
+            std::ptr::null_mut(),
+        );
+        let found = addresses(list);
+        if !list.is_null() {
+            host!("ws2_32.dll", "FreeAddrInfoExW": extern "system" fn(*mut c_void))(list);
+        }
+        (code, found)
+    };
+    assert_eq!(lookup("example.com"), (WSAHOST_NOT_FOUND, vec![]));
+    assert_eq!(lookup("www.example.com."), (WSAHOST_NOT_FOUND, vec![]));
+    let (code, found) = lookup("localhost");
+    assert_eq!(code, 0);
+    assert!(!found.is_empty());
+    assert!(found.iter().all(|a| loopback(a.ip())), "{found:?}");
+    // A literal needs no lookup; connecting to it is vetted separately.
+    let (code, found) = lookup("192.0.2.1");
+    assert_eq!(code, 0);
+    assert!(!found.is_empty());
+    assert!(found.iter().all(|a| *a == (AWAY, 0).into()), "{found:?}");
+
+    // `gethostbyname`.
+    wsa_error(0);
+    assert!(gethostbyname(c"example.com".as_ptr()).is_null());
+    assert_eq!(last_error(), WSAHOST_NOT_FOUND);
+    /// A `hostent`.
+    #[repr(C)]
+    struct HostEntry {
+        name: *const c_char,
+        aliases: *const *const c_char,
+        kind: i16,
+        length: i16,
+        addresses: *const *const u8,
+    }
+    let entry = gethostbyname(c"localhost".as_ptr()).cast::<HostEntry>();
+    // SAFETY: the host's `hostent` for this thread, or null.
+    let entry = unsafe { entry.as_ref() }.expect("localhost");
+    assert_eq!((entry.kind, entry.length), (AF_INET as i16, 4));
+    // SAFETY: a null-terminated list of 4-byte addresses, not empty.
+    let first = unsafe { (*entry.addresses).cast::<[u8; 4]>().read_unaligned() };
+    assert!(loopback(Ipv4Addr::from(first).into()), "{first:?}");
+
+    // The asynchronous forms: no task is started.
+    let mut buffer = [0 as c_char; 1024];
+    wsa_error(0);
+    assert!(
+        WSAAsyncGetHostByName(
+            null,
+            0x0400,
+            c"example.com".as_ptr(),
+            buffer.as_mut_ptr(),
+            1024
+        )
+        .is_null()
+    );
+    assert_eq!(last_error(), WSAHOST_NOT_FOUND);
+    wsa_error(0);
+    assert!(
+        WSAAsyncGetHostByAddr(
+            null,
+            0x0400,
+            AWAY.as_ptr().cast(),
+            4,
+            AF_INET.into(),
+            buffer.as_mut_ptr(),
+            1024
+        )
+        .is_null()
+    );
+    assert_eq!(last_error(), WSAHOST_NOT_FOUND);
+
+    // Name-space queries find nothing.
+    let mut query = null;
+    wsa_error(0);
+    assert_eq!(WSALookupServiceBeginA(no, 0, &mut query), SOCKET_ERROR);
+    assert_eq!(last_error(), WSASERVICE_NOT_FOUND);
+    wsa_error(0);
+    assert_eq!(WSALookupServiceBeginW(no, 0x0FF0, &mut query), SOCKET_ERROR);
+    assert_eq!(last_error(), WSASERVICE_NOT_FOUND);
+    assert!(query.is_null());
+
+    // `GetNameInfoW`: numeric, as with no network, unless a name is required.
+    let away = v4(AWAY, 80);
+    let mut text = [0u16; 64];
+    assert_eq!(
+        GetNameInfoW(
+            away.as_ptr(),
+            16,
+            text.as_mut_ptr(),
+            64,
+            std::ptr::null_mut(),
+            0,
+            0
+        ),
+        0
+    );
+    assert_eq!(wide(text.as_ptr()).as_deref(), Some("192.0.2.1"));
+    wsa_error(0);
+    assert_eq!(
+        GetNameInfoW(
+            away.as_ptr(),
+            16,
+            text.as_mut_ptr(),
+            64,
+            std::ptr::null_mut(),
+            0,
+            NI_NAMEREQD
+        ),
+        WSAHOST_NOT_FOUND
+    );
+    assert_eq!(last_error(), WSAHOST_NOT_FOUND);
+    // Only the service was asked for: nothing to look up.
+    let mut service = [0u16; 16];
+    assert_eq!(
+        GetNameInfoW(
+            away.as_ptr(),
+            16,
+            std::ptr::null_mut(),
+            0,
+            service.as_mut_ptr(),
+            16,
+            0x08 // NI_NUMERICSERV
+        ),
+        0
+    );
+    assert_eq!(wide(service.as_ptr()).as_deref(), Some("80"));
+}
 
 /// A `SOCKET_ADDRESS_LIST` of `N`.
 #[repr(C)]
@@ -690,4 +1165,159 @@ fn get_addr_info_ex_a_resolves_localhost_and_frees() {
         assert_eq!((code, last_error()), (WSAHOST_NOT_FOUND, WSAHOST_NOT_FOUND));
         assert!(list.is_null());
     }
+}
+
+/// What the stand-in for the host's `WinHttpOpen` was asked for.
+static OPENED: Mutex<Vec<Opened>> = Mutex::new(Vec::new());
+
+/// The agent, access type, proxy, bypass list and flags of one call.
+type Opened = (usize, u32, usize, usize, u32);
+
+extern "system" fn recording_open(
+    agent: *const u16,
+    access: u32,
+    proxy: *const u16,
+    bypass: *const u16,
+    flags: u32,
+) -> Handle {
+    let mut opened = OPENED.lock().unwrap_or_else(|e| e.into_inner());
+    opened.push((
+        agent as usize,
+        access,
+        proxy as usize,
+        bypass as usize,
+        flags,
+    ));
+    std::ptr::without_provenance_mut(0x5e55)
+}
+
+#[test]
+fn winhttp_never_uses_a_proxy() {
+    const WINHTTP_ACCESS_TYPE_DEFAULT_PROXY: u32 = 0;
+    const WINHTTP_ACCESS_TYPE_NAMED_PROXY: u32 = 3;
+    const WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY: u32 = 4;
+    const WINHTTP_FLAG_ASYNC: u32 = 0x1000_0000;
+    const WINHTTP_OPTION_CONNECT_TIMEOUT: u32 = 3;
+    let null = std::ptr::null_mut::<c_void>();
+    let agent = utf16("victory test");
+    let proxy = utf16("192.0.2.1:8080");
+
+    // Whatever access a title asks for, the host is asked for none.
+    for access in [
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_ACCESS_TYPE_NO_PROXY,
+        WINHTTP_ACCESS_TYPE_NAMED_PROXY,
+        WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+    ] {
+        let session =
+            open_without_proxy(recording_open, agent.as_ptr(), access, WINHTTP_FLAG_ASYNC);
+        assert_eq!(session as usize, 0x5e55);
+    }
+    let asked = (
+        agent.as_ptr() as usize,
+        WINHTTP_ACCESS_TYPE_NO_PROXY,
+        0,
+        0,
+        WINHTTP_FLAG_ASYNC,
+    );
+    let opened = std::mem::take(&mut *OPENED.lock().unwrap());
+    assert_eq!(opened, [asked; 4]);
+
+    // A real session, opened with a proxy named: no connection is made
+    // for that, and none through it later.
+    let session = WinHttpOpen(
+        agent.as_ptr(),
+        WINHTTP_ACCESS_TYPE_NAMED_PROXY,
+        proxy.as_ptr(),
+        std::ptr::null(),
+        0,
+    );
+    assert!(!session.is_null(), "WinHttpOpen: {}", win32_error());
+
+    // A proxy set later is accepted, and the host does not hear of it:
+    // it would refuse the null handle, as it does for another option.
+    /// A `WINHTTP_PROXY_INFO`.
+    #[repr(C)]
+    struct ProxyInfo {
+        access: u32,
+        proxy: *const u16,
+        bypass: *const u16,
+    }
+    let info = ProxyInfo {
+        access: WINHTTP_ACCESS_TYPE_NAMED_PROXY,
+        proxy: proxy.as_ptr(),
+        bypass: std::ptr::null(),
+    };
+    let size = size_of::<ProxyInfo>() as u32;
+    let info = (&raw const info).cast::<c_void>();
+    assert_eq!(
+        WinHttpSetOption(session, WINHTTP_OPTION_PROXY, info, size),
+        1
+    );
+    assert_eq!(WinHttpSetOption(null, WINHTTP_OPTION_PROXY, info, size), 1);
+    let timeout = 1000u32;
+    clear_win32_error();
+    assert_eq!(
+        WinHttpSetOption(
+            null,
+            WINHTTP_OPTION_CONNECT_TIMEOUT,
+            (&raw const timeout).cast(),
+            4
+        ),
+        0
+    );
+    assert_eq!(win32_error(), ERROR_INVALID_HANDLE);
+    assert_eq!(
+        WinHttpSetOption(
+            session,
+            WINHTTP_OPTION_CONNECT_TIMEOUT,
+            (&raw const timeout).cast(),
+            4
+        ),
+        1
+    );
+
+    // Proxy auto-detection fails without asking the network.
+    let url = utf16("http://example.com/");
+    let mut found = std::ptr::null_mut::<u16>();
+    clear_win32_error();
+    assert_eq!(WinHttpDetectAutoProxyConfigUrl(3, &mut found), 0);
+    assert_eq!(win32_error(), ERROR_WINHTTP_AUTODETECTION_FAILED);
+    assert!(found.is_null());
+    clear_win32_error();
+    assert_eq!(
+        WinHttpGetProxyForUrl(session, url.as_ptr(), std::ptr::null(), null),
+        0
+    );
+    assert_eq!(win32_error(), ERROR_WINHTTP_AUTODETECTION_FAILED);
+    let failed = ERROR_WINHTTP_AUTODETECTION_FAILED;
+    assert_eq!(
+        WinHttpGetProxyForUrlEx(null, url.as_ptr(), std::ptr::null(), 0),
+        failed
+    );
+    assert_eq!(
+        WinHttpGetProxyForUrlEx2(null, url.as_ptr(), std::ptr::null(), 0, std::ptr::null(), 0),
+        failed
+    );
+    assert_eq!(
+        WinHttpGetProxySettingsEx(null, 0, std::ptr::null(), 0),
+        failed
+    );
+
+    // Loopback is the one server a session can name.
+    let close = host!("winhttp.dll", "WinHttpCloseHandle": extern "system" fn(Handle) -> i32);
+    let (_listener, port) = listener();
+    for server in ["localhost", "127.0.0.1", "[::1]"] {
+        let server_name = utf16(server);
+        let connection = WinHttpConnect(session, server_name.as_ptr(), port, 0);
+        assert!(!connection.is_null(), "{server}: {}", win32_error());
+        assert_eq!(close(connection), 1);
+    }
+    for server in ["example.com", "192.0.2.1", "localhost.example.com"] {
+        let server_name = utf16(server);
+        clear_win32_error();
+        assert!(WinHttpConnect(session, server_name.as_ptr(), port, 0).is_null());
+        assert_eq!(win32_error(), ERROR_WINHTTP_CANNOT_CONNECT, "{server}");
+    }
+    assert_eq!(close(session), 1);
 }

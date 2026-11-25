@@ -1003,10 +1003,19 @@ pub extern "system" fn WinHttpOpen(
     _bypass: *const u16,
     flags: u32,
 ) -> Handle {
+    let open = host!("winhttp.dll", "WinHttpOpen": extern "system" fn(*const u16, u32, *const u16, *const u16, u32) -> Handle);
+    open_without_proxy(open, agent, access, flags)
+}
+
+type OpenSession = extern "system" fn(*const u16, u32, *const u16, *const u16, u32) -> Handle;
+
+/// [`WinHttpOpen`] with the host's function as a parameter, so that a
+/// test can see what the host is asked for.
+fn open_without_proxy(open: OpenSession, agent: *const u16, access: u32, flags: u32) -> Handle {
     if access != WINHTTP_ACCESS_TYPE_NO_PROXY {
         once("HTTP proxy ignored", format!("access type {access}"));
     }
-    host!("winhttp.dll", "WinHttpOpen": extern "system" fn(*const u16, u32, *const u16, *const u16, u32) -> Handle)(
+    open(
         agent,
         WINHTTP_ACCESS_TYPE_NO_PROXY,
         std::ptr::null(),
