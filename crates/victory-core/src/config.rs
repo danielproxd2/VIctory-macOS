@@ -314,6 +314,21 @@ mod tests {
         assert_eq!(cfg.game_dir, None);
     }
 
+    /// An empty `VICTORY_CONFIG` names no file: the working directory's
+    /// `victory.toml` is read if there is one, and none is not an error.
+    #[test]
+    fn an_empty_explicit_config_is_the_default_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = || env_of(&[("VICTORY_CONFIG", ""), ("HOME", "home")]);
+        let cfg = Config::load_from(tmp.path(), env()).unwrap();
+        assert_eq!(cfg.source, None);
+        let path = tmp.path().join("victory.toml");
+        std::fs::write(&path, "[paths]\ngame_dir = 'game'\ncache_dir = 'c'\n").unwrap();
+        let cfg = Config::load_from(tmp.path(), env()).unwrap();
+        assert_eq!(cfg.source, Some(path));
+        assert_eq!(cfg.game_dir, Some(PathBuf::from("game")));
+    }
+
     #[test]
     fn config_file_is_read_from_the_working_directory() {
         let tmp = tempfile::tempdir().unwrap();
