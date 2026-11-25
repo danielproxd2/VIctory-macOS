@@ -355,6 +355,81 @@ pub(crate) struct PageBatch {
 /// Bytes per mapped page.
 const PAGE: u64 = 64 << 10;
 
+/// Maps what `batches` say through `map` (`(to, from, len)`, `from` 0
+/// unmaps; false on failure): whether every range was mapped. A range of
+/// pool pages that is not inside the pool is not mapped.
+///
+/// `Err` if an address of any range does not fit in 64 bits (the title's
+/// numbers are not trusted); nothing is mapped then, also not the ranges
+/// before the one that wraps.
+fn map_batches(
+    map: &mut dyn FnMut(u64, u64, u64) -> bool,
+    batches: &[PageBatch],
+    pool: u64,
+    pool_pages: u32,
+) -> Result<bool, ()> {
+    walk_batches(None, batches, pool, pool_pages)?;
+    walk_batches(Some(map), batches, pool, pool_pages)
+}
+
+/// [`map_batches`], or with no `map` only its arithmetic.
+fn walk_batches(
+    mut map: Option<&mut dyn FnMut(u64, u64, u64) -> bool>,
+    batches: &[PageBatch],
+    pool: u64,
+    pool_pages: u32,
+) -> Result<bool, ()> {
+    let dry = map.is_none();
+    let mut call = |to: u64, from: u64, len: u64| match map.as_mut() {
+        Some(map) => map(to, from, len),
+        None => true,
+    };
+    let mut ok = true;
+    for b in batches {
+        if b.ranges.is_null() {
+            continue;
+        }
+        // SAFETY: each batch holds `count` ranges.
+        let ranges = unsafe { std::slice::from_raw_parts(b.ranges, b.count as usize) };
+        let mut at = b.destination;
+        for r in ranges {
+            // 32 bits of pages of 64 KiB: this cannot overflow.
+            let len = u64::from(r.count) * PAGE;
+            let end = at.checked_add(len).ok_or(())?;
+            // Where `pages` pool pages from the range's first are, if they
+            // are inside the pool.
+            let source = |pages: u32| -> Result<Option<u64>, ()> {
+                if r.start.checked_add(pages).is_none_or(|e| e > pool_pages) {
+                    return Ok(None);
+                }
+                let source = pool.checked_add(u64::from(r.start) * PAGE).ok_or(())?;
+                source.checked_add(u64::from(pages) * PAGE).ok_or(())?;
+                Ok(Some(source))
+            };
+            ok &= match r.kind {
+                0 => match source(r.count)? {
+                    Some(source) => call(at, source, len),
+                    None => false,
+                },
+                1 => match source(1)? {
+                    // Below `end`, so these sums do not overflow. The
+                    // pass without a mapper has nothing to do per page.
+                    Some(source) if !dry => {
+                        (0..u64::from(r.count)).all(|k| call(at + k * PAGE, source, PAGE))
+                    }
+                    Some(_) => true,
+                    None => false,
+                },
+                2 => call(at, 0, len),
+                3 => true,
+                _ => false,
+            };
+            at = end;
+        }
+    }
+    Ok(ok)
+}
+
 /// `CopyPageMappingsBatchX(count, batches, pool, pool pages, flags)`: maps
 /// pages of a pool (memory the title mapped physical pages into) at the
 /// batches' addresses. Grand Theft Auto VI streams textures into pool pages
@@ -372,35 +447,46 @@ extern "system" fn copy_page_mappings(
     let Some(map) = crate::resource::page_mapper() else {
         return E_INVALIDARG;
     };
+    copy_mappings(
+        &mut |to, from, len| map(to, from, len),
+        count,
+        batches,
+        pool,
+        pool_pages,
+    )
+}
+
+/// [`copy_page_mappings`] with the mapper `map`.
+///
+/// A mapping the mapper refuses is logged and the call still succeeds.
+/// shortcut: what the console returns then is not known; titles seen do
+/// not check for it. Batches whose addresses wrap are an argument error.
+fn copy_mappings(
+    map: &mut dyn FnMut(u64, u64, u64) -> bool,
+    count: u32,
+    batches: *const PageBatch,
+    pool: u64,
+    pool_pages: u32,
+) -> HRESULT {
     if batches.is_null() && count > 0 {
         return E_INVALIDARG;
     }
-    let batches = (count > 0).then(|| {
+    let batches = if count > 0 {
         // SAFETY: the title passes `count` batches.
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
-    });
-    let mut ok = true;
-    for b in batches.into_iter().flatten() {
-        if b.ranges.is_null() {
-            continue;
-        }
-        // SAFETY: each batch holds `count` ranges.
-        let ranges = unsafe { std::slice::from_raw_parts(b.ranges, b.count as usize) };
-        let mut at = b.destination;
-        for r in ranges {
-            let len = u64::from(r.count) * PAGE;
-            let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
-            let source = pool + u64::from(r.start) * PAGE;
-            ok &= match r.kind {
-                0 if inside(r.count) => map(at, source, len),
-                1 if inside(1) => (0..u64::from(r.count)).all(|k| map(at + k * PAGE, source, PAGE)),
-                2 => map(at, 0, len),
-                3 => true,
-                _ => false,
-            };
-            at += len;
-        }
-    }
+    } else {
+        &[]
+    };
+    let Ok(ok) = map_batches(map, batches, pool, pool_pages) else {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                pool = format_args!("{pool:#x}"),
+                "a page mapping batch wraps around the address space; refused"
+            )
+        });
+        return E_INVALIDARG;
+    };
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
@@ -554,5 +640,194 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
+    }
+
+    type Call = (u64, u64, u64);
+
+    fn range(kind: u32, start: u32, count: u32) -> PageRange {
+        PageRange { kind, start, count }
+    }
+
+    /// What the mapper is asked for `ranges` from `destination` on, whether
+    /// everything was mapped (`Err`: the addresses wrap), and what the
+    /// queue's method returns for the same batch with a mapper that
+    /// answers `mapper`.
+    fn mapped(
+        destination: u64,
+        ranges: &[PageRange],
+        pool: u64,
+        pool_pages: u32,
+        mapper: bool,
+    ) -> (Vec<Call>, Result<bool, ()>, HRESULT) {
+        let batch = [PageBatch {
+            destination,
+            count: ranges.len() as u32,
+            ranges: ranges.as_ptr(),
+        }];
+        let mut calls = Vec::new();
+        let mut record = |to, from, len| {
+            // A test that would record a call per page of a huge range
+            // stops here instead of filling memory.
+            assert!(calls.len() < 1 << 16, "too many mapper calls");
+            calls.push((to, from, len));
+            mapper
+        };
+        let all = map_batches(&mut record, &batch, pool, pool_pages);
+        let mut again = Vec::new();
+        let hr = copy_mappings(
+            &mut |to, from, len| {
+                assert!(again.len() < 1 << 16, "too many mapper calls");
+                again.push((to, from, len));
+                mapper
+            },
+            1,
+            batch.as_ptr(),
+            pool,
+            pool_pages,
+        );
+        if mapper {
+            assert_eq!(again, calls, "the method maps what the batches say");
+        }
+        (calls, all, hr)
+    }
+
+    #[test]
+    fn page_mapping_batches_reach_the_mapper_in_order() {
+        const POOL: u64 = 0x40_0000_0000;
+        const TO: u64 = 0x80_0000_0000;
+        let ranges = [
+            range(0, 2, 3), // three pool pages from the pool's third
+            range(1, 5, 2), // the pool's sixth page, twice
+            range(2, 9, 2), // two pages unmapped (the start means nothing)
+            range(3, 0, 4), // four pages left alone
+            range(0, 0, 1),
+        ];
+        let (calls, all, hr) = mapped(TO, &ranges, POOL, 8, true);
+        assert_eq!(
+            calls,
+            [
+                (TO, POOL + 2 * PAGE, 3 * PAGE),
+                (TO + 3 * PAGE, POOL + 5 * PAGE, PAGE),
+                (TO + 4 * PAGE, POOL + 5 * PAGE, PAGE),
+                (TO + 5 * PAGE, 0, 2 * PAGE),
+                (TO + 11 * PAGE, POOL, PAGE),
+            ]
+        );
+        assert_eq!((all, hr), (Ok(true), S_OK));
+
+        // Pool pages outside the pool are not mapped, and neither is an
+        // unknown kind; what follows them still is, at its own place.
+        let ranges = [
+            range(0, 6, 3),
+            range(1, 8, 1),
+            range(0, u32::MAX, 2),
+            range(7, 0, 1),
+            range(2, 0, 1),
+        ];
+        let (calls, all, hr) = mapped(TO, &ranges, POOL, 8, true);
+        assert_eq!(calls, [(TO + 7 * PAGE, 0, PAGE)]);
+        // The call succeeds all the same (as it did before the batches
+        // were checked): what the console returns is not known.
+        assert_eq!((all, hr), (Ok(false), S_OK));
+    }
+
+    /// A mapper that fails is logged, not reported: existing behaviour,
+    /// kept until the console's is known.
+    #[test]
+    fn a_failed_page_mapping_is_not_an_error() {
+        let ranges = [range(1, 0, 3), range(2, 0, 1)];
+        let (calls, all, hr) = mapped(0x1_0000_0000, &ranges, 0x2_0000_0000, 1, false);
+        // The pages of one range stop at the first that fails.
+        assert_eq!(
+            calls,
+            [
+                (0x1_0000_0000, 0x2_0000_0000, PAGE),
+                (0x1_0000_0000 + 3 * PAGE, 0, PAGE)
+            ]
+        );
+        assert_eq!((all, hr), (Ok(false), S_OK));
+    }
+
+    /// Addresses that do not fit in 64 bits are an argument error, and
+    /// nothing is mapped: not at a wrapped address, and not the ranges
+    /// before either.
+    #[test]
+    fn page_mapping_batches_never_wrap() {
+        const POOL: u64 = 0x40_0000_0000;
+        let refused = (Vec::new(), Err(()), E_INVALIDARG);
+        // The destination's second page would start at 0.
+        let top = u64::MAX - PAGE;
+        assert_eq!(mapped(top, &[range(2, 0, 2)], POOL, 8, true), refused);
+        assert_eq!(mapped(top, &[range(0, 0, 2)], POOL, 8, true), refused);
+        assert_eq!(mapped(top, &[range(3, 0, 2)], POOL, 8, true), refused);
+        // One page per page, as many as 32 bits hold, near the top.
+        let many = [range(1, 0, u32::MAX)];
+        assert_eq!(mapped(u64::MAX << 40, &many, POOL, 8, true), refused);
+        // A good range first: it is not mapped either.
+        let ranges = [range(2, 0, 1), range(2, 0, 2)];
+        assert_eq!(mapped(top - PAGE, &ranges, POOL, 8, true), refused);
+        // The pool's pages would wrap.
+        let ranges = [range(0, 0, 1)];
+        assert_eq!(mapped(0x1000, &ranges, u64::MAX - 1, 8, true), refused);
+        let ranges = [range(1, 7, 1)];
+        assert_eq!(
+            mapped(0x1000, &ranges, u64::MAX - 7 * PAGE, 8, true),
+            refused
+        );
+        // Up to the last byte is fine.
+        let (calls, all, hr) = mapped(top - 1, &[range(2, 0, 1)], POOL, 8, true);
+        assert_eq!(calls, [(top - 1, 0, PAGE)]);
+        assert_eq!((all, hr), (Ok(true), S_OK));
+    }
+
+    /// Without the runtime's page mapper (nothing in this test binary
+    /// names one) the queue's method refuses every call.
+    #[test]
+    fn page_mappings_without_a_mapper_are_refused() {
+        assert!(crate::resource::page_mapper().is_none());
+        let null = std::ptr::null();
+        let desc = QueueDesc {
+            kind: 0,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let mut q = null;
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
+        type Copy = extern "system" fn(This, u32, *const PageBatch, u64, u32, u32) -> HRESULT;
+        let copy = crate::testing::queue_slot::<Copy>(q, 0xe8);
+        let ranges = [range(2, 0, 1)];
+        let batch = PageBatch {
+            destination: 0x1000_0000,
+            count: 1,
+            ranges: ranges.as_ptr(),
+        };
+        assert_eq!(copy(q, 1, &batch, 0x2000_0000, 8, 0), E_INVALIDARG);
+        assert_eq!(copy(q, 0, std::ptr::null(), 0, 0, 0), E_INVALIDARG);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
+    }
+
+    /// No batches where some are counted is an argument error, whatever
+    /// the mapper; no batches at all is nothing to do.
+    #[test]
+    fn page_mappings_need_their_batches() {
+        let mut calls = 0;
+        let mut map = |_, _, _| {
+            calls += 1;
+            true
+        };
+        assert_eq!(
+            copy_mappings(&mut map, 1, std::ptr::null(), 0, 0),
+            E_INVALIDARG
+        );
+        assert_eq!(copy_mappings(&mut map, 0, std::ptr::null(), 0, 0), S_OK);
+        // A batch without ranges is passed over.
+        let batch = PageBatch {
+            destination: 0,
+            count: 5,
+            ranges: std::ptr::null(),
+        };
+        assert_eq!(copy_mappings(&mut map, 1, &batch, 0, 0), S_OK);
+        assert_eq!(calls, 0);
     }
 }
