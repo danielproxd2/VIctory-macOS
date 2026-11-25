@@ -63,12 +63,19 @@ A shader test that lacks something it needs passes after printing one line that 
 The shader tests can have Microsoft's DXIL validator (`dxil.dll`) check every container the translator emits, and compare the container hash VIctory computes with the one the validator signs. The DLL is not part of this repository and must never be committed. It ships with the Windows SDK and with the releases of Microsoft's open-source DirectXShaderCompiler. Keep it outside the repository, for example in `~/Library/Caches/victory-macos/dxc/`, and name it by its macOS path.
 
 ```sh
-VICTORY_DXIL_UNIX="$HOME/Library/Caches/victory-macos/dxc/dxil.dll" VICTORY_REQUIRE_DXIL=1 tools/macos/test-wine.sh -p victory-shader --no-fail-fast
+VICTORY_DXIL_UNIX="$HOME/Library/Caches/victory-macos/dxc/v1.9.2609/dxil.dll" VICTORY_REQUIRE_DXIL=1 VICTORY_REQUIRE_GPU=1 tools/macos/test-wine.sh -p victory-shader --no-fail-fast
 ```
 
 `test-wine.sh` passes the file to the tests as `VICTORY_DXIL`, the `Z:` path Wine knows it by. On Windows, set `VICTORY_DXIL` yourself, or leave it unset to use the newest Windows SDK's copy. Without a validator each validating test prints `skipped: DXIL validation: ...`; the native macOS build cannot load the DLL at all and always prints that line, so `VICTORY_REQUIRE_DXIL=1` fails there.
 
-Whether Wine can load `dxil.dll` and run its validator has not been tried yet. Until a run with `VICTORY_REQUIRE_DXIL=1` has passed under Wine, the validator has checked nothing on a Mac.
+Wine loads the validator and runs it. Measured on 24 November 2026 on an M4 with the CrossOver Wine build and D3DMetal, with the `dxil.dll` of DirectXShaderCompiler release v1.9.2609 (SHA-256 `64be2368211d257a038a7d4ea6bb3e24c878eb8d588c7b8414fccf759b69c2ac`):
+
+- The first run of the command above gave 149 passed, 1 failed and 1 ignored. The failure was `emitted_containers_carry_the_parts_each_stage_needs`, with the validator's message "Not all elements of output SV_Position were written." The test's mesh program declared a position and exported none.
+- That was also a defect of the translator. The validator wants every channel of each system-value output of a vertex, pixel or mesh-vertex signature written by some store. That covers `SV_Position`, the clip and cull distances, the render-target and viewport indices, the depths, `SV_Coverage` and `SV_StencilRef`. It makes exceptions for `SV_Target` and for user semantics, and it does not check per-primitive mesh outputs this way. The translator now refuses a program that leaves such an output unwritten or half written ("a system-value output the program does not write in full"), because what the console does with it is not known.
+- After the fix the same command gives 152 passed, 0 failed and 1 ignored, with no `skipped: DXIL validation` line. The lines that remain are 19 of `skipped: no SM 6.6 WARP device` and 4 of `skipped: no console compiler ...`. So every container these tests emit was validated and carries the hash the validator signs, but the differential tests did not run.
+- A container with one flipped bitcode byte makes the validator's `Validate` call fail (0x80004005). One with a wrong feature bit in `SFI0` gets a verdict ("Container part 'Feature Info' does not match expected for module."). `validator_accepts_an_emitted_module_and_rejects_a_corrupted_one` checks both.
+
+The validator checks nothing in a run without `VICTORY_REQUIRE_DXIL=1` and a `dxil.dll`, and the device tests compare nothing where there is no device. A run that is meant to prove something sets `VICTORY_REQUIRE_DXIL=1` and `VICTORY_REQUIRE_GPU=1`.
 
 ## Route A: next steps
 
