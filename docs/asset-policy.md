@@ -74,8 +74,9 @@ reads every text file the same way, whatever its type:
 * The list goes on across commas, brackets of all three kinds, spaces and
   line breaks. Rows (`[1, 2], [3, 4]`) and tuples (`(1, 2), (3, 4)`) are
   one list of four.
-* Comments do not split a list: `//` and `#` to the end of the line, and
-  `/* ... */`. A list written inside comments is counted too.
+* A comment between two entries does not split a list: `//` and `#` to
+  the end of the line, and `/* ... */`. A list written inside comments is
+  counted as well, as long as those comments hold nothing but the list.
 * Anything else ends the list: a name, a string, an operator, a
   semicolon. The limit is on one list, not on a file's total.
 
@@ -85,7 +86,10 @@ Not counted, so not caught by this rule:
   can count, so a list of them is a list of one;
 * numbers inside strings, or with a name or string between every two of
   them (`(1, "a"), (2, "b")`);
-* lists split by a comment form of another language (`rem`, `<# ... #>`).
+* lists split by a comment form of another language (`rem`, `<# ... #>`);
+* lists written inside comments with a word between the rows, in a
+  comment or in code: rows of sixteen in `//` lines with a `// row` line
+  after each count as lists of sixteen.
 
 The size limit and the hex/base64 rule still apply to all of these, and
 review is what stands behind the check.

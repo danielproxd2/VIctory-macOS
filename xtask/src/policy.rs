@@ -313,8 +313,15 @@ fn longest_encoded_run(content: &[u8]) -> Option<usize> {
 /// is not counted.
 ///
 /// Comments are read both ways and the longer list is taken: once as
-/// nothing at all, so that they cannot split a list, and once as ordinary
-/// text, so that a list cannot hide inside them.
+/// nothing at all, so that a comment between two entries does not split a
+/// list, and once as ordinary text whose markers (`/`, `*`, `#`) are
+/// stepped over, so that a list written in comments that hold nothing else
+/// is counted.
+///
+/// That is all it does. In the second reading a word ends a list as it
+/// does anywhere else, so rows of literals in comments with a comment of
+/// words between the rows count one row at a time and pass. It is one of
+/// the gaps docs/asset-policy.md lists.
 fn longest_literal_run(content: &[u8]) -> usize {
     literal_run(content, true)
         .0
@@ -694,6 +701,19 @@ mod tests {
         let in_comments = grouped(4096, 16, "// ", ",", "\n");
         assert_eq!(run(&in_comments), 4096);
         assert!(named(&in_comments), "rows that are comments");
+
+        // What the two readings do not catch, and docs/asset-policy.md
+        // says so: rows in comments with a comment of words between them.
+        // Read as text, the word ends each row; with comments stepped over
+        // there is nothing left.
+        assert_eq!(run("// 1, 2,\n// row\n// 3, 4, 5,\n"), 3);
+        let worded = grouped(4096, 16, "// ", ",", "\n// row\n");
+        assert_eq!(run(&worded), 16);
+        assert!(!named(&worded), "rows that are comments, a word between");
+        // A row of code between rows of comments ends the list as well,
+        // unless it is itself part of the list.
+        assert_eq!(run("// 1, 2,\nlet x = 0;\n// 3, 4, 5,\n"), 3);
+        assert_eq!(run("// 1, 2,\n[3, 4],\n// 5, 6,\n"), 6);
 
         // The same shapes at the limit pass.
         let at_limit = grouped(super::MAX_LITERAL_RUN, 16, "    [", "],", "\n");
