@@ -9,7 +9,7 @@ use std::ffi::{c_char, c_void};
 
 use super::xasync::{self, AsyncBlock, E_ABORT};
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, text,
+    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, query_interface, text,
 };
 
 pub const PROVIDER: Guid = Guid::new(
@@ -260,7 +260,7 @@ mod dialog {
 }
 
 static VTABLE: Methods<20> = Methods([
-    missing::<0> as *const (),
+    query_interface as *const (),
     add_ref as *const (),
     add_ref as *const (),
     missing::<3> as *const (),        // 0x18 message dialog

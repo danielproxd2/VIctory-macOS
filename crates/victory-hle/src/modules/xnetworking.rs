@@ -8,7 +8,7 @@ use std::ffi::{c_char, c_void};
 
 use super::xasync::{self, AsyncBlock};
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, Object, add_ref, missing, put, text, token,
+    Guid, HRESULT, Interface, Methods, Object, add_ref, missing, put, query_interface, text, token,
 };
 
 pub const PROVIDER: Guid = Guid::new(
@@ -139,7 +139,7 @@ extern "system" fn unregister(_: This, _token: u64, _wait: bool) -> bool {
 }
 
 static VTABLE: Methods<18> = Methods([
-    missing::<0> as *const (),
+    query_interface as *const (),
     add_ref as *const (),
     add_ref as *const (),
     udp_port as *const (),             // 0x18

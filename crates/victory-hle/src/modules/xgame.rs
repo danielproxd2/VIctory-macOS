@@ -6,7 +6,7 @@
 use std::ffi::{CStr, c_char, c_void};
 
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, text, token,
+    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, put, query_interface, text, token,
 };
 use crate::runtime;
 
@@ -169,7 +169,7 @@ extern "system" fn write_event(
 }
 
 static TITLE_VTABLE: Methods<5> = Methods([
-    missing::<0> as *const (),
+    query_interface as *const (),
     add_ref as *const (),
     add_ref as *const (),
     title_id as *const (),        // 0x18
@@ -177,14 +177,14 @@ static TITLE_VTABLE: Methods<5> = Methods([
 ]);
 
 static FEATURES_VTABLE: Methods<4> = Methods([
-    missing::<0> as *const (),
+    query_interface as *const (),
     add_ref as *const (),
     add_ref as *const (),
     is_feature_available as *const (), // 0x18
 ]);
 
 static INVITES_VTABLE: Methods<5> = Methods([
-    missing::<0> as *const (),
+    query_interface as *const (),
     add_ref as *const (),
     add_ref as *const (),
     register as *const (),   // 0x18
@@ -192,7 +192,7 @@ static INVITES_VTABLE: Methods<5> = Methods([
 ]);
 
 static EVENTS_VTABLE: Methods<4> = Methods([
-    missing::<0> as *const (),
+    query_interface as *const (),
     add_ref as *const (),
     add_ref as *const (),
     write_event as *const (), // 0x18

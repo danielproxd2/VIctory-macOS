@@ -33,6 +33,8 @@ use crate::{HleModule, hle_export};
 
 pub type HRESULT = i32;
 pub const S_OK: HRESULT = 0;
+pub const E_NOINTERFACE: HRESULT = 0x8000_4002_u32 as i32;
+pub const E_POINTER: HRESULT = 0x8000_4003_u32 as i32;
 /// `HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)`.
 pub const NOT_SUPPORTED: HRESULT = 0x8007_0032_u32 as i32;
 
@@ -67,6 +69,9 @@ impl std::fmt::Display for Guid {
     }
 }
 
+/// `IUnknown`, which every object answers.
+pub const IID_IUNKNOWN: Guid = Guid::new(0, 0, 0, [0xc0, 0, 0, 0, 0, 0, 0, 0x46]);
+
 /// A runtime object as title code calls it: its first word points at the
 /// method table. Ours are static, so reference counting is a no-op.
 #[repr(C)]
@@ -74,6 +79,9 @@ pub struct Object {
     vtable: *const *const (),
     /// Named in the log when a title calls a method we lack.
     area: &'static str,
+    /// The interface id it was handed out as, for an object that
+    /// `QueryApiImpl` does not serve (those are found in `AREAS`).
+    iid: Option<Guid>,
 }
 
 // SAFETY: the table is a static array of function addresses.
@@ -84,6 +92,20 @@ impl Object {
         Object {
             vtable: methods.0.as_ptr(),
             area,
+            iid: None,
+        }
+    }
+
+    /// An object handed out outside `QueryApiImpl`, as interface `iid`.
+    pub const fn with_interface<const N: usize>(
+        area: &'static str,
+        methods: &'static Methods<N>,
+        iid: Guid,
+    ) -> Object {
+        Object {
+            vtable: methods.0.as_ptr(),
+            area,
+            iid: Some(iid),
         }
     }
 }
@@ -116,6 +138,46 @@ const AREAS: &[&[Interface]] = &[
 /// `AddRef` and `Release`.
 pub extern "system" fn add_ref(_: *const Object) -> u32 {
     1
+}
+
+/// `QueryInterface`, slot 0 of every table: the object itself for
+/// `IUnknown` and for an interface id it is handed out as, with a
+/// reference added through its own `AddRef`; anything else is
+/// `E_NOINTERFACE` with `*out` null, as COM has it. An object implements
+/// exactly the interface it was handed out as (an area's interface id
+/// changes when its method table does).
+pub extern "system" fn query_interface(
+    this: *const Object,
+    iid: *const Guid,
+    out: *mut *mut c_void,
+) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    // SAFETY: title code calls methods on objects we handed out, and
+    // passes a GUID (null is tolerated).
+    let (object, iid) = unsafe { (&*this, iid.as_ref()) };
+    let ours = iid.is_some_and(|iid| {
+        *iid == IID_IUNKNOWN
+            || object.iid == Some(*iid)
+            || AREAS
+                .iter()
+                .flat_map(|area| area.iter())
+                .any(|(_, i, o)| i == iid && std::ptr::eq(*o, this))
+    });
+    if !ours {
+        // SAFETY: checked non-null; the title passes room for a pointer.
+        unsafe { out.write(std::ptr::null_mut()) };
+        return E_NOINTERFACE;
+    }
+    // SAFETY: slot 1 of every table is the object's `AddRef`; `out` as
+    // above.
+    unsafe {
+        let add_ref = *object.vtable.add(1);
+        std::mem::transmute::<*const (), extern "system" fn(*const Object) -> u32>(add_ref)(this);
+        out.write(this.cast_mut().cast());
+    }
+    S_OK
 }
 
 /// Calls of [`missing`] slots, by method table and slot.
@@ -377,6 +439,95 @@ mod tests {
         assert_eq!(
             (missing_calls(&OBJECT, 3), missing_calls(&OBJECT, 4)),
             (1000, 1)
+        );
+    }
+
+    type Query = extern "system" fn(*const Object, *const Guid, *mut *mut c_void) -> HRESULT;
+    type Count = extern "system" fn(*const Object) -> u32;
+    const NOBODYS: Guid = Guid::new(0x5eed, 1, 2, [3; 8]);
+
+    fn objects() -> impl Iterator<Item = &'static Interface> {
+        AREAS.iter().flat_map(|area| area.iter())
+    }
+
+    /// `QueryApiImpl` finds an object by its (provider, interface id), so
+    /// no pair may be listed twice.
+    #[test]
+    fn area_ids_are_unique() {
+        let ids: Vec<_> = objects()
+            .map(|(p, i, _)| (p.to_string(), i.to_string()))
+            .collect();
+        for (at, id) in ids.iter().enumerate() {
+            assert!(!ids[..at].contains(id), "{id:?} is listed twice");
+        }
+        assert!(objects().all(|(_, i, _)| *i != IID_IUNKNOWN));
+    }
+
+    /// Every object `QueryApiImpl` serves is a COM object: slot 0 answers
+    /// `IUnknown` and the id it is served as, slots 1 and 2 count (the
+    /// objects are static, so the count stays 1).
+    #[test]
+    fn every_table_starts_with_query_interface_addref_release() {
+        for (_, iid, object) in objects() {
+            let (object, area): (&Object, _) = (object, object.area);
+            let this: *const Object = object;
+            let query = method::<Query>(object, 0);
+            for id in [IID_IUNKNOWN, *iid] {
+                let mut out = std::ptr::null_mut();
+                assert_eq!(query(this, &id, &mut out), S_OK, "{area}: {id}");
+                assert_eq!(out.cast_const(), this.cast::<c_void>(), "{area}: {id}");
+            }
+            let mut out = 0x1234 as *mut c_void;
+            assert_eq!(query(this, &NOBODYS, &mut out), E_NOINTERFACE, "{area}");
+            assert!(out.is_null(), "{area}");
+            assert_eq!(method::<Count>(object, 0x08)(this), 1, "{area}: AddRef");
+            assert_eq!(method::<Count>(object, 0x10)(this), 1, "{area}: Release");
+            assert_eq!(missing_calls(object, 0), 0, "{area}: slot 0 is a method");
+        }
+    }
+
+    #[test]
+    fn query_interface_answers_iunknown_and_its_own_iid_only() {
+        let this: *const Object = &xasync::OBJECT;
+        let mut out = 0x1234 as *mut c_void;
+        // Another area's interface is not this object's.
+        let (_, other, _) = xuser::INTERFACES[0];
+        assert_ne!(other, xasync::PROVIDER);
+        assert_eq!(query_interface(this, &other, &mut out), E_NOINTERFACE);
+        assert!(out.is_null());
+        out = 0x1234 as *mut c_void;
+        assert_eq!(
+            query_interface(this, std::ptr::null(), &mut out),
+            E_NOINTERFACE
+        );
+        assert!(out.is_null());
+        let iid = IID_IUNKNOWN;
+        assert_eq!(query_interface(this, &iid, std::ptr::null_mut()), E_POINTER);
+
+        // An object handed out outside `QueryApiImpl` answers the id it
+        // names, and the reference goes through its own `AddRef`.
+        static ADDED: AtomicU64 = AtomicU64::new(0);
+        extern "system" fn counting(_: *const Object) -> u32 {
+            ADDED.fetch_add(1, Ordering::SeqCst) as u32 + 2
+        }
+        static TABLE: Methods<3> = Methods([
+            query_interface as *const (),
+            counting as *const (),
+            add_ref as *const (),
+        ]);
+        static NAMED: Object = Object::with_interface("test object", &TABLE, NOBODYS);
+        static PLAIN: Object = Object::new("test object", &TABLE);
+        let mut out = std::ptr::null_mut();
+        assert_eq!(query_interface(&NAMED, &NOBODYS, &mut out), S_OK);
+        assert_eq!(out.cast_const(), (&raw const NAMED).cast::<c_void>());
+        assert_eq!(query_interface(&NAMED, &iid, &mut out), S_OK);
+        assert_eq!(ADDED.load(Ordering::SeqCst), 2);
+        assert_eq!(query_interface(&PLAIN, &NOBODYS, &mut out), E_NOINTERFACE);
+        assert!(out.is_null());
+        assert_eq!(
+            ADDED.load(Ordering::SeqCst),
+            2,
+            "a refusal adds no reference"
         );
     }
 

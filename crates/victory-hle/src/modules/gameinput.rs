@@ -574,7 +574,8 @@ fn hand(out: Out, reading: Option<&Ref>) -> HRESULT {
 }
 
 extern "system" fn no_interface(_: *const c_void, _iid: *const c_void, out: Out) -> HRESULT {
-    tracing::warn!("input QueryInterface not implemented");
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| tracing::warn!("input QueryInterface not implemented (logged once)"));
     fail(out, E_NOINTERFACE)
 }
 /// The input object and devices live as long as the process.
@@ -1310,6 +1311,22 @@ mod tests {
         let f = unsafe { *(*(object as *const *const *const ())).add(offset / 8) };
         // SAFETY: the caller names the slot's signature.
         unsafe { std::mem::transmute_copy(&f) }
+    }
+
+    /// The input object's interfaces are its own: `QueryInterface` refuses
+    /// every id and leaves no stale pointer behind.
+    #[test]
+    fn query_interface_is_refused_with_a_null_result() {
+        type Query = extern "system" fn(This, *const c_void, Out) -> HRESULT;
+        let (hub, _host) = fake();
+        let this: This = &hub.object;
+        let iid = [0u8; 16];
+        for _ in 0..3 {
+            let mut out = 0x1234 as *const c_void;
+            let hr = slot::<Query, _>(this, 0)(this, iid.as_ptr().cast(), &mut out);
+            assert_eq!(hr, E_NOINTERFACE);
+            assert!(out.is_null());
+        }
     }
 
     /// Device callbacks seen: device index, current and previous status.

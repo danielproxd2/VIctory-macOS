@@ -28,7 +28,9 @@ use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 use victory_formats::bcpack::{self, Tables};
 
 use super::xasync::{E_INVALIDARG, E_NOTIMPL, E_PENDING};
-use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put};
+use super::xgameruntime::{
+    Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put, query_interface,
+};
 use crate::{HleModule, hle_export};
 
 /// The factory interface Grand Theft Auto VI asks for.
@@ -47,7 +49,8 @@ const INVALID_DATA: HRESULT = 0x8007_000D_u32 as i32;
 
 type Out = *mut *mut c_void;
 
-static FACTORY_OBJECT: Object = Object::new("dstorage factory", &FACTORY_VTABLE);
+static FACTORY_OBJECT: Object =
+    Object::with_interface("dstorage factory", &FACTORY_VTABLE, FACTORY);
 
 pub extern "system" fn DStorageGetFactory(iid: *const Guid, out: Out) -> HRESULT {
     // SAFETY: the title passes a GUID (null tolerated).
@@ -236,7 +239,7 @@ fn text(name: *const c_char) -> String {
 }
 
 static FACTORY_VTABLE: Methods<16> = Methods([
-    missing::<0> as *const (),
+    query_interface as *const (),
     add_ref as *const (),
     add_ref as *const (),
     missing::<3> as *const (),            // 0x18 (2020: queue creation)
@@ -261,7 +264,7 @@ struct File {
 }
 
 static FILE_VTABLE: Methods<8> = Methods([
-    missing::<0> as *const (),
+    query_interface as *const (),
     add_ref_instance::<File> as *const (),
     release::<File> as *const (),
     missing::<3> as *const (),
@@ -296,7 +299,7 @@ extern "system" fn is_complete(this: Array, index: u32) -> bool {
 }
 
 static STATUS_VTABLE: Methods<5> = Methods([
-    missing::<0> as *const (),
+    query_interface as *const (),
     add_ref_instance::<StatusArray> as *const (),
     release::<StatusArray> as *const (),
     is_complete as *const (),   // 0x18
@@ -998,7 +1001,7 @@ fn into_destination(
 /// Slots by the 2020 order, which the argument shapes at Grand Theft Auto
 /// VI's call sites match (0x18, 0x20, 0x30 and 0x40 are called).
 static QUEUE_VTABLE: Methods<12> = Methods([
-    missing::<0> as *const (),
+    query_interface as *const (),
     add_ref_instance::<Queue> as *const (),
     release::<Queue> as *const (),
     enqueue_request as *const (), // 0x18
@@ -1337,6 +1340,31 @@ mod tests {
         assert!(l.start().is_none());
         l.finish(&second, Ok(()));
         assert!(l.start().is_some());
+    }
+
+    /// `QueryInterface` on the factory and on a counted object: the
+    /// reference it hands out is a real one, and a refusal adds none.
+    #[test]
+    fn objects_answer_query_interface() {
+        use crate::modules::xgameruntime::IID_IUNKNOWN;
+        type Query = extern "system" fn(*mut c_void, *const Guid, Out) -> HRESULT;
+        type Count = extern "system" fn(*mut c_void) -> u32;
+        let factory = factory();
+        let mut out = std::ptr::null_mut();
+        for iid in [FACTORY, IID_IUNKNOWN] {
+            assert_eq!(call::<Query>(factory, 0)(factory, &iid, &mut out), S_OK);
+            assert_eq!(out, factory);
+        }
+
+        let array = status_array(1);
+        let query = call::<Query>(array, 0);
+        assert_eq!(query(array, &IID_IUNKNOWN, &mut out), S_OK);
+        assert_eq!(out, array);
+        assert_eq!(call::<Count>(array, 0x10)(array), 1, "two references");
+        // The factory's interface is not the array's.
+        assert_eq!(query(array, &FACTORY, &mut out), E_NOINTERFACE);
+        assert!(out.is_null());
+        assert_eq!(call::<Count>(array, 0x10)(array), 0, "the last reference");
     }
 
     #[test]

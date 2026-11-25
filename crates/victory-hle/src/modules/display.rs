@@ -5,7 +5,8 @@
 use std::ffi::{c_char, c_void};
 
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, NOT_SUPPORTED, Object, add_ref, missing, put, text,
+    Guid, HRESULT, Interface, Methods, NOT_SUPPORTED, Object, add_ref, missing, put,
+    query_interface, text,
 };
 
 /// HDR mode; asked for with this interface id since 2020.
@@ -137,7 +138,7 @@ extern "system" fn take_screenshot(_: This, _user: *const c_void, _result: *mut 
 }
 
 static HDR_VTABLE: Methods<5> = Methods([
-    missing::<0> as *const (),
+    query_interface as *const (),
     add_ref as *const (),
     add_ref as *const (),
     missing::<3> as *const (),
@@ -146,7 +147,7 @@ static HDR_VTABLE: Methods<5> = Methods([
 
 #[cfg(windows)]
 static SHELL_VTABLE: Methods<6> = Methods([
-    missing::<0> as *const (),
+    query_interface as *const (),
     add_ref as *const (),
     add_ref as *const (),
     launch_uri as *const (),       // 0x18
@@ -155,14 +156,14 @@ static SHELL_VTABLE: Methods<6> = Methods([
 ]);
 #[cfg(not(windows))]
 static SHELL_VTABLE: Methods<4> = Methods([
-    missing::<0> as *const (),
+    query_interface as *const (),
     add_ref as *const (),
     add_ref as *const (),
     launch_uri as *const (),
 ]);
 
 static CAPTURE_VTABLE: Methods<6> = Methods([
-    missing::<0> as *const (),
+    query_interface as *const (),
     add_ref as *const (),
     add_ref as *const (),
     missing::<3> as *const (),    // 0x18 diagnostic screenshot

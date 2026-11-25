@@ -9,7 +9,8 @@ use std::ffi::{c_char, c_void};
 
 use super::xasync::{self, AsyncBlock, E_ILLEGAL_METHOD_CALL};
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, put_string, text, token,
+    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, put_string,
+    query_interface, text, token,
 };
 use super::xpackage;
 use crate::runtime;
@@ -333,7 +334,7 @@ extern "system" fn unregister(_: This, _: Handle, _token: u64, _wait: bool) -> b
 }
 
 static VTABLE: Methods<76> = Methods([
-    missing::<0> as *const (),
+    query_interface as *const (),
     add_ref as *const (),
     add_ref as *const (),
     create_context as *const (),             // 0x18

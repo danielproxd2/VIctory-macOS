@@ -8,8 +8,8 @@ use std::path::Path;
 
 use super::xasync::{self, AsyncBlock, E_ABORT};
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, NOT_SUPPORTED, Object, S_OK, add_ref, missing, put,
-    put_string,
+    Guid, HRESULT, Interface, Methods, NOT_SUPPORTED, Object, S_OK, add_ref, put, put_string,
+    query_interface,
 };
 use crate::runtime;
 
@@ -162,7 +162,7 @@ extern "system" fn prompt_result(_: This, block: *mut AsyncBlock) -> HRESULT {
 }
 
 static VTABLE: Methods<8> = Methods([
-    missing::<0> as *const (),
+    query_interface as *const (),
     add_ref as *const (),
     add_ref as *const (),
     path_size as *const (),        // 0x18

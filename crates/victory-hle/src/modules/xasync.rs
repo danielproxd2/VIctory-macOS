@@ -16,7 +16,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
 use std::time::Duration;
 
-use super::xgameruntime::{Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing};
+use super::xgameruntime::{
+    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, query_interface,
+};
 
 /// The task-queue provider; it is also the interface id titles ask for.
 pub const PROVIDER: Guid = Guid {
@@ -1152,7 +1154,7 @@ extern "system" fn m_set_process_queue(_: This, q: *const Queue) {
 extern "system" fn m_check_thread(_: This) {}
 
 static VTABLE: Methods<31> = Methods([
-    missing::<0> as *const (),         // 0x00 QueryInterface
+    query_interface as *const (),      // 0x00 QueryInterface
     add_ref as *const (),              // 0x08 AddRef
     add_ref as *const (),              // 0x10 Release: the object is static
     m_get_status as *const (),         // 0x18

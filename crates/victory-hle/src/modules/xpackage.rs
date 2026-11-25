@@ -9,7 +9,8 @@ use std::sync::OnceLock;
 
 use super::xasync::{self, AsyncBlock};
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, put_string, text, token,
+    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, put_string,
+    query_interface, text, token,
 };
 use crate::runtime;
 
@@ -269,7 +270,7 @@ extern "system" fn enumerate(
 }
 
 static VTABLE: Methods<40> = Methods([
-    missing::<0> as *const (),
+    query_interface as *const (),
     add_ref as *const (),
     add_ref as *const (),
     current_identifier as *const (),    // 0x18

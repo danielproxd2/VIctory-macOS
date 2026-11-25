@@ -10,7 +10,7 @@
 use std::ffi::{c_char, c_void};
 
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, text,
+    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, query_interface, text,
 };
 
 /// Closed captions, high contrast, speech to text and synthesis.
@@ -96,7 +96,7 @@ extern "system" fn stream_data(
 }
 
 static VTABLE: Methods<22> = Methods([
-    missing::<0> as *const (),
+    query_interface as *const (),
     add_ref as *const (),
     add_ref as *const (),
     missing::<3> as *const (),      // 0x18 closed captions

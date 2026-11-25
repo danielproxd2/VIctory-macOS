@@ -8,7 +8,8 @@ use std::ffi::{c_char, c_void};
 
 use super::xasync::{self, AsyncBlock, ProviderData};
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, put_string, text, token,
+    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, put_string,
+    query_interface, text, token,
 };
 
 /// The user provider.
@@ -270,7 +271,7 @@ extern "system" fn find_for_device(_: This, _device: *const c_void, _: *mut Hand
 // Unset slots (no title seen calls them): maximum users, gamer pictures,
 // the UTF-16 token calls, issue resolution.
 static VTABLE: Methods<35> = Methods([
-    missing::<0> as *const (),             // 0x00 QueryInterface
+    query_interface as *const (),          // 0x00 QueryInterface
     add_ref as *const (),                  // 0x08 AddRef
     add_ref as *const (),                  // 0x10 Release: the object is static
     duplicate as *const (),                // 0x18
@@ -308,14 +309,14 @@ static VTABLE: Methods<35> = Methods([
 ]);
 
 static GAMERTAG_VTABLE: Methods<4> = Methods([
-    missing::<0> as *const (),
+    query_interface as *const (),
     add_ref as *const (),
     add_ref as *const (),
     get_gamertag as *const (), // 0x18
 ]);
 
 static DEVICE_VTABLE: Methods<6> = Methods([
-    missing::<0> as *const (),
+    query_interface as *const (),
     add_ref as *const (),
     add_ref as *const (),
     find_for_device as *const (), // 0x18

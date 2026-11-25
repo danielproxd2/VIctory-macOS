@@ -26,7 +26,7 @@ use std::sync::Mutex;
 
 use super::xasync::{self, AsyncBlock, E_INVALIDARG};
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, text,
+    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, query_interface, text,
 };
 use super::{storage, xuser};
 use crate::runtime;
@@ -985,7 +985,7 @@ extern "system" fn submit_result(_: This, block: *mut AsyncBlock) -> HRESULT {
 }
 
 static VTABLE: Methods<30> = Methods([
-    missing::<0> as *const (),
+    query_interface as *const (),
     add_ref as *const (),
     add_ref as *const (),
     missing::<3> as *const (),         // 0x18 initialize (blocking)

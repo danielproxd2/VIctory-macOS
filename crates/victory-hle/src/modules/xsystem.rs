@@ -4,7 +4,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, Object, add_ref, missing, put_string,
+    Guid, HRESULT, Interface, Methods, Object, add_ref, put_string, query_interface,
 };
 
 pub const PROVIDER: Guid = Guid::new(
@@ -115,7 +115,7 @@ extern "system" fn analytics_info(_: This, out: *mut AnalyticsInfo) -> *mut Anal
 }
 
 static VTABLE: Methods<6> = Methods([
-    missing::<0> as *const (),
+    query_interface as *const (),
     add_ref as *const (),
     add_ref as *const (),
     console_id as *const (), // 0x18, by the older table; titles seen do not call it
@@ -124,7 +124,7 @@ static VTABLE: Methods<6> = Methods([
 ]);
 
 static ANALYTICS_VTABLE: Methods<4> = Methods([
-    missing::<0> as *const (),
+    query_interface as *const (),
     add_ref as *const (),
     add_ref as *const (),
     analytics_info as *const (), // 0x18
