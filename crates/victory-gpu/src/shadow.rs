@@ -983,25 +983,27 @@ const WINDOW: u64 = 4 << 20;
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
-/// The copy of loose memory `[address, end)`: one there is that holds all
-/// of it, else a new one of the windows it touches.
+/// The copy of loose memory `[address, end)`: the copy of the windows it
+/// touches, one per (first window, length), as upstream keys them.
 ///
-/// shortcut: a new copy may overlap older ones (a range across two windows
-/// after ranges inside each): the same title memory then has two host
-/// copies, each brought up to date where it is used, and what shaders write
-/// into one is not seen through the other. Logged once.
+/// shortcut (upstream's): copies of different keys may overlap (a range
+/// across two windows and ranges inside each; a range inside a window of
+/// a longer copy): the same title memory then has two host copies, each
+/// brought up to date where it is used, and what shaders write into one
+/// is not seen through the other. The first such copy is logged.
+///
+/// (For a while this fork answered a range with any copy that held all of
+/// it. Nothing else in this file needs that, it only made the overlap
+/// rarer in one of the two orders, and it changed which copy answers for
+/// ordinary ranges, so the lookup is upstream's again. What stays is that
+/// a range in the last window of the address space has no copy instead of
+/// an overflow.)
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
     // A range in the last window of the address space has no copy.
     let len = end.checked_next_multiple_of(WINDOW)? - start;
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-    // Few copies, so all that start at or below the address are looked at.
-    if let Some(shadow) = map
-        .range(..=(address, u64::MAX))
-        .rev()
-        .map(|(_, s)| s)
-        .find(|s| s.end() >= end)
-    {
+    if let Some(shadow) = map.get(&(start, len)) {
         return Some(shadow.clone());
     }
     if map
@@ -1437,11 +1439,14 @@ mod tests {
         assert_eq!(found, Some((u64::MAX - 64, 64)));
     }
 
-    /// Loose memory (outside any buffer) is copied by 4 MiB window; a
-    /// range inside a copy there already is uses that copy. The addresses
-    /// are in no test's memory: nothing here reads them.
+    /// Loose memory (outside any buffer) is copied by the 4 MiB windows a
+    /// range touches, one copy per (first window, length), as upstream
+    /// keys them: ranges in one window share its copy, and a range across
+    /// two windows has a copy of both that ranges inside either window do
+    /// not use. The addresses are in no test's memory: nothing here reads
+    /// them.
     #[test]
-    fn loose_ranges_in_one_window_share_a_copy() {
+    fn loose_ranges_share_the_copy_of_their_own_windows() {
         let Some(_gpu) = crate::testing::gpu() else {
             return;
         };
@@ -1456,20 +1461,29 @@ mod tests {
         let next = find(BASE + WINDOW, 1).unwrap();
         assert_eq!((next.start, next.len), (BASE + WINDOW, WINDOW));
 
-        // A range across two windows gets one copy of both, and ranges
-        // inside either then use it.
+        // A range across two windows gets one copy of both, and the same
+        // windows asked for again get the same copy.
         const FAR: u64 = BASE + 16 * WINDOW;
         let both = find(FAR + WINDOW - 8, 16).unwrap();
         assert_eq!((both.start, both.len), (FAR, 2 * WINDOW));
+        let again = find(FAR + 64, WINDOW).unwrap();
+        assert!(Arc::ptr_eq(&both, &again));
+        // A range inside one of its windows is that window's own copy,
+        // not the larger one that also holds it (upstream's keying; the
+        // shortcut documented at `loose`).
         let first = find(FAR + 64, 64).unwrap();
         let second = find(FAR + WINDOW + 64, 64).unwrap();
-        assert!(Arc::ptr_eq(&both, &first));
-        assert!(Arc::ptr_eq(&both, &second));
-        // shortcut (as documented at `loose`): the other way round, the
-        // range across gets a second copy that overlaps the first two.
+        assert_eq!((first.start, first.len), (FAR, WINDOW));
+        assert_eq!((second.start, second.len), (FAR + WINDOW, WINDOW));
+        assert!(!Arc::ptr_eq(&both, &first));
+        assert!(!Arc::ptr_eq(&both, &second));
+        assert!(Arc::ptr_eq(&first, &find(FAR + WINDOW - 1, 1).unwrap()));
+        // The other way round as well: the range across gets a copy of
+        // its own that overlaps the two there are.
         let across = find(BASE + WINDOW - 8, 16).unwrap();
         assert_eq!((across.start, across.len), (BASE, 2 * WINDOW));
         assert!(!Arc::ptr_eq(&across, &a));
+        assert!(Arc::ptr_eq(&a, &find(BASE + 8, 8).unwrap()));
     }
 
     #[test]
