@@ -8,6 +8,8 @@
 pub mod config;
 pub mod logging;
 pub mod policy;
+#[cfg(test)]
+mod testing;
 
 pub use config::Config;
 pub use policy::{PolicyError, ensure_outside_repo};

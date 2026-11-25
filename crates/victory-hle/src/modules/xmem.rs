@@ -2830,6 +2830,10 @@ mod tests {
             assert!(said[0].starts_with("VIctory: Wine could not create a section for"));
             assert!(said[0].contains("os error 8"), "{said:?}");
             assert!(said[0].contains("free memory and disk space"), "{said:?}");
+        } else {
+            // The failure itself was checked above; elsewhere memory is
+            // asked for at each commit, which has its own report.
+            crate::testing::skip("not Wine: only there is a refused section reported");
         }
         // A count that is no size at all is no failure of the host's:
         // nothing is asked of it and nothing reported.
@@ -2958,7 +2962,7 @@ mod tests {
         if !on_wine() {
             // Elsewhere the section is reserved and each view committed:
             // `physical_pages_map_alias_and_unmap` covers that path.
-            eprintln!("skipped: not Wine");
+            crate::testing::skip("not Wine: only there is a section committed whole");
             return;
         }
         let resident = || {

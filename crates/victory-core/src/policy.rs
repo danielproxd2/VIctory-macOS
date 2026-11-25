@@ -519,7 +519,7 @@ mod tests {
         std::fs::write(tree.join(ROOT_MARKER), "").unwrap();
         let shouted = tmp.path().join("VICTORY-TREE");
         if !shouted.join(ROOT_MARKER).is_file() {
-            println!("skipped: the temporary folder is on a case-sensitive volume");
+            crate::testing::skip("the temporary folder is on a case-sensitive volume");
             return;
         }
         // Compared with the tree (check 1) and found by its marker (check 2).
@@ -594,7 +594,7 @@ mod tests {
     #[test]
     fn host_path_inside_a_source_tree_is_refused() {
         if !wine::present() {
-            println!("skipped: not Wine (kernel32 has no wine_get_unix_file_name)");
+            crate::testing::skip("not Wine: kernel32 has no wine_get_unix_file_name");
             return;
         }
         let tmp = tempfile::tempdir().unwrap();
@@ -639,13 +639,13 @@ mod tests {
     #[test]
     fn repo_path_through_a_wine_drive_is_refused() {
         if !wine::present() {
-            println!("skipped: not Wine (kernel32 has no wine_get_unix_file_name)");
+            crate::testing::skip("not Wine: kernel32 has no wine_get_unix_file_name");
             return;
         }
         // A cross-compiled binary has the host's spelling of its tree.
         let manifest = env!("CARGO_MANIFEST_DIR");
         if !manifest.starts_with('/') {
-            println!("skipped: built on Windows, the tree has no host path");
+            crate::testing::skip("built on Windows: the tree has no host path");
             return;
         }
         let root = normalize(&wine::host_path(manifest).join("..").join(".."));
