@@ -1501,7 +1501,9 @@ mod tests {
 
     /// Where the loop's last base is past the end of the address space, the
     /// real loop never leaves by its compare: the loop is not taken as one.
-    /// Only its `clwb` is skipped, and the registers stay as they were.
+    /// Only its `clwb` is skipped, and the registers stay as they were:
+    /// the limit and the flags too, and at the very end of the address
+    /// space, which the test of the wrapping ranges below does not look at.
     #[test]
     fn clwb_loop_with_extreme_limit_does_not_overflow() {
         for (base, limit) in [
@@ -1800,6 +1802,9 @@ mod tests {
         *OPENED_ON_WRITE.lock().unwrap() = (0..0, 0);
     }
 
+    /// The instructions of `clwb_lengths` with other bytes behind them, as
+    /// in code, and cut short, as at the end of a page that is followed by
+    /// none: only an instruction that is there whole has a length.
     #[test]
     fn clwb_lengths_in_padded_and_cut_code() {
         let pad = |b: &[u8]| {
