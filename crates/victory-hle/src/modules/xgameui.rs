@@ -5,10 +5,13 @@
 //! when the dialog is dismissed or cannot open. A message dialog is a host
 //! dialog too, with the title's buttons: the call completes with the
 //! button pressed, or with the button the title named as its cancel action
-//! when the dialog is dismissed or cannot open. An error dialog shows the
-//! code and the title's text and completes when it is dismissed. Invites,
-//! achievements and the player picker have no documented result without
-//! the system's UI and stay unimplemented.
+//! when the user dismisses the dialog. An error dialog shows the code and
+//! the title's text and completes when the user dismisses it. Where no
+//! dialog can be shown (a host without dialogs, a session without a
+//! desktop) nobody has pressed or dismissed anything, and nothing public
+//! says what the call completes with then: both calls fail with
+//! `E_NOTIMPL`. Invites, achievements and the player picker have no
+//! documented result without the system's UI and stay unimplemented.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::{c_char, c_void};
@@ -114,12 +117,31 @@ static ERROR: u8 = 0;
 /// `XGameUiMessageDialogButton::Third`, the last of the three buttons.
 const THIRD: u32 = 2;
 
+/// What became of a dialog with buttons.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))] // only Windows hosts show one
+enum Answer {
+    /// The user pressed the button with this index.
+    Pressed(u32),
+    /// The user left the dialog without a button (Esc, the close box).
+    Dismissed,
+    /// No dialog could be shown, so the user has answered nothing.
+    Unavailable,
+}
+
+/// What a dialog call completes with where no dialog can be shown. The
+/// public reference describes only a dialog the user answers, so this is
+/// our choice of a clean failure, not console behaviour: a success would
+/// tell the title that the user had seen the message and chosen.
+const NO_DIALOG: HRESULT = xasync::E_NOTIMPL;
+
 /// `XGameUiShowMessageDialogAsync`: "The index of the button pressed by
 /// the user is contained in the result." A button exists for each text
-/// the title gives; `cancel` "represents the cancel action", so it is the
-/// result when the dialog is dismissed without a button (or cannot open
-/// on this host). A default or cancel button that is none of the three
-/// is refused.
+/// the title gives; `cancelButton` "Indicates which button represents the
+/// cancel action", so it is the result when the user dismisses the dialog
+/// without a button. Where no dialog can be shown the call completes with
+/// [`NO_DIALOG`] and has no result. A default or cancel button that is
+/// none of the three is refused (our choice of failure as well).
 #[allow(clippy::too_many_arguments)]
 extern "system" fn message_dialog_async(
     _: This,
@@ -139,9 +161,14 @@ extern "system" fn message_dialog_async(
     let buttons = [first, second, third].map(text);
     tracing::info!(title, content, "message dialog");
     xasync::pending_with(block, (&raw const MESSAGE).cast(), move || {
-        let pressed = choose(&title, &content, &buttons, default);
-        tracing::info!(?pressed, cancel, "message dialog: done");
-        Ok(pressed.unwrap_or(cancel).to_le_bytes().to_vec())
+        let answer = choose(&title, &content, &buttons, default);
+        tracing::info!(?answer, cancel, "message dialog: done");
+        let button = match answer {
+            Answer::Pressed(button) => button,
+            Answer::Dismissed => cancel,
+            Answer::Unavailable => return Err(NO_DIALOG),
+        };
+        Ok(button.to_le_bytes().to_vec())
     })
 }
 /// `XGameUiShowMessageDialogResult`: the button, once the call is over.
@@ -171,8 +198,9 @@ extern "system" fn message_dialog_result(
 
 /// `XGameUiShowErrorDialogAsync`: "The async operation completes when the
 /// user dismisses the error dialog." There is no service to look the code
-/// up, so the dialog shows the code and the title's own text; on a host
-/// without dialogs the error is only logged and the call completes.
+/// up, so the dialog shows the code and the title's own text. Where no
+/// dialog can be shown no user dismisses anything: the error is logged and
+/// the call completes with [`NO_DIALOG`].
 extern "system" fn error_dialog_async(
     _: This,
     block: *mut AsyncBlock,
@@ -182,8 +210,10 @@ extern "system" fn error_dialog_async(
     let content = error_text(code, &text(context).unwrap_or_default());
     tracing::warn!(content, "error dialog");
     xasync::pending_with(block, (&raw const ERROR).cast(), move || {
-        choose("Error", &content, &[Some("OK".to_owned()), None, None], 0);
-        Ok(Vec::new())
+        match choose("Error", &content, &[Some("OK".to_owned()), None, None], 0) {
+            Answer::Pressed(_) | Answer::Dismissed => Ok(Vec::new()),
+            Answer::Unavailable => Err(NO_DIALOG),
+        }
     })
 }
 extern "system" fn error_dialog_result(_: This, block: *mut AsyncBlock) -> HRESULT {
@@ -237,33 +267,46 @@ fn ask(title: &str, _: &str, _: &str, _: u32) -> Option<String> {
     None
 }
 
-/// Shows a message with a button for each text given, `default` focused;
-/// the index of the button pressed, `None` if dismissed without one.
+/// Shows a message with a button for each text given, `default` focused,
+/// and waits for the user's answer.
 #[cfg(all(not(test), windows))]
-fn choose(title: &str, content: &str, buttons: &[Option<String>; 3], default: u32) -> Option<u32> {
+fn choose(title: &str, content: &str, buttons: &[Option<String>; 3], default: u32) -> Answer {
     dialog::message(title, content, buttons, default)
 }
 
 /// Tests answer for the user: a title "Press <label>" presses the button
-/// with that label; any other dialog is dismissed. What was shown is kept.
+/// with that label (dismissing the dialog if it has none), a context
+/// "no dialog" is a host that can show none, and any other dialog is
+/// dismissed. What was shown is kept.
 #[cfg(test)]
-fn choose(title: &str, content: &str, buttons: &[Option<String>; 3], _: u32) -> Option<u32> {
+fn choose(title: &str, content: &str, buttons: &[Option<String>; 3], _: u32) -> Answer {
+    if content.starts_with("no dialog") {
+        return Answer::Unavailable;
+    }
     let mut shown = tests::SHOWN.lock().unwrap_or_else(|e| e.into_inner());
     shown.push(format!("{title}|{content}"));
-    let label = title.strip_prefix("Press ")?;
-    let pressed = buttons.iter().position(|b| b.as_deref() == Some(label));
-    pressed.map(|i| i as u32)
+    let pressed = title
+        .strip_prefix("Press ")
+        .and_then(|label| buttons.iter().position(|b| b.as_deref() == Some(label)));
+    pressed.map_or(Answer::Dismissed, |i| Answer::Pressed(i as u32))
 }
 
-/// No native dialog exists yet on other hosts, so a message is dismissed.
+/// No native dialog exists yet on other hosts.
 #[cfg(all(not(test), not(windows)))]
-fn choose(title: &str, content: &str, _: &[Option<String>; 3], _: u32) -> Option<u32> {
+fn choose(title: &str, content: &str, _: &[Option<String>; 3], _: u32) -> Answer {
+    host_without_dialogs(title, content)
+}
+
+/// What a host that has no dialogs answers for one: it is logged, and the
+/// user has seen nothing.
+#[cfg_attr(windows, allow(dead_code))] // the answer of other hosts
+fn host_without_dialogs(title: &str, content: &str) -> Answer {
     tracing::warn!(
         title,
         content,
         "message dialog is not available on this host"
     );
-    None
+    Answer::Unavailable
 }
 
 #[cfg(windows)]
@@ -272,6 +315,8 @@ mod dialog {
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
     use windows_sys::Win32::UI::WindowsAndMessaging::{self as wm, DLGTEMPLATE};
+
+    use super::Answer;
 
     pub(super) const EDIT: i32 = 100;
     // Edit control messages (the controls headers).
@@ -480,15 +525,16 @@ mod dialog {
         t
     }
 
-    /// Shows the message modally, `default` focused. The index of the
-    /// button pressed; `None` for Esc, the close box, or no dialog.
+    /// Shows the message modally, `default` focused: the button pressed,
+    /// dismissed for Esc or the close box, unavailable if no dialog could
+    /// be shown.
     #[allow(dead_code)] // unused in most test builds
     pub(super) fn message(
         title: &str,
         content: &str,
         buttons: &[Option<String>; 3],
         default: u32,
-    ) -> Option<u32> {
+    ) -> Answer {
         let mut shown = Shown {
             default,
             pressed: None,
@@ -497,8 +543,18 @@ mod dialog {
         };
         // `shown` outlives the modal dialog.
         let template = message_template(title, content, buttons, default);
-        template.run(message_procedure, (&raw mut shown) as LPARAM);
-        shown.pressed
+        let ran = template.run(message_procedure, (&raw mut shown) as LPARAM);
+        answer(ran, shown.pressed)
+    }
+
+    /// What a modal message dialog ended as: `ran` is whether it was shown
+    /// at all (`Template::run`), `pressed` the button its procedure noted.
+    pub(super) fn answer(ran: bool, pressed: Option<u32>) -> Answer {
+        match (ran, pressed) {
+            (false, _) => Answer::Unavailable,
+            (true, Some(button)) => Answer::Pressed(button),
+            (true, None) => Answer::Dismissed,
+        }
     }
 
     extern "system" fn message_procedure(
@@ -837,13 +893,22 @@ mod tests {
     /// Shows a message dialog with buttons "One" and "Three" (no second
     /// one); the status it completes with and the button in its result.
     fn message(title: &std::ffi::CStr, default: u32, cancel: u32) -> (HRESULT, HRESULT, u32) {
+        message_saying(title, c"Text", default, cancel)
+    }
+
+    fn message_saying(
+        title: &std::ffi::CStr,
+        content: &std::ffi::CStr,
+        default: u32,
+        cancel: u32,
+    ) -> (HRESULT, HRESULT, u32) {
         let this: This = &OBJECT;
         let mut b = block();
         let hr = method::<Message>(&OBJECT, 0x18)(
             this,
             &mut b,
             title.as_ptr(),
-            c"Text".as_ptr(),
+            content.as_ptr(),
             c"One".as_ptr(),
             std::ptr::null(),
             c"Three".as_ptr(),
@@ -903,6 +968,45 @@ mod tests {
         let mut button = u32::MAX;
         assert_eq!(result(this, &mut b, &mut button), S_OK);
         assert_eq!(button, 0);
+    }
+
+    /// Where no dialog can be shown the user has neither pressed nor
+    /// dismissed anything: the message dialog fails instead of answering
+    /// with the title's cancel button, the error dialog fails instead of
+    /// completing as if it had been read, and neither has a result.
+    #[test]
+    fn dialogs_that_cannot_be_shown_fail_the_call() {
+        assert_eq!(NO_DIALOG as u32, 0x8000_4001);
+        for cancel in 0..=2 {
+            assert_eq!(
+                message_saying(c"Press One", c"no dialog here", 0, cancel),
+                (NO_DIALOG, NO_DIALOG, u32::MAX),
+                "cancel {cancel}"
+            );
+        }
+        type Error = extern "system" fn(This, *mut AsyncBlock, HRESULT, *const c_char) -> HRESULT;
+        type Done = extern "system" fn(This, *mut AsyncBlock) -> HRESULT;
+        let this: This = &OBJECT;
+        let mut b = block();
+        let code = 0x8923_5200_u32 as i32;
+        // The call itself begins; it is its completion that fails.
+        assert_eq!(
+            method::<Error>(&OBJECT, 0x70)(this, &mut b, code, c"no dialog".as_ptr()),
+            S_OK
+        );
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), NO_DIALOG);
+        assert_eq!(method::<Done>(&OBJECT, 0x78)(this, &mut b), NO_DIALOG);
+        // A host that has no dialogs is such a case, whatever is asked.
+        assert_eq!(host_without_dialogs("Title", "Text"), Answer::Unavailable);
+        // A modal host dialog that did not run is one too, and one that
+        // ran answers with the button noted or as dismissed.
+        #[cfg(windows)]
+        {
+            assert_eq!(dialog::answer(false, None), Answer::Unavailable);
+            assert_eq!(dialog::answer(false, Some(1)), Answer::Unavailable);
+            assert_eq!(dialog::answer(true, Some(1)), Answer::Pressed(1));
+            assert_eq!(dialog::answer(true, None), Answer::Dismissed);
+        }
     }
 
     #[test]
@@ -1178,10 +1282,10 @@ mod tests {
         let id = std::process::id();
         let buttons = [Some("Yes".to_owned()), None, Some("No".to_owned())];
         let cases = [
-            (dialog::FIRST_BUTTON, Some(0)),
-            (dialog::FIRST_BUTTON + 2, Some(2)),
+            (dialog::FIRST_BUTTON, Answer::Pressed(0)),
+            (dialog::FIRST_BUTTON + 2, Answer::Pressed(2)),
             // Esc and the close box send the cancel command.
-            (IDCANCEL, None),
+            (IDCANCEL, Answer::Dismissed),
         ];
         for (n, (command, expected)) in cases.into_iter().enumerate() {
             let title = format!("victory message test {id} {n}");
@@ -1189,7 +1293,7 @@ mod tests {
             let pressed = dialog::message(&title, "Two lines\nof text", &buttons, 2);
             if n == 0 && !presser.join().unwrap() {
                 // No dialog came up at all, so the call returned at once.
-                assert_eq!(pressed, None);
+                assert_eq!(pressed, Answer::Unavailable);
                 return crate::testing::skip("no dialog can be shown in this session");
             }
             assert_eq!(pressed, expected, "command {command}");
