@@ -1,6 +1,6 @@
 //! The shell scripts in tools/macos: that they parse, and the parts of
-//! test-wine.sh and gnullvm-cc.sh that can run without Wine or a compiler,
-//! with stand-ins for the programs they start.
+//! test-wine.sh, victory.sh and gnullvm-cc.sh that can run without Wine or
+//! a compiler, with stand-ins for the programs they start.
 #![cfg(unix)]
 
 use std::fs;
@@ -243,4 +243,143 @@ fn test_wine_builds_the_fixtures_and_removes_its_wrapper() {
             runner.parent().unwrap().display()
         );
     }
+}
+
+/// What victory.sh starts Wine with, from stand-ins for cargo and wine in a
+/// home folder of the test's own.
+struct Launched {
+    out: Output,
+    /// The stand-in wine's `VICTORY_DATA_DIR`, `None` when it had none.
+    data_dir: Option<String>,
+    /// The arguments the stand-in wine got.
+    args: Vec<String>,
+    /// The home folder as Wine's Z: drive shows it.
+    home: String,
+}
+
+/// Runs victory.sh with `VICTORY_DATA_DIR` and `VICTORY_CONFIG` as given.
+/// `config` is the text of a config file in the test's folder; the script
+/// is told about it by `config_name`, in which `{}` stands for the file's
+/// macOS path. (Without `VICTORY_CONFIG` the script would read the
+/// victory.toml of whoever runs the tests.)
+fn victory(name: &str, data_dir: Option<&str>, config: &str, config_name: &str) -> Launched {
+    let dir = scratch(name);
+    let log = dir.join("wine.log");
+    let home = dir.join("home");
+    fs::create_dir_all(dir.join("wine/lib/external/D3DMetal.framework")).unwrap();
+    script(
+        &dir.join("bin/cargo"),
+        r#"echo "cargo $*" >> "$STAND_IN_LOG""#,
+    );
+    script(
+        &dir.join("wine/bin/wine"),
+        r#"{
+    printf '%s\n' "data ${VICTORY_DATA_DIR-<unset>}"
+    printf 'arg %s\n' "$@"
+} >> "$STAND_IN_LOG""#,
+    );
+    let file = dir.join("victory config.toml");
+    fs::write(&file, config).unwrap();
+    let windows = |path: &Path| format!("Z:{}", path.display().to_string().replace('/', "\\"));
+    let config_name = config_name
+        .replace("{Z}", &windows(&file))
+        .replace("{}", &file.display().to_string());
+    let mut command = Command::new(root().join("tools/macos/victory.sh"));
+    command
+        .args(["run", "--execute", "a title.exe"])
+        .env("CARGO", dir.join("bin/cargo"))
+        .env("WINE", dir.join("wine/bin/wine"))
+        .env("HOME", &home)
+        .env("STAND_IN_LOG", &log)
+        .env("VICTORY_CONFIG", config_name)
+        .env_remove("VICTORY_DATA_DIR")
+        .env_remove("WINEPREFIX");
+    if let Some(data_dir) = data_dir {
+        command.env("VICTORY_DATA_DIR", data_dir);
+    }
+    let out = command.output().unwrap();
+    assert!(out.status.success(), "{name}: {}", text(&out.stderr));
+    assert_eq!(logged(&log, "cargo ").len(), 1, "{name}: built once");
+    let data = logged(&log, "data ");
+    assert_eq!(data.len(), 1, "{name}: wine started once");
+    Launched {
+        out,
+        data_dir: (data[0] != "<unset>").then(|| data[0].clone()),
+        args: logged(&log, "arg "),
+        home: windows(&home),
+    }
+}
+
+/// What titles save must not sit in the Wine prefix, which the launcher
+/// keeps under ~/Library/Caches: with no data folder named anywhere, the
+/// launcher names one under ~/Library/Application Support.
+#[test]
+fn victory_sh_keeps_saved_data_out_of_the_cache_folder() {
+    const NO_DATA_DIR: &str = "[paths]\ngame_dir = 'Z:\\g'\n# data_dir = 'Z:\\commented\\out'\n";
+    let expected =
+        |l: &Launched| format!("{}\\Library\\Application Support\\victory\\data", l.home);
+
+    // The config file named the way Wine needs it, and by its macOS path.
+    for (name, config_name) in [
+        ("victory-sh-default", "{Z}"),
+        ("victory-sh-default-unix", "{}"),
+    ] {
+        let launched = victory(name, None, NO_DATA_DIR, config_name);
+        assert_eq!(launched.data_dir, Some(expected(&launched)), "{name}");
+        assert!(expected(&launched).starts_with("Z:\\"), "{name}");
+        assert!(!expected(&launched).contains("Caches"), "{name}");
+        assert_eq!(text(&launched.out.stderr), "", "{name}");
+        // The title's arguments arrive whole, behind the program.
+        assert!(launched.args[0].ends_with("/release/victory.exe"), "{name}");
+        assert_eq!(launched.args[1..], ["run", "--execute", "a title.exe"]);
+    }
+    // An empty variable names nothing, to the launcher as to victory.exe.
+    let launched = victory("victory-sh-empty", Some(""), NO_DATA_DIR, "{Z}");
+    assert_eq!(launched.data_dir, Some(expected(&launched)));
+
+    // The user's variable stays as it is.
+    let launched = victory("victory-sh-env", Some("Z:\\mine"), NO_DATA_DIR, "{Z}");
+    assert_eq!(launched.data_dir.as_deref(), Some("Z:\\mine"));
+
+    // A variable would override the config file's data_dir: none is set.
+    for (name, config) in [
+        ("victory-sh-file", "[paths]\ndata_dir = 'Z:\\saves'\n"),
+        (
+            "victory-sh-file-indented",
+            "[paths]\n  data_dir='Z:\\saves'\n",
+        ),
+        ("victory-sh-file-dotted", "paths.data_dir = 'Z:\\saves'\n"),
+        (
+            "victory-sh-file-inline",
+            "paths = { data_dir = 'Z:\\saves' }\n",
+        ),
+    ] {
+        let launched = victory(name, None, config, "{Z}");
+        assert_eq!(launched.data_dir, None, "{name}");
+        assert_eq!(text(&launched.out.stderr), "", "{name}");
+    }
+
+    // A config file macOS cannot read may name one too; the launcher says
+    // where the data goes if it does not.
+    let launched = victory(
+        "victory-sh-unreadable",
+        None,
+        "",
+        "C:\\elsewhere\\victory.toml",
+    );
+    assert_eq!(launched.data_dir, None);
+    let said = text(&launched.out.stderr);
+    assert!(
+        said.contains("C:\\elsewhere\\victory.toml") && said.contains("Library/Caches"),
+        "{said}"
+    );
+}
+
+/// The variable the launcher sets is the one the configuration reads.
+#[test]
+fn victory_sh_sets_the_variable_the_config_reads() {
+    let config = fs::read_to_string(root().join("crates/victory-core/src/config.rs")).unwrap();
+    assert!(config.contains(r#"env_path("VICTORY_DATA_DIR")"#));
+    let launcher = fs::read_to_string(root().join("tools/macos/victory.sh")).unwrap();
+    assert!(launcher.contains(r#"export VICTORY_DATA_DIR="Z:"#));
 }

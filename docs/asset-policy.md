@@ -47,7 +47,9 @@ the check refuses. It holds nothing from a game.
 Outside the repository, configured in `victory.toml`: `game_dir` (the
 user's dump), `test_titles`, `cache_dir` for everything derived
 (default `%LOCALAPPDATA%\victory\cache`) and `data_dir` for what titles
-save (default `%LOCALAPPDATA%\victory\data`).
+save (default `%LOCALAPPDATA%\victory\data`; under `tools/macos/victory.sh`
+`~/Library/Application Support/victory/data`, because the Wine prefix that
+holds `%LOCALAPPDATA%` is in a cache folder).
 
 ## Enforcement
 

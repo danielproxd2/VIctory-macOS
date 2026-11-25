@@ -23,9 +23,13 @@ test_titles = []
 # Wine shows the whole Mac as drive Z:, so /Users/<you>/victory-data is
 # Z:\Users\<you>\victory-data. Do not use D: or other letters: Wine maps
 # them to whatever volumes happen to be mounted.
-# The defaults also work: %LOCALAPPDATA% lies inside the Wine prefix, which
-# victory.sh keeps in ~/Library/Caches/victory-macos/prefix-play. A cache
-# there may be cleared by macOS tools, so name data_dir if saves matter.
+# The defaults also work. %LOCALAPPDATA% lies inside the Wine prefix, which
+# victory.sh keeps in ~/Library/Caches/victory-macos/prefix-play, a folder
+# macOS tools may clear; that is where the default cache_dir is. What titles
+# save must not be lost with it: when neither VICTORY_DATA_DIR nor the
+# config file names a data_dir, victory.sh sets VICTORY_DATA_DIR to
+# ~/Library/Application Support/victory/data (in the Z:\ form). Started
+# without victory.sh, the default is the one inside the prefix.
 # Instead of this file the launcher's environment can name the folders:
 # VICTORY_GAME_DIR, VICTORY_CACHE_DIR and VICTORY_DATA_DIR, in the same
 # Z:\ form. Replace the [paths] values above with these:
