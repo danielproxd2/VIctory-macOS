@@ -170,8 +170,12 @@ pub extern "system" fn XMemVirtualQuery(
     out: *mut BasicInformation,
 ) -> BOOL {
     let size = size_of::<MEMORY_BASIC_INFORMATION>();
-    // SAFETY: the title passes room for the whole structure; the host
-    // fails on a null one.
+    // Windows fails the query for a null structure; Wine writes through it
+    // inside its own lock and the process hangs.
+    if out.is_null() {
+        return 0;
+    }
+    // SAFETY: the title passes room for the whole structure.
     unsafe {
         if VirtualQueryEx(process, address, out.cast(), size) == 0 {
             return 0;
@@ -1053,6 +1057,15 @@ mod tests {
         assert!((p as usize) + (16 << 30) <= 1 << 40, "{p:p}");
         // SAFETY: our own reservation.
         assert_ne!(unsafe { VirtualFree(p, 0, MEM_RELEASE) }, 0);
+    }
+
+    #[test]
+    fn a_query_without_a_structure_fails() {
+        let here = (&raw const PHYSICAL).cast::<c_void>();
+        // SAFETY: a pseudo handle needs no closing.
+        let process = unsafe { GetCurrentProcess() };
+        assert_eq!(XMemVirtualQuery(process, here, std::ptr::null_mut()), 0);
+        assert_eq!(query(here).host.State, MEM_COMMIT);
     }
 
     #[test]
