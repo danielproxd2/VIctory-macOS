@@ -581,134 +581,75 @@ fn f16_max_and_min_order_negative_zero_below_positive_zero() {
     }
 }
 
-/// A float format for [`max_min_reference`]: its sign bit and the bits of
-/// its positive infinity.
-#[derive(Clone, Copy)]
-struct FloatBits {
-    sign: u32,
-    infinity: u32,
+// What follows covers what upstream's probes leave out: the three-operand
+// half-float forms with NaN operands and over the format's edges, and the
+// packed forms. The 32-bit forms (two and three operands, with NaN, both
+// zeros, the infinities and 32-bit denormals, which the lowering reads as
+// zeros on their bits, so that the host's own denormal mode does not show)
+// and the two-operand half-float forms are checked against the model of
+// the hardware in `semantics_tests` (`min_max_and_clamp_match_the_hardware`,
+// `sixteen_bit_floats_match_the_hardware`), and the half-float zeros in
+// `f16_max_and_min_order_negative_zero_below_positive_zero` above.
+
+/// A half-float operand of a maximum or minimum: `None` for a NaN.
+fn f16_number(bits: u32) -> Option<u32> {
+    (bits & 0x7FFF <= 0x7C00).then_some(bits)
 }
 
-const F32_BITS: FloatBits = FloatBits {
-    sign: 0x8000_0000,
-    infinity: 0x7F80_0000,
-};
-const F16_BITS: FloatBits = FloatBits {
-    sign: 0x8000,
-    infinity: 0x7C00,
-};
-
-impl FloatBits {
-    /// `bits` as an operand of a maximum or minimum: `None` for a NaN.
-    fn number(self, bits: u32) -> Option<u32> {
-        (bits & (self.sign - 1) <= self.infinity).then_some(bits)
-    }
-
-    /// The place of a number in the order -inf < ... < -0 < +0 < ... < +inf:
-    /// sign and magnitude read as one signed integer.
-    fn key(self, bits: u32) -> i64 {
-        let magnitude = i64::from(bits & (self.sign - 1));
-        if bits & self.sign == 0 {
-            magnitude
-        } else {
-            -magnitude - 1
-        }
+/// The place of a half float in the order -inf < ... < -0 < +0 < ... <
+/// +inf: sign and magnitude read as one signed integer.
+fn f16_key(bits: u32) -> i64 {
+    let magnitude = i64::from(bits & 0x7FFF);
+    if bits & 0x8000 == 0 {
+        magnitude
+    } else {
+        -magnitude - 1
     }
 }
 
-/// The RDNA2 maximum (`max`) or minimum of two operands, each `None` for a
-/// NaN, written from the ISA's definition with integer compares only: a NaN
-/// operand gives the other operand, and -0 orders below +0. It is not
-/// `f32::max`/`f32::min`, which may return either zero. `None` is "a NaN",
-/// whose bits the tests leave open.
-fn max_min_reference(format: FloatBits, max: bool, a: Option<u32>, b: Option<u32>) -> Option<u32> {
+/// The RDNA2 maximum (`max`) or minimum of two half floats, each `None`
+/// for a NaN, written from the ISA's definition with integer compares
+/// only: a NaN operand gives the other operand, and -0 orders below +0.
+/// `None` is "a NaN", whose bits the tests leave open.
+fn f16_max_min_reference(max: bool, a: Option<u32>, b: Option<u32>) -> Option<u32> {
     match (a, b) {
         (None, other) | (other, None) => other,
         (Some(a), Some(b)) => {
             let first = if max {
-                format.key(a) >= format.key(b)
+                f16_key(a) >= f16_key(b)
             } else {
-                format.key(a) <= format.key(b)
+                f16_key(a) <= f16_key(b)
             };
             Some(if first { a } else { b })
         }
     }
 }
 
-/// [`max_min_reference`] of the first two (`operands` 2) or three input
-/// dwords: the three-operand forms are the two-operand one applied twice.
-fn max_min_reference_of(
-    format: FloatBits,
-    max: bool,
-    operands: usize,
-    inp: [u32; 4],
-) -> Option<u32> {
-    inp[..operands]
-        .iter()
-        .map(|&x| format.number(x))
-        .reduce(|a, b| max_min_reference(format, max, a, b))
-        .expect("at least one operand")
-}
-
-/// The scalar maximums and minimums of one format as
-/// `(name, is a maximum, operands, shader)`.
-fn max_min_shaders(half: bool) -> Vec<(&'static str, bool, usize, HostShader)> {
-    let ops: [(&'static str, bool, usize); 4] = if half {
-        [
-            ("v_max_f16", true, 2),
-            ("v_min_f16", false, 2),
-            ("v_max3_f16", true, 3),
-            ("v_min3_f16", false, 3),
-        ]
-    } else {
-        [
-            ("v_max_f32", true, 2),
-            ("v_min_f32", false, 2),
-            ("v_max3_f32", true, 3),
-            ("v_min3_f32", false, 3),
-        ]
-    };
-    ops.into_iter()
-        .map(|(name, max, operands)| {
-            let body = if operands == 2 {
-                asm::vop2(name, 0, asm::vgpr(1), 2)
-            } else {
-                let sources = [asm::vgpr(1), asm::vgpr(2), asm::vgpr(3)];
-                asm::vop3(name, 0, &sources, Vop3Mods::default())
-            };
-            (name, max, operands, build_valu_cs(&body))
-        })
-        .collect()
-}
-
-/// Runs every scalar maximum and minimum of one format over `cases` and
-/// returns a line for each result that is not [`max_min_reference_of`] its
-/// operands (any NaN where the reference is a NaN).
-fn max_min_mismatches(half: bool, cases: &[[u32; 4]]) -> Vec<String> {
-    let (format, mask) = if half {
-        (F16_BITS, 0xFFFF)
-    } else {
-        (F32_BITS, u32::MAX)
-    };
+/// Runs `v_max3_f16` and `v_min3_f16` over `cases` and returns a line for
+/// each result that is not [`f16_max_min_reference`] applied twice to the
+/// low halves of the three operands (any NaN where the reference is a NaN).
+fn f16_max3_min3_mismatches(cases: &[[u32; 4]]) -> Vec<String> {
     let mut wrong = Vec::new();
-    for (name, max, operands, shader) in max_min_shaders(half) {
+    for (name, max) in [("v_max3_f16", true), ("v_min3_f16", false)] {
+        let sources = [asm::vgpr(1), asm::vgpr(2), asm::vgpr(3)];
+        let shader = build_valu_cs(&asm::vop3(name, 0, &sources, Vop3Mods::default()));
         run_cases(&shader, cases, |backend, _, inp, got| {
-            let got = got & mask;
-            let want = max_min_reference_of(format, max, operands, inp);
+            let got = got & 0xFFFF;
+            let want = inp[..3]
+                .iter()
+                .map(|&x| f16_number(x))
+                .reduce(|a, b| f16_max_min_reference(max, a, b))
+                .expect("three operands");
             let same = match want {
                 Some(bits) => got == bits,
-                None => format.number(got).is_none(),
+                None => f16_number(got).is_none(),
             };
             if !same {
                 let want = want.map_or("a NaN".to_owned(), |bits| format!("{bits:#x}"));
-                let line = format!(
+                wrong.push(format!(
                     "{backend}: {name} {:x?} = {got:#x}, want {want}",
-                    &inp[..operands]
-                );
-                // The two-operand forms meet a pair once for each third dword.
-                if !wrong.contains(&line) {
-                    wrong.push(line);
-                }
+                    &inp[..3]
+                ));
             }
         });
     }
@@ -717,9 +658,7 @@ fn max_min_mismatches(half: bool, cases: &[[u32; 4]]) -> Vec<String> {
 
 /// Every way of placing NaNs from `nans` among three operands whose other
 /// values come from `numbers`: one NaN in each place beside each ordered
-/// pair of numbers, two NaNs around each number, and all NaNs. The
-/// two-operand instructions read the first two dwords, so they see one NaN
-/// on either side, two NaNs, and (from the cases whose NaN is third) none.
+/// pair of numbers, two NaNs around each number, and all NaNs.
 fn nan_cases(nans: &[u32], numbers: &[u32]) -> Vec<[u32; 4]> {
     let mut cases = Vec::new();
     for (n, &nan) in nans.iter().enumerate() {
@@ -740,38 +679,31 @@ fn nan_cases(nans: &[u32], numbers: &[u32]) -> Vec<[u32; 4]> {
     cases
 }
 
-/// A maximum or minimum with a NaN operand is the other operand (RDNA2 ISA,
-/// `v_max_f32`: the hardware results of `v_med3_f32_matches_rdna2_with_nan`
-/// are the same rule), bit for bit: of a NaN and -0 it is -0. With two
-/// NaNs among three operands it is the one number, and of NaNs only it is a
-/// NaN. Quiet and signalling NaNs of both signs are tried.
+/// A three-operand half-float maximum or minimum with a NaN operand is
+/// that of the other operands (RDNA2 ISA, `v_max_f32`: the hardware
+/// results of `v_med3_f16_matches_rdna2_with_nan` are the same rule), bit
+/// for bit: of a NaN, a NaN and -0 it is -0, and of NaNs only it is a NaN.
+/// Quiet and signalling NaNs of both signs are tried.
 #[test]
-fn max_and_min_return_the_other_operand_for_one_nan() {
-    let f = f32::to_bits;
-    let nans = [0x7FC0_0000, 0xFFC0_0000, 0x7F80_0001, 0xFFFF_FFFF];
-    let numbers = [
-        f(1.0),
-        f(-1.0),
-        0,
-        0x8000_0000,
-        f(f32::INFINITY),
-        f(f32::NEG_INFINITY),
-    ];
-    let mut wrong = max_min_mismatches(false, &nan_cases(&nans, &numbers));
-
-    let half_nans = [0x7E00, 0xFE00, 0x7C01, 0xFFFF];
-    // 1, -1, the zeros and the infinities as halves.
-    let half_numbers = [0x3C00, 0xBC00, 0, 0x8000, 0x7C00, 0xFC00];
-    wrong.extend(max_min_mismatches(
-        true,
-        &nan_cases(&half_nans, &half_numbers),
-    ));
+fn f16_max3_and_min3_skip_nan_operands() {
+    let nans = [0x7E00, 0xFE00, 0x7C01, 0xFFFF];
+    // 1, -1, the zeros and the infinities.
+    let numbers = [0x3C00, 0xBC00, 0, 0x8000, 0x7C00, 0xFC00];
+    let wrong = f16_max3_min3_mismatches(&nan_cases(&nans, &numbers));
     assert_eq!(wrong, Vec::<String>::new());
 }
 
-/// Every ordered pair of `values`, each with a third operand that takes
-/// every value in turn over the pairs.
-fn pair_cases(values: &[u32]) -> Vec<[u32; 4]> {
+/// The three-operand half-float maximum and minimum of numbers agree bit
+/// for bit with [`f16_max_min_reference`] over the edges of the format:
+/// the two zeros, the smallest and largest denormals (normal numbers in
+/// the f32 the halves are computed in), the smallest normal, the largest
+/// finite value and the infinities, of both signs, and a few ordinary
+/// values. Every ordered pair, each with a third operand that takes every
+/// value in turn over the pairs.
+#[test]
+fn f16_max3_and_min3_match_a_reference_over_edge_values() {
+    let positive = [0, 1, 0x03FF, 0x0400, 0x3C00, 0x3C01, 0x3E00, 0x7BFF, 0x7C00];
+    let values: Vec<u32> = positive.iter().flat_map(|&x| [x, x | 0x8000]).collect();
     let n = values.len();
     let mut cases = Vec::new();
     for i in 0..n {
@@ -779,48 +711,7 @@ fn pair_cases(values: &[u32]) -> Vec<[u32; 4]> {
             cases.push([values[i], values[j], values[(i + 2 * j + 1) % n], 0]);
         }
     }
-    cases
-}
-
-/// The maximums and minimums of numbers agree bit for bit with
-/// [`max_min_reference`] over the edges of the format: the two zeros, the
-/// infinities, the smallest normal and the largest finite values, of both
-/// signs, and a few ordinary values; for halves the smallest and largest
-/// denormals too, which are normal numbers in the f32 the halves are
-/// computed in.
-///
-/// f32 denormals are left out, as what is not established: whether the
-/// hardware reads a denormal operand as itself or as zero is a bit of the
-/// float MODE register, which the emitter does not model, and a D3D12 host
-/// may do either in FMax/FMin. (Under D3DMetal a denormal compares equal
-/// to zero and to any other denormal there, and the second operand comes
-/// back: `v_max_f32(1 ulp, -0)` is -0.)
-#[test]
-fn max_and_min_match_a_rust_reference_over_edge_values() {
-    let f = f32::to_bits;
-    let positive = [
-        0,                    // +0
-        f(f32::MIN_POSITIVE), // the smallest normal
-        f(f32::MIN_POSITIVE) + 1,
-        f(1.0),
-        f(1.0) + 1, // the next value above 1
-        f(1.5),
-        f(f32::MAX),
-        f(f32::INFINITY),
-    ];
-    let values: Vec<u32> = positive
-        .iter()
-        .flat_map(|&x| [x, x | 0x8000_0000])
-        .collect();
-    let mut wrong = max_min_mismatches(false, &pair_cases(&values));
-
-    // The same edges as halves, and the smallest and largest denormals.
-    let half_positive = [0, 1, 0x03FF, 0x0400, 0x3C00, 0x3C01, 0x3E00, 0x7BFF, 0x7C00];
-    let half_values: Vec<u32> = half_positive
-        .iter()
-        .flat_map(|&x| [x, x | 0x8000])
-        .collect();
-    wrong.extend(max_min_mismatches(true, &pair_cases(&half_values)));
+    let wrong = f16_max3_min3_mismatches(&cases);
     assert_eq!(wrong, Vec::<String>::new());
 }
 
@@ -868,10 +759,10 @@ fn packed_f16_max_and_min_order_zeros_and_skip_nan_in_each_half() {
                     inp[1] >> shift & 0xFFFF,
                     got >> shift & 0xFFFF,
                 );
-                let want = max_min_reference(F16_BITS, max, F16_BITS.number(a), F16_BITS.number(b));
+                let want = f16_max_min_reference(max, f16_number(a), f16_number(b));
                 let same = match want {
                     Some(bits) => got == bits,
-                    None => F16_BITS.number(got).is_none(),
+                    None => f16_number(got).is_none(),
                 };
                 if !same {
                     let want = want.map_or("a NaN".to_owned(), |bits| format!("{bits:#x}"));
