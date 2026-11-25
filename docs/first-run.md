@@ -172,7 +172,8 @@ Host differences, measured under D3DMetal (details in `macos.md`, "Open differen
 - The host's gather picks other texels for coordinates on a texel boundary.
 - D3DMetal does not check a shader container's hash, and it accepts any bytes as a pipeline library.
 - Wine's HLSL compiler cannot build VIctory's two run-time shaders. The argument clamp is embedded as bytecode for that reason; the depth conversion is not (stage 10).
-- Seven device tests of `victory-gpu` do not run under Wine (`VICTORY_REQUIRE_HLSL`, `macos.md`), so depth twins, unordered 1D and 3D textures, root views, bindless heap views and the shared page table are untested on this host.
+- D3DMetal refuses a texture whose castable formats include one it has no Metal pixel format for (`R10G10B10_XR_BIAS_A2_UNORM`, `R8G8_B8G8_UNORM`, `G8R8_G8B8_UNORM`). VIctory leaves those three out of the lists there; a view in one of them over a texture of another format is refused.
+- Sixteen device tests of `victory-gpu` compile shaders Wine's HLSL compiler cannot build. They run under D3DMetal only in a test run that names a DXC (`VICTORY_PC_DXC_UNIX`, `macos.md`, "Test shaders built by DXC"), and then on DXIL where upstream's run on shader model 5.1 bytecode.
 
 Differences in VIctory itself:
 
