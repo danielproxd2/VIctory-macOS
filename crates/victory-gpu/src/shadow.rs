@@ -699,7 +699,8 @@ mod tests {
         let Some(_gpu) = crate::testing::gpu() else {
             return;
         };
-        const BASE: u64 = 0x7b00_0000_0000;
+        // (Not the range `draw`'s rectangle test registers its buffer in.)
+        const BASE: u64 = 0x7c00_0000_0000;
         const SMALL: u64 = 5000;
         const BIG: u64 = 1 << 20;
         let mut registered = Registered(Vec::new());
