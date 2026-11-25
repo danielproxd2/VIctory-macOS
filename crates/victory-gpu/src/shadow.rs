@@ -708,18 +708,29 @@ mod tests {
         for i in 0..SMALL {
             registered.add(INNER + i as usize, BASE + 16 * i, 16);
         }
-        let looked_at = || LOOKED_AT.get();
-        let found = find(BASE + 16 * SMALL - 8, 16).map(|s| (s.start, s.len));
-        assert_eq!(found, Some((BASE, BIG)));
-        assert!(looked_at() <= 120, "{} buffers looked at", looked_at());
+        // The count is zeroed before each lookup and must be set by it: a
+        // `find` that stops counting, or walks without counting, leaves 0.
+        let counted = |address: u64| {
+            LOOKED_AT.set(0);
+            let found = find(address, 16).map(|s| (s.start, s.len));
+            let looked_at = LOOKED_AT.get();
+            assert!(
+                (1..=120).contains(&looked_at),
+                "{looked_at} buffers looked at for {address:#x}"
+            );
+            found
+        };
+        assert_eq!(counted(BASE + 16 * SMALL - 8), Some((BASE, BIG)));
         // Just past the big buffer, every one of them below the address.
-        let found = find(BASE + BIG - 8, 16).map(|s| (s.start, s.len));
-        assert_eq!(found, Some((BASE, WINDOW)), "loose memory");
-        assert!(looked_at() <= 120, "{} buffers looked at", looked_at());
+        assert_eq!(
+            counted(BASE + BIG - 8),
+            Some((BASE, WINDOW)),
+            "loose memory"
+        );
         // A buffer the title released is not found any more.
         registered.0.retain(|&(resource, _)| resource != OUTER);
         unregister(OUTER, BASE);
-        let found = find(BASE + 16 * SMALL - 8, 16).map(|s| (s.start, s.len));
+        let found = counted(BASE + 16 * SMALL - 8);
         assert_eq!(found, Some((BASE, WINDOW)), "loose memory");
         drop(registered);
         assert_eq!(buffers().holders.holder(BASE + 8, BASE + 9).key, None);
