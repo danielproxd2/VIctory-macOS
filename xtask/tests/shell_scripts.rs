@@ -177,9 +177,10 @@ fn test_wine_says_when_the_rust_target_is_missing() {
     assert!(!log.exists(), "cargo must not be started");
 }
 
-/// The fixtures workspace is built once, in the tests' profile, the tests
-/// are told where it is in Wine's spelling, and the wrapper script is gone
-/// afterwards.
+/// The fixtures workspace is built once, in the tests' profile, and the
+/// fixture that unwinds once more with the profile that goes with it; the
+/// tests are told where they are in Wine's spelling, and the wrapper script
+/// is gone afterwards.
 #[test]
 fn test_wine_builds_the_fixtures_and_removes_its_wrapper() {
     let libdir = scratch("test-wine-libdir");
@@ -205,11 +206,25 @@ fn test_wine_builds_the_fixtures_and_removes_its_wrapper() {
         let (out, log) = test_wine(name, &libdir, args);
         assert!(out.status.success(), "{name}: {}", text(&out.stderr));
         let cargo = logged(&log, "cargo ");
-        assert_eq!(cargo.len(), 2, "{name}: {cargo:?}");
+        assert_eq!(cargo.len(), 3, "{name}: {cargo:?}");
+        for build in &cargo[..2] {
+            assert!(
+                build.starts_with("build ")
+                    && build.contains("--manifest-path tests/fixtures/Cargo.toml")
+                    && build.contains("--target-dir target/fixtures")
+                    && build.contains(&format!("--target {target}")),
+                "{name}: {cargo:?}"
+            );
+        }
+        // Everything a plain build makes, then title-unwind by name.
+        assert!(!cargo[0].contains(" -p "), "{name}: {cargo:?}");
+        let unwind = if profile == "release" {
+            "unwind-release"
+        } else {
+            "unwind"
+        };
         assert!(
-            cargo[0].starts_with("build ")
-                && cargo[0].contains("--manifest-path tests/fixtures/Cargo.toml")
-                && cargo[0].contains(&format!("--target {target}")),
+            cargo[1].ends_with(&format!(" -p title-unwind --profile {unwind}")),
             "{name}: {cargo:?}"
         );
         assert_eq!(
@@ -218,18 +233,18 @@ fn test_wine_builds_the_fixtures_and_removes_its_wrapper() {
             "{name}: {cargo:?}"
         );
         assert_eq!(
-            cargo[1],
+            cargo[2],
             format!("test --target {target} {}", args.join(" ")),
             "{name}"
         );
-        // Known to the test run; the fixture build comes before it.
+        // Known to the test run; the fixture builds come before it.
         let dirs = logged(&log, "fixtures ");
-        assert_eq!(dirs[1], format!("{fixtures}\\{profile}"), "{name}");
+        assert_eq!(dirs[2], format!("{fixtures}\\{profile}"), "{name}");
         let runners = logged(&log, "runner ");
-        let runner = Path::new(&runners[1]);
+        let runner = Path::new(&runners[2]);
         assert_eq!(
             logged(&log, "wrapper present").len(),
-            2,
+            3,
             "{name}: no wrapper"
         );
         assert!(

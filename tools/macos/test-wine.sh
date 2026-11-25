@@ -17,6 +17,9 @@
 # The stand-in title and its DLLs (tests/fixtures) are built here, once, in
 # the profile the tests are built in, and VICTORY_FIXTURE_DIR tells the tests
 # where they are: cargo cannot be started inside Wine.
+# title-unwind, the fixture that unwinds, takes a second build with a profile
+# of its own (unwind, or unwind-release) and lies in the folder of that name
+# beside the others.
 # VICTORY_DXIL_UNIX names a dxil.dll (Microsoft's DXIL validator, kept
 # outside the repository) by its macOS path; the tests get it as
 # VICTORY_DXIL, the Z: path Wine knows it by. VICTORY_REQUIRE_DXIL=1 makes
@@ -54,10 +57,11 @@ TARGET=x86_64-pc-windows-gnullvm
 # The fixtures follow the tests' profile.
 PROFILE=debug
 FIXTURE_PROFILE=
+UNWIND_PROFILE=unwind
 for a in "$@"; do
     case "$a" in
         --) break ;;
-        --release | -r) PROFILE=release FIXTURE_PROFILE=--release ;;
+        --release | -r) PROFILE=release FIXTURE_PROFILE=--release UNWIND_PROFILE=unwind-release ;;
     esac
 done
 # A wrapper rather than a symlink: some Wine builds find their loader next
@@ -92,6 +96,8 @@ fi
 export CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_RUNNER="$LINK"
 cargo build --quiet --locked --manifest-path tests/fixtures/Cargo.toml \
     --target-dir target/fixtures --target "$TARGET" $FIXTURE_PROFILE
+cargo build --quiet --locked --manifest-path tests/fixtures/Cargo.toml \
+    --target-dir target/fixtures --target "$TARGET" -p title-unwind --profile "$UNWIND_PROFILE"
 VICTORY_FIXTURE_DIR="Z:$(printf '%s' "$ROOT" | tr / '\\')\\target\\fixtures\\$TARGET\\$PROFILE"
 export VICTORY_FIXTURE_DIR
 cargo test --target "$TARGET" "$@"

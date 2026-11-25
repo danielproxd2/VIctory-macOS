@@ -13,6 +13,19 @@ members = [
     "title-loop-a",
     "title-loop-b",
     "title-quiet",
+    "title-unwind",
+]
+# What a plain `cargo build` makes: everything but title-unwind, which is
+# built with `-p title-unwind --profile unwind` (or `unwind-release`), into
+# the folder of that name beside `debug` (or `release`).
+default-members = [
+    "hle-probe",
+    "hle-probe-exe",
+    "title-a",
+    "title-b",
+    "title-loop-a",
+    "title-loop-b",
+    "title-quiet",
 ]
 
 [workspace.package]
@@ -28,3 +41,14 @@ panic = "abort"
 
 [profile.release]
 panic = "abort"
+
+# For title-unwind alone: Cargo takes the panic strategy from the profile,
+# never from a package, and the DLLs without a runtime cannot be built to
+# unwind.
+[profile.unwind]
+inherits = "dev"
+panic = "unwind"
+
+[profile.unwind-release]
+inherits = "release"
+panic = "unwind"

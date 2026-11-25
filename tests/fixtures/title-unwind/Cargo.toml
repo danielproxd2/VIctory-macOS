@@ -1,0 +1,13 @@
+# A stand-in title that unwinds: it panics and catches the panic, faults
+# and throws, for the loader's tests of unwinding and crash reports through
+# a prepared image. Built with the `unwind` profiles of this workspace (the
+# others abort on a panic), so a plain `cargo build` leaves it out.
+[package]
+name = "title-unwind"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
