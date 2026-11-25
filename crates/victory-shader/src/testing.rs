@@ -9,7 +9,15 @@
 //!   adapter);
 //! * `VICTORY_REQUIRE_WARP=1`: the WARP device beside it;
 //! * `VICTORY_REQUIRE_DXIL=1`: the validator in `dxil.dll`;
-//! * `VICTORY_REQUIRE_DIFF=1`: the console and PC compilers.
+//! * `VICTORY_REQUIRE_DIFF=1`: the console and PC compilers;
+//! * `VICTORY_REQUIRE_PC_GPU=1`: a host device that gives the results of
+//!   the PC hardware the device tests were measured on. Where a host is
+//!   known to give another result (Apple's D3DMetal, see `docs/macos.md`,
+//!   "Open differences under D3DMetal"), the test that shows it checks
+//!   that the result is the measured one, prints the skip line naming the
+//!   difference ([`host_differs`]) and passes; with the switch it fails.
+//!   A result that is neither the hardware's nor the measured difference
+//!   fails either way, and on any other host only the hardware's passes.
 //!
 //! Without its switch a test that lacks what it needs passes having
 //! checked nothing, and no test here fails for that: a run that is meant
@@ -113,6 +121,63 @@ pub(crate) fn host(warp: bool) -> Option<crate::emit::host::Host> {
     }
 }
 
+/// Whether `host` is Apple's D3DMetal (the D3D12 of the Game Porting
+/// Toolkit, under Wine): the process runs under Wine and the device's
+/// adapter is the one D3DMetal presents, which names itself "AMD
+/// Compatibility Mode" (measured: vendor 0x1002, device 0x66AF, on an M5
+/// with D3DMetal 4.0 beta 3). No other host is taken for it: a Wine with
+/// another D3D12, or Windows on an AMD GPU, is not.
+#[cfg(windows)]
+pub(crate) fn d3dmetal(host: &crate::emit::host::Host) -> bool {
+    use windows::Win32::Graphics::Dxgi::{
+        CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4,
+    };
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    // SAFETY: ntdll is always loaded and both names end with a NUL; the
+    // DXGI calls are plain queries with valid out pointers.
+    unsafe {
+        let wine = GetProcAddress(
+            GetModuleHandleA(c"ntdll.dll".as_ptr().cast()),
+            c"wine_get_version".as_ptr().cast(),
+        )
+        .is_some();
+        if !wine {
+            return false;
+        }
+        let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) else {
+            return false;
+        };
+        let luid = host.device.GetAdapterLuid();
+        let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(luid) else {
+            return false;
+        };
+        adapter
+            .GetDesc1()
+            .is_ok_and(|desc| is_d3dmetal_adapter(&desc.Description))
+    }
+}
+
+/// Whether a DXGI adapter description (UTF-16, NUL-padded) is the name
+/// D3DMetal gives its adapter.
+pub(crate) fn is_d3dmetal_adapter(description: &[u16]) -> bool {
+    let end = description
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(description.len());
+    String::from_utf16_lossy(&description[..end]) == "AMD Compatibility Mode"
+}
+
+/// What a device test does where the host gave the result it is known to
+/// give instead of the PC hardware's (`difference` says which, as
+/// `docs/macos.md` lists it): the skip line, or a failure with
+/// `VICTORY_REQUIRE_PC_GPU=1`. The caller has checked both that the host
+/// is the one the difference was measured on ([`d3dmetal`]) and that the
+/// result is the measured one.
+#[cfg(windows)]
+pub(crate) fn host_differs(difference: &str) {
+    skip_unless_required("VICTORY_REQUIRE_PC_GPU", difference);
+}
+
 /// Has `dxil.dll` validate an emitted container and checks that the hash
 /// we wrote is the one the validator signs it with. Where the validator
 /// cannot be loaded (always so off Windows) this is a skip line, and a
@@ -150,6 +215,7 @@ mod tests {
             "VICTORY_REQUIRE_WARP",
             "VICTORY_REQUIRE_DXIL",
             "VICTORY_REQUIRE_DIFF",
+            "VICTORY_REQUIRE_PC_GPU",
         ] {
             let set = std::env::var(var).ok();
             assert_eq!(required(var), require(set.as_deref()), "{var}");
@@ -167,6 +233,42 @@ mod tests {
         );
         for off in [None, Some(""), Some("0"), Some("true")] {
             assert_eq!(missing(var, off, "no dxil.dll"), Ok(()), "{off:?}");
+        }
+    }
+
+    /// A measured host difference is a skip, and a failure naming its
+    /// switch when the run requires the PC hardware's results.
+    #[test]
+    fn a_host_difference_fails_only_when_pc_results_are_required() {
+        let var = "VICTORY_REQUIRE_PC_GPU";
+        assert_eq!(missing(var, None, "the host rounds otherwise"), Ok(()));
+        assert_eq!(
+            missing(var, Some("1"), "the host rounds otherwise"),
+            Err("VICTORY_REQUIRE_PC_GPU=1: the host rounds otherwise".into())
+        );
+    }
+
+    /// Only the adapter name D3DMetal presents is taken for it: the whole
+    /// NUL-terminated description, not a part of one.
+    #[test]
+    fn only_d3dmetals_adapter_name_is_taken_for_it() {
+        let wide = |name: &str| {
+            let mut description: Vec<u16> = name.encode_utf16().collect();
+            description.resize(128, 0);
+            description
+        };
+        assert!(is_d3dmetal_adapter(&wide("AMD Compatibility Mode")));
+        // Without a terminating NUL: the array's end ends the name.
+        let exact: Vec<u16> = "AMD Compatibility Mode".encode_utf16().collect();
+        assert!(is_d3dmetal_adapter(&exact));
+        for other in [
+            "",
+            "AMD Radeon RX 6700 XT",
+            "AMD Compatibility Mode 2",
+            "Microsoft Basic Render Driver",
+            "Apple M5",
+        ] {
+            assert!(!is_d3dmetal_adapter(&wide(other)), "{other}");
         }
     }
 }

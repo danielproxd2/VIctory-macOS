@@ -26,7 +26,10 @@
 # the shader tests fail where the validator cannot be loaded, instead of
 # printing "skipped: DXIL validation: ...". VICTORY_REQUIRE_WARP=1 and
 # VICTORY_REQUIRE_DIFF=1 do the same for WARP and for the compilers of the
-# differential shader tests.
+# differential shader tests. VICTORY_REQUIRE_PC_GPU=1 makes a result that
+# D3DMetal is known to give instead of the PC hardware's (docs/macos.md,
+# "Open differences under D3DMetal") a failure instead of a printed
+# "skipped: D3DMetal ...".
 # ROSETTA_ADVERTISE_AVX=1 is set for the tests unless the caller set the
 # variable: `victory run --execute` refuses a CPU without AVX2, and Rosetta 2
 # says it has AVX and AVX2 only to a process started with this variable.
@@ -92,6 +95,7 @@ export ROSETTA_ADVERTISE_AVX="${ROSETTA_ADVERTISE_AVX:-1}"
 [ -z "${VICTORY_REQUIRE_WARP:-}" ] || export VICTORY_REQUIRE_WARP
 [ -z "${VICTORY_REQUIRE_DXIL:-}" ] || export VICTORY_REQUIRE_DXIL
 [ -z "${VICTORY_REQUIRE_DIFF:-}" ] || export VICTORY_REQUIRE_DIFF
+[ -z "${VICTORY_REQUIRE_PC_GPU:-}" ] || export VICTORY_REQUIRE_PC_GPU
 if [ -n "${VICTORY_DXIL_UNIX:-}" ]; then
     [ -f "$VICTORY_DXIL_UNIX" ] || { echo "VICTORY_DXIL_UNIX: no file at $VICTORY_DXIL_UNIX" >&2; exit 1; }
     case "$VICTORY_DXIL_UNIX" in

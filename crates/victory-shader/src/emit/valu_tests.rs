@@ -1824,13 +1824,17 @@ fn image_addresses_of_16_bits_and_clamps() {
         (&gathers, f(3.0), &gathered(3.0)),
         (&gathers, f(-1.0), &gathered(1.0)),
     ];
-    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let _one = crate::testing::one_gpu_test_at_a_time();
     for (label, warp) in [("hardware", false), ("warp", true)] {
         // A printed skip without the device, or a failure with its
         // `VICTORY_REQUIRE_*` switch (`crate::testing`).
         let Some(host) = crate::testing::host(warp) else {
             continue;
         };
+        // Biased samples D3DMetal took at the level of the derivatives
+        // alone (level 1, what a bias of 0 gives).
+        let d3dmetal = !warp && crate::testing::d3dmetal(&host);
+        let mut unbiased = 0;
         for (shader, k, want) in cases {
             let (root, pso) = host
                 .compute_pipeline(shader)
@@ -1851,7 +1855,21 @@ fn image_addresses_of_16_bits_and_clamps() {
                 .iter()
                 .map(|&x| f32::from_bits(x))
                 .collect();
+            // D3DMetal drops the bias of a biased sample in a compute
+            // shader: there, and only there, the unbiased level passes as
+            // well, and is said aloud below.
+            if d3dmetal && std::ptr::eq(shader, &biased) && got != want && got == [1.0] {
+                unbiased += 1;
+                continue;
+            }
             assert_eq!(got, want, "{label}: {k:#x}");
+        }
+        if unbiased > 0 {
+            // A printed skip, or a failure with `VICTORY_REQUIRE_PC_GPU=1`.
+            crate::testing::host_differs(&format!(
+                "D3DMetal ignores the bias of a biased sample (SampleBias) in a compute \
+                 shader: {unbiased} samples at the level of the derivatives alone"
+            ));
         }
     }
 }
@@ -1944,6 +1962,18 @@ fn image_atomics_of_64_bits() {
             )
             .unwrap_or_else(|e| panic!("{label}: {e}"));
         let got: Vec<u64> = out[0].chunks(2).map(|t| key(t[0], t[1])).collect();
+        // D3DMetal reports 64-bit atomics on typed views
+        // (`AtomicInt64OnTypedResourceSupported`), creates the pipeline and
+        // runs nothing of the shader: there, and only there, a texture
+        // left as it was is the measured difference, said aloud (a
+        // failure with `VICTORY_REQUIRE_PC_GPU=1`).
+        if !warp && crate::testing::d3dmetal(&host) && got.iter().all(|&texel| texel == 0) {
+            crate::testing::host_differs(
+                "D3DMetal runs nothing of a compute shader that has a 64-bit atomic on a \
+                 typed view: the texture is left as it was",
+            );
+            continue;
+        }
         assert_eq!(got, want, "{label}");
     }
 }

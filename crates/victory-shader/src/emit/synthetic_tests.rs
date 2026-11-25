@@ -146,6 +146,16 @@ fn first(u: f32, size: u32) -> i64 {
     ((f64::from(u) * f64::from(size) * 512.0).floor() as i64 - 255) >> 9
 }
 
+/// The first texel of the footprint D3DMetal's own gather picks (measured
+/// on an M5, D3DMetal 4.0 beta 3): as [`first`], but of the product of
+/// coordinate and size rounded to f32, where the PC hardware (RDNA2, as
+/// the console) takes the exact product. The two differ only where that
+/// rounding carries the product across a texel's threshold.
+fn first_of_f32_product(u: f32, size: u32) -> i64 {
+    let u = if u.is_nan() { 0.0 } else { u.clamp(-2.0, 2.0) };
+    ((f64::from(u * size as f32) * 512.0).floor() as i64 - 255) >> 9
+}
+
 #[test]
 fn gathers_at_a_level_match_the_hardware() {
     // 24×16 then 12×8, 6×4, 3×2; red = level × 1000 + y × 32 + x + 1.
@@ -213,15 +223,16 @@ fn gathers_at_a_level_match_the_hardware() {
         },
         View::RawUav(32 * 12),
     ];
-    let _one = super::valu_tests::ONE_AT_A_TIME
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _one = crate::testing::one_gpu_test_at_a_time();
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
+        let Some(host) = crate::testing::host(warp) else {
             continue;
         };
+        // Lanes whose own gather is D3DMetal's footprint, not the PC
+        // hardware's.
+        let d3dmetal = !warp && crate::testing::d3dmetal(&host);
+        let mut d3dmetal_lanes = 0;
         let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
         let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
         let out = host
@@ -268,8 +279,32 @@ fn gathers_at_a_level_match_the_hardware() {
             );
             // WARP's own gather truncates where the hardware rounds.
             if lane < 16 && !warp {
+                // D3DMetal's rounds the f32 product (`first_of_f32_product`):
+                // there, and only there, that footprint passes as well, and
+                // is said aloud below.
+                let (x, y) = (
+                    first_of_f32_product(f32::from_bits(u), w),
+                    first_of_f32_product(f32::from_bits(v), h),
+                );
+                let of_f32_product = vec![
+                    texel(level, x, y + 1),
+                    texel(level, x + 1, y + 1),
+                    texel(level, x + 1, y),
+                    texel(level, x, y),
+                ];
+                if d3dmetal && got(2) != got(0) && got(2) == of_f32_product {
+                    d3dmetal_lanes += 1;
+                    continue;
+                }
                 assert_eq!(got(2), got(0), "{label}: lane {lane} against its gather");
             }
+        }
+        if d3dmetal_lanes > 0 {
+            // A printed skip, or a failure with `VICTORY_REQUIRE_PC_GPU=1`.
+            crate::testing::host_differs(&format!(
+                "D3DMetal's own gather picks its texels from the f32 product of coordinate \
+                 and size, not the exact one: {d3dmetal_lanes} of 16 lanes one texel off"
+            ));
         }
     }
     assert!(ran > 0, "no device");

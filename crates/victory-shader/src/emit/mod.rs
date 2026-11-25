@@ -230,7 +230,8 @@ pub use shader::{
 /// Whether a `VICTORY_REQUIRE_*` switch with the value `var` is on: only
 /// `1` is. The tests read these switches (`crate::testing`): on, a test
 /// that would be skipped for want of a device, of `dxil.dll` or of a
-/// compiler fails instead.
+/// compiler, or for a result the host is known to give instead of the PC
+/// hardware's, fails instead.
 #[cfg(test)]
 pub(crate) fn require(var: Option<&str>) -> bool {
     var.is_some_and(|v| v.trim() == "1")
@@ -656,7 +657,7 @@ mod tests {
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
 
-    /// `VICTORY_REQUIRE_GPU`, `_WARP`, `_DXIL` and `_DIFF`: `1` requires,
+    /// `VICTORY_REQUIRE_GPU`, `_WARP`, `_DXIL`, `_DIFF` and `_PC_GPU`: `1` requires,
     /// anything else (unset, empty, `0`, `true`) does not.
     #[test]
     fn the_require_switch_reads_one_as_required() {
@@ -1035,31 +1036,23 @@ mod tests {
         // The runtime checks the container hash: no hash or a wrong one is
         // refused. (Recent runtimes also take sixteen 0x01 bytes, a bypass
         // value; ours works with older ones too.)
-        // D3DMetal under Wine does not check the hash, so it accepts both.
-        // SAFETY: ntdll is always loaded; both names end with a NUL.
-        let wine = unsafe {
-            use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
-            GetProcAddress(
-                GetModuleHandleA(c"ntdll.dll".as_ptr().cast()),
-                c"wine_get_version".as_ptr().cast(),
-            )
-        }
-        .is_some();
+        // D3DMetal does not check the hash and accepts both: there, and
+        // only there, taking both is the measured difference, said aloud
+        // (a failure with `VICTORY_REQUIRE_PC_GPU=1`).
         let mut wrong = ps.dxil[4..20].to_vec();
         wrong[0] ^= 1;
-        if wine {
-            // Said aloud: this half proves nothing here.
-            crate::testing::skip("container hash refusal: D3DMetal does not check the hash");
-            return;
-        }
-        for digest in [&[0u8; 16][..], &wrong] {
+        let refused = [&[0u8; 16][..], &wrong].map(|digest| {
             let mut other = ps.clone();
             other.dxil[4..20].copy_from_slice(digest);
-            assert!(
-                host.pipeline(&vs, &other).is_err(),
-                "digest {digest:02x?} accepted"
+            host.pipeline(&vs, &other).is_err()
+        });
+        if refused == [false, false] && crate::testing::d3dmetal(&host) {
+            crate::testing::host_differs(
+                "container hash refusal: D3DMetal does not check the hash",
             );
+            return;
         }
+        assert_eq!(refused, [true, true], "a zero and a wrong digest refused");
     }
 
     #[test]
