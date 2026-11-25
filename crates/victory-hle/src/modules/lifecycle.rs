@@ -458,8 +458,9 @@ mod tests {
     /// In a child process of the tests below; does nothing otherwise.
     /// `close` and `slow-close`: a title with one suspend routine (0.3 s,
     /// or 3 s) whose window the user closes. `previous`: a process that
-    /// lives 2.5 s. `relaunched`: a new `victory` that waits for the one
-    /// it replaces.
+    /// lives until its standard input ends. `relaunched`: a new `victory`
+    /// that says it is about to wait for the one it replaces, waits, and
+    /// says how long that took.
     #[test]
     fn lifecycle_child() {
         let Ok(part) = std::env::var(PART) else {
@@ -499,11 +500,19 @@ mod tests {
                 std::thread::sleep(Duration::from_secs(10));
                 println!("STILL RUNNING");
             }
-            "previous" => std::thread::sleep(Duration::from_millis(2500)),
+            "previous" => {
+                // Until the parent closes the pipe, and not a moment less.
+                let mut rest = String::new();
+                let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut rest);
+            }
             "relaunched" => {
+                // The clock starts before the parent can know of us.
+                let start = std::time::Instant::now();
+                println!("WAITING");
                 wait_for_previous();
                 println!(
-                    "WAITED handle_left={}",
+                    "WAITED ms={} handle_left={}",
+                    start.elapsed().as_millis(),
                     std::env::var(RELAUNCHED_FROM).is_ok()
                 );
             }
@@ -596,19 +605,33 @@ mod tests {
     }
 
     /// The relaunched process goes on only once the one it replaces has
-    /// ended, and takes the handle out of its environment.
+    /// ended, and takes the handle out of its environment. The process it
+    /// replaces ends when this test says so, which is after the new one
+    /// has been seen waiting for a while: the order does not depend on
+    /// how fast either starts.
     #[test]
     fn a_relaunched_process_waits_for_the_one_it_replaces() {
+        use std::io::BufRead;
         use std::os::windows::io::AsRawHandle;
+        use std::process::{Command, Stdio};
         use windows_sys::Win32::Foundation::{
             CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE,
         };
+        /// How long the new process is watched waiting before the old
+        /// one is let go.
+        const HELD: Duration = Duration::from_millis(1000);
         let test = "modules::lifecycle::tests::lifecycle_child";
-        let mut previous = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", test, "--nocapture", "--test-threads=1"])
-            .env(PART, "previous")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+        let child = |part: &str| {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", test, "--nocapture", "--test-threads=1"])
+                .env(PART, part)
+                .stderr(Stdio::null());
+            command
+        };
+        let mut previous = child("previous")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
             .spawn()
             .unwrap();
         let mut inherited: HANDLE = std::ptr::null_mut();
@@ -625,27 +648,77 @@ mod tests {
             )
         };
         assert_ne!(duplicated, 0);
-        let handle = (inherited as usize).to_string();
-        let out = crate::testing::child(
-            test,
-            &[
-                (PART, "relaunched".as_ref()),
-                (RELAUNCHED_FROM, handle.as_ref()),
-            ],
-        );
-        let ended = previous.try_wait().unwrap();
-        // SAFETY: our duplicate.
+        let mut relaunched = child("relaunched")
+            .env(RELAUNCHED_FROM, (inherited as usize).to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // SAFETY: our duplicate; the new process has its own by now.
         unsafe { CloseHandle(inherited) };
-        let _ = previous.kill();
-        let _ = previous.wait();
-        let (printed, logged) = crate::testing::printed(&out);
+        // What the new process says, line by line, as it says it.
+        let (said, hears) = std::sync::mpsc::channel();
+        let output = relaunched.stdout.take().unwrap();
+        let reader = std::thread::spawn(move || {
+            for line in std::io::BufReader::new(output).lines() {
+                let Ok(line) = line else { break };
+                // The harness's "test <name> ... " precedes the first.
+                let ours = line.find("WAIT").map(|at| line[at..].to_owned());
+                if ours.is_some_and(|ours| said.send(ours).is_err()) {
+                    break;
+                }
+            }
+        });
+        // What is seen, in order; an error says what was seen instead.
+        let mut watch = || {
+            let first = hears.recv_timeout(Duration::from_secs(120));
+            if first.as_deref() != Ok("WAITING") {
+                return Err(format!("the new process never waited: {first:?}"));
+            }
+            // It is waiting. While the old process lives it says no more
+            // and does not end.
+            let early = hears.recv_timeout(HELD);
+            let alive = (
+                previous.try_wait().unwrap().is_none(),
+                relaunched.try_wait().unwrap().is_none(),
+            );
+            if early.is_ok() || alive != (true, true) {
+                return Err(format!(
+                    "the new process went on beside the old one: {early:?}, alive {alive:?}"
+                ));
+            }
+            // The old process is told to end; only then does the new one
+            // go on.
+            drop(previous.stdin.take());
+            let ended = previous.wait().unwrap();
+            let after = hears
+                .recv_timeout(Duration::from_secs(60))
+                .map_err(|e| format!("the new process did not go on: {e}"))?;
+            Ok((ended, relaunched.wait().unwrap(), after))
+        };
+        let seen = watch();
+        // Neither child outlives the test, whatever was seen.
+        drop(previous.stdin.take());
+        for child in [&mut previous, &mut relaunched] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        reader.join().unwrap();
+        let (ended, status, after) = match seen {
+            Ok(seen) => seen,
+            Err(seen) => return assert_eq!(seen, "the new process waiting, then going on"),
+        };
+        assert!(ended.success(), "{ended:?}");
+        assert!(status.success(), "{status:?}");
+        let waited = after
+            .strip_prefix("WAITED ms=")
+            .and_then(|rest| rest.strip_suffix(" handle_left=false"))
+            .and_then(|ms| ms.parse::<u128>().ok());
+        // Its own clock, started before it said it was waiting: the wait
+        // spans all the time the old process was held.
         assert!(
-            printed.contains("WAITED handle_left=false"),
-            "{printed}{logged}"
-        );
-        assert!(
-            ended.is_some(),
-            "the new process went on beside the old one"
+            waited.is_some_and(|ms| ms >= HELD.as_millis()),
+            "waited {after:?}, held {HELD:?}"
         );
     }
 }
