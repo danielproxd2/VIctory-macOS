@@ -45,14 +45,30 @@ pub enum PolicyError {
 ///    tree, and a host symlink is an ordinary folder to Windows.
 pub fn ensure_outside_repo(path: &Path) -> Result<(), PolicyError> {
     static REPORTED: Once = Once::new();
-    ensure_outside(path, &compiled_workspace_root(), &REPORTED)
+    ensure_outside(path, &compiled_workspace_root(), &marker_file, &REPORTED)
 }
 
-/// [`ensure_outside_repo`] with the compiled-in source tree passed in, and
-/// with what remembers that check 1 could not be made: that is said once
-/// per `reported`, which is once per process for the public function.
-fn ensure_outside(path: &Path, compiled_root: &Path, reported: &Once) -> Result<(), PolicyError> {
-    if let CompiledRoot::Unreadable(kind) = check(path, compiled_root)? {
+/// Says whether a folder is the root of a VIctory source tree.
+type Marked<'a> = &'a dyn Fn(&Path) -> bool;
+
+/// What says so outside the tests: the folder holds the [`ROOT_MARKER`]
+/// file. The tests pass a check that sees only the folders they made, so
+/// that where the machine keeps its temporary folder decides nothing.
+fn marker_file(dir: &Path) -> bool {
+    dir.join(ROOT_MARKER).is_file()
+}
+
+/// [`ensure_outside_repo`] with the compiled-in source tree and the marker
+/// check passed in, and with what remembers that check 1 could not be
+/// made: that is said once per `reported`, which is once per process for
+/// the public function.
+fn ensure_outside(
+    path: &Path,
+    compiled_root: &Path,
+    marked: Marked<'_>,
+    reported: &Once,
+) -> Result<(), PolicyError> {
+    if let CompiledRoot::Unreadable(kind) = check(path, compiled_root, marked)? {
         reported.call_once(|| report_unreadable_root(compiled_root, kind));
     }
     Ok(())
@@ -92,8 +108,13 @@ fn report_unreadable_root(root: &Path, kind: std::io::ErrorKind) {
     }
 }
 
-/// [`ensure_outside_repo`] with the compiled-in source tree passed in.
-fn check(path: &Path, compiled_root: &Path) -> Result<CompiledRoot, PolicyError> {
+/// [`ensure_outside_repo`] with the compiled-in source tree and the marker
+/// check passed in. Check 3 (Wine) always asks the host itself.
+fn check(
+    path: &Path,
+    compiled_root: &Path,
+    marked: Marked<'_>,
+) -> Result<CompiledRoot, PolicyError> {
     let resolved = resolve(path)?;
     let inside = |root: &Path| PolicyError::InsideRepo {
         path: path.to_path_buf(),
@@ -101,16 +122,13 @@ fn check(path: &Path, compiled_root: &Path) -> Result<CompiledRoot, PolicyError>
     };
 
     let compiled = match std::fs::canonicalize(compiled_root) {
-        Ok(root) if !root.join(ROOT_MARKER).is_file() => CompiledRoot::Unmarked,
+        Ok(root) if !marked(&root) => CompiledRoot::Unmarked,
         Ok(root) if resolved.starts_with(&root) => return Err(inside(&root)),
         Ok(_) => CompiledRoot::Outside,
         Err(e) => CompiledRoot::Unreadable(e.kind()),
     };
 
-    if let Some(root) = resolved
-        .ancestors()
-        .find(|dir| dir.join(ROOT_MARKER).is_file())
-    {
+    if let Some(root) = resolved.ancestors().find(|dir| marked(dir)) {
         return Err(inside(root));
     }
 
@@ -326,6 +344,16 @@ mod tests {
     use super::*;
     use std::fmt;
 
+    /// A marker check that sees the folders of one test only: the marker
+    /// file counts in `below` and under it and nowhere else. With it a
+    /// test's verdicts follow from what the test made, not from where this
+    /// machine keeps its temporary folder (a clone above it would otherwise
+    /// refuse every path the tests expect to be accepted).
+    fn marked_below(below: &Path) -> impl Fn(&Path) -> bool {
+        let below = std::fs::canonicalize(below).unwrap();
+        move |dir| dir.starts_with(&below) && marker_file(dir)
+    }
+
     #[test]
     fn rejects_paths_inside_this_repo() {
         let inside = compiled_workspace_root().join("cache").join("textures");
@@ -412,18 +440,19 @@ mod tests {
     #[test]
     fn unreadable_compiled_root_is_reported() {
         let tmp = tempfile::tempdir().unwrap();
+        let marked = marked_below(tmp.path());
         let gone = tmp.path().join("no-such-tree");
         let path = tmp.path().join("cache");
         assert_eq!(
-            check(&path, &gone).unwrap(),
+            check(&path, &gone, &marked).unwrap(),
             CompiledRoot::Unreadable(std::io::ErrorKind::NotFound)
         );
         // It is said, once for each `Once`, and a tree that is merely not
         // here is not worth a warning.
         let reported = Once::new();
         let events = events_of(|| {
-            ensure_outside(&path, &gone, &reported).unwrap();
-            ensure_outside(&path.join("deeper"), &gone, &reported).unwrap();
+            ensure_outside(&path, &gone, &marked, &reported).unwrap();
+            ensure_outside(&path.join("deeper"), &gone, &marked, &reported).unwrap();
         });
         assert_eq!(events.len(), 1, "{events:?}");
         assert!(events[0].starts_with("DEBUG "), "{events:?}");
@@ -431,22 +460,22 @@ mod tests {
             events[0].contains("is not here") && events[0].contains("no-such-tree"),
             "{events:?}"
         );
-        let again = events_of(|| ensure_outside(&path, &gone, &Once::new()).unwrap());
+        let again = events_of(|| ensure_outside(&path, &gone, &marked, &Once::new()).unwrap());
         assert_eq!(again.len(), 1, "another `Once` reports again: {again:?}");
         // A tree that was compared has nothing to report.
         let tree = tmp.path().join("tree");
         std::fs::create_dir_all(&tree).unwrap();
-        for marked in [false, true] {
-            if marked {
+        for with_marker in [false, true] {
+            if with_marker {
                 std::fs::write(tree.join(ROOT_MARKER), "").unwrap();
             }
-            let events = events_of(|| ensure_outside(&path, &tree, &Once::new()).unwrap());
-            assert_eq!(events, Vec::<String>::new(), "marked: {marked}");
+            let events = events_of(|| ensure_outside(&path, &tree, &marked, &Once::new()).unwrap());
+            assert_eq!(events, Vec::<String>::new(), "marked: {with_marker}");
         }
         // The marker check still stands without the compiled-in tree.
         std::fs::write(tmp.path().join(ROOT_MARKER), "").unwrap();
         assert!(matches!(
-            check(&path, &gone),
+            check(&path, &gone, &marked),
             Err(PolicyError::InsideRepo { .. })
         ));
     }
@@ -457,18 +486,19 @@ mod tests {
     #[test]
     fn compiled_root_that_cannot_be_read_is_a_warning() {
         let tmp = tempfile::tempdir().unwrap();
+        let marked = marked_below(tmp.path());
         std::fs::write(tmp.path().join("file"), "").unwrap();
         let root = tmp.path().join("file").join("tree");
         let path = tmp.path().join("cache");
-        let kind = match check(&path, &root).unwrap() {
+        let kind = match check(&path, &root, &marked).unwrap() {
             CompiledRoot::Unreadable(kind) => kind,
             other => panic!("expected Unreadable, got {other:?}"),
         };
         assert_ne!(kind, std::io::ErrorKind::NotFound);
         let reported = Once::new();
         let events = events_of(|| {
-            ensure_outside(&path, &root, &reported).unwrap();
-            ensure_outside(&path, &root, &reported).unwrap();
+            ensure_outside(&path, &root, &marked, &reported).unwrap();
+            ensure_outside(&path, &root, &marked, &reported).unwrap();
         });
         assert_eq!(events.len(), 1, "{events:?}");
         assert!(events[0].starts_with("WARN "), "{events:?}");
@@ -481,7 +511,7 @@ mod tests {
         // The path is still refused where a marker says so, without a word.
         std::fs::write(tmp.path().join(ROOT_MARKER), "").unwrap();
         let events = events_of(|| {
-            let refused = ensure_outside(&path, &root, &Once::new());
+            let refused = ensure_outside(&path, &root, &marked, &Once::new());
             assert!(matches!(refused, Err(PolicyError::InsideRepo { .. })));
         });
         assert_eq!(events, Vec::<String>::new());
@@ -490,17 +520,21 @@ mod tests {
     #[test]
     fn compiled_root_is_compared_when_it_is_there() {
         let tmp = tempfile::tempdir().unwrap();
+        let marked = marked_below(tmp.path());
         let tree = tmp.path().join("tree");
         let elsewhere = tmp.path().join("elsewhere");
         std::fs::create_dir_all(&tree).unwrap();
         // A folder that is no source tree any more refuses nothing.
         assert_eq!(
-            check(&tree.join("cache"), &tree).unwrap(),
+            check(&tree.join("cache"), &tree, &marked).unwrap(),
             CompiledRoot::Unmarked
         );
         std::fs::write(tree.join(ROOT_MARKER), "").unwrap();
-        assert_eq!(check(&elsewhere, &tree).unwrap(), CompiledRoot::Outside);
-        match check(&tree.join("cache"), &tree) {
+        assert_eq!(
+            check(&elsewhere, &tree, &marked).unwrap(),
+            CompiledRoot::Outside
+        );
+        match check(&tree.join("cache"), &tree, &marked) {
             Err(PolicyError::InsideRepo { root, .. }) => {
                 assert_eq!(root, std::fs::canonicalize(&tree).unwrap());
             }
@@ -514,6 +548,7 @@ mod tests {
     #[test]
     fn differently_cased_repo_path_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
+        let marked = marked_below(tmp.path());
         let tree = tmp.path().join("victory-tree");
         std::fs::create_dir_all(tree.join("sub")).unwrap();
         std::fs::write(tree.join(ROOT_MARKER), "").unwrap();
@@ -529,7 +564,10 @@ mod tests {
             (shouted.join("cache"), tmp.path().join("no-such-tree")),
         ] {
             assert!(
-                matches!(check(&path, &root), Err(PolicyError::InsideRepo { .. })),
+                matches!(
+                    check(&path, &root, &marked),
+                    Err(PolicyError::InsideRepo { .. })
+                ),
                 "{} was accepted",
                 path.display()
             );
@@ -598,6 +636,7 @@ mod tests {
             return;
         }
         let tmp = tempfile::tempdir().unwrap();
+        let marked = marked_below(tmp.path());
         let tree = tmp.path().join("tree");
         let elsewhere = tmp.path().join("elsewhere");
         std::fs::create_dir_all(tree.join("out")).unwrap();
@@ -620,7 +659,7 @@ mod tests {
             link.join("file"),
             link.join("new").join("deeper").join("file"),
         ] {
-            match check(&path, &gone) {
+            match check(&path, &gone, &marked) {
                 Err(PolicyError::InsideRepo { root, .. }) => {
                     assert_eq!(root, PathBuf::from(unix(&tree)), "{}", path.display());
                 }
@@ -628,7 +667,7 @@ mod tests {
             }
         }
         // Beside the link nothing is refused.
-        check(&elsewhere.join("file"), &gone).unwrap();
+        check(&elsewhere.join("file"), &gone, &marked).unwrap();
         // Windows cannot remove the link, and would empty the tree through it.
         host_run("/bin/rm", &[&unix_link], || !link.exists());
     }
@@ -651,6 +690,8 @@ mod tests {
         let root = normalize(&wine::host_path(manifest).join("..").join(".."));
         assert!(root.join(ROOT_MARKER).is_file(), "{}", root.display());
         let gone = Path::new(r"C:\no-such-tree");
+        // The real tree, so the real markers.
+        let marked = marker_file;
         // `\\?\unix\<tree>\cache\x` and whatever drive Wine shows it on.
         let through_unix = root.join("cache").join("x");
         let on_a_drive = std::fs::canonicalize(&root)
@@ -659,7 +700,10 @@ mod tests {
             .join("x");
         for path in [through_unix, on_a_drive] {
             assert!(
-                matches!(check(&path, gone), Err(PolicyError::InsideRepo { .. })),
+                matches!(
+                    check(&path, gone, &marked),
+                    Err(PolicyError::InsideRepo { .. })
+                ),
                 "{} was accepted",
                 path.display()
             );
@@ -670,10 +714,76 @@ mod tests {
         }
     }
 
-    /// Where the tools put derived data when nothing is configured, in the
-    /// environment the tests run in (under Wine: inside the Wine prefix).
+    /// Where the tools put derived data when nothing is configured: the
+    /// defaults of an environment the test makes up, in folders it made,
+    /// are accepted outside a source tree and refused inside one. (Under
+    /// Wine check 3 still asks the host about the folders above the
+    /// temporary one; `this_runs_own_folders_are_outside_every_source_tree`
+    /// names that.)
     #[test]
-    fn default_user_directories_are_outside_the_repo() {
+    fn default_directories_are_judged_by_where_the_environment_puts_them() {
+        use std::ffi::OsString;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let marked = marked_below(tmp.path());
+        let tree = tmp.path().join("tree");
+        // What a Wine prefix or a home folder inside a clone looks like.
+        let inside = tree.join("target").join("prefix").join("user");
+        let outside = tmp.path().join("elsewhere").join("user");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(tree.join(ROOT_MARKER), "").unwrap();
+        let root = std::fs::canonicalize(&tree).unwrap();
+
+        // Each source of the defaults on its own, as `default_dir` reads
+        // them: Windows and Wine, XDG, and a bare home folder.
+        let sources: [&[&str]; 3] = [
+            &["LOCALAPPDATA"],
+            &["XDG_CACHE_HOME", "XDG_DATA_HOME"],
+            &["HOME"],
+        ];
+        for vars in sources {
+            let defaults = |base: &Path| {
+                let value = OsString::from(base);
+                crate::Config::defaults_of(|k| vars.contains(&k).then(|| value.clone())).unwrap()
+            };
+            let cfg = defaults(&outside);
+            for dir in [&cfg.cache_dir, &cfg.data_dir] {
+                assert!(dir.starts_with(&outside), "{vars:?}: {}", dir.display());
+                assert_eq!(
+                    check(dir, &tree, &marked).unwrap(),
+                    CompiledRoot::Outside,
+                    "{vars:?}: {}",
+                    dir.display()
+                );
+                // The tree is found by its marker alone too.
+                check(dir, &tmp.path().join("no-such-tree"), &marked).unwrap();
+            }
+            let cfg = defaults(&inside);
+            for dir in [&cfg.cache_dir, &cfg.data_dir] {
+                for compiled in [tree.clone(), tmp.path().join("no-such-tree")] {
+                    match check(dir, &compiled, &marked) {
+                        Err(PolicyError::InsideRepo { root: found, .. }) => {
+                            assert_eq!(found, root, "{vars:?}: {}", dir.display());
+                        }
+                        other => panic!(
+                            "{vars:?}: {} should be refused, got {other:?}",
+                            dir.display()
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    /// A check of this machine and this run, not of the code: the user and
+    /// temporary folders the tests and tools use here (under Wine: those of
+    /// the Wine prefix) must lie outside every VIctory source tree. It
+    /// fails with no code change where a home or temporary folder is inside
+    /// a clone, or `WINEPREFIX` is; `tools/macos/test-wine.sh` keeps its
+    /// prefix outside the repository for this reason.
+    #[test]
+    fn this_runs_own_folders_are_outside_every_source_tree() {
         let cfg = crate::Config::defaults_of(|k| {
             // Only what the defaults are made of, not the user's VICTORY_*.
             ["LOCALAPPDATA", "XDG_CACHE_HOME", "XDG_DATA_HOME", "HOME"]
@@ -681,15 +791,44 @@ mod tests {
                 .then(|| std::env::var_os(k))
                 .flatten()
         })
-        .unwrap();
-        ensure_outside_repo(&cfg.cache_dir).unwrap();
-        ensure_outside_repo(&cfg.data_dir).unwrap();
-        ensure_outside_repo(&std::env::temp_dir().join("victory-test")).unwrap();
+        .expect("this run's environment names a user folder (HOME or LOCALAPPDATA)");
+        let temporary = std::env::temp_dir().join("victory-test");
+        for (what, dir) in [
+            ("default cache folder", &cfg.cache_dir),
+            ("default data folder", &cfg.data_dir),
+            ("temporary folder", &temporary),
+        ] {
+            if let Err(error) = ensure_outside_repo(dir) {
+                panic!(
+                    "this machine's {what} ({}) cannot be used: {error}\n\
+                     This is a precondition of the run, not a fault in the code: move HOME, \
+                     LOCALAPPDATA, TMPDIR or WINEPREFIX out of the source tree.",
+                    dir.display()
+                );
+            }
+        }
     }
 
     #[test]
     fn accepts_unrelated_directories() {
         let tmp = tempfile::tempdir().unwrap();
-        ensure_outside_repo(&tmp.path().join("does").join("not").join("exist")).unwrap();
+        let marked = marked_below(tmp.path());
+        let tree = tmp.path().join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join(ROOT_MARKER), "").unwrap();
+        // Beside a source tree, existing or not yet.
+        for path in [
+            tmp.path().join("does").join("not").join("exist"),
+            tmp.path().to_path_buf(),
+            tmp.path().join("tree-2").join("cache"),
+        ] {
+            assert_eq!(
+                check(&path, &tree, &marked).unwrap(),
+                CompiledRoot::Outside,
+                "{}",
+                path.display()
+            );
+            ensure_outside(&path, &tree, &marked, &Once::new()).unwrap();
+        }
     }
 }
