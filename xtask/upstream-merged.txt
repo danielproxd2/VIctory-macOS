@@ -1,0 +1,2 @@
+# The full hash of the VIctory (upstream) commit last merged into this fork: `cargo xtask fmt` takes the files of that commit for upstream's. It is updated in the same commit as each upstream merge.
+13f91caee25f2fdf2c062be5f7a27f058e51cbca

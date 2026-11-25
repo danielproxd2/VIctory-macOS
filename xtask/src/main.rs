@@ -38,18 +38,21 @@ enum Cmd {
     /// Format the fork's own Rust files with rustfmt. A file is the fork's
     /// own when the upstream commit last merged does not have it, neither
     /// at its path nor under the name the fork moved it from (git's rename
-    /// detection, half the same or more). That commit is the merge base of
-    /// HEAD and upstream/main or the second parent of a merge commit in
-    /// HEAD's first-parent history, whichever is newer, so upstream/main
-    /// may be out of date or missing. Files that exist upstream are left
-    /// as they are, also where the fork changed them: upstream's layout is
-    /// kept so that merges do not conflict on formatting.
+    /// detection, half the same or more). That commit is the one whose
+    /// full hash xtask/upstream-merged.txt holds; the file is updated in
+    /// the same commit as each upstream merge, and no `upstream` remote is
+    /// needed. Files that exist upstream are left as they are, also where
+    /// the fork changed them: upstream's layout is kept so that merges do
+    /// not conflict on formatting. Nothing is formatted when the recorded
+    /// commit is not in the clone (a shallow one) or the record is seen to
+    /// be out of date.
     Fmt,
     /// Check that the fork's own Rust files (see `fmt`) are formatted,
     /// without writing. Files that exist upstream are not checked, also
-    /// where the fork changed or renamed them. Without an `upstream`
-    /// remote and without a merge of upstream in the history nothing is
-    /// checked and the command succeeds with a message.
+    /// where the fork changed or renamed them. When the commit that
+    /// xtask/upstream-merged.txt names is not in the clone (a shallow one)
+    /// nothing is checked and the command succeeds with a message; a
+    /// record that is missing or out of date is an error.
     FmtCheck,
 }
 
