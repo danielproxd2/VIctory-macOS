@@ -1648,6 +1648,97 @@ mod tests {
         assert_eq!(blob_size(u64::MAX), Err(NO_ACCESS));
     }
 
+    /// A blob file of more than 32 bits (nothing we write; made here as a
+    /// sparse file, which takes no room on the disk) is not loaded and
+    /// not cut short: reading it fails before the file is read, and the
+    /// container lists no blobs once one of those asked for is such a
+    /// file. Blobs not asked for are not looked at.
+    #[test]
+    fn a_blob_file_past_32_bits_is_neither_read_nor_listed() {
+        extern "system" fn listed(info: *const BlobInfo, context: *mut c_void) -> bool {
+            // SAFETY: valid during the callback; the context is the test's
+            // vector.
+            let (info, out) = unsafe { (&*info, &mut *context.cast::<Vec<(String, u32)>>()) };
+            out.push((text(info.name).unwrap(), info.size));
+            true
+        }
+        fn list(
+            slot: &Container,
+            prefix: Option<&std::ffi::CStr>,
+        ) -> (HRESULT, Vec<(String, u32)>) {
+            let mut found: Vec<(String, u32)> = Vec::new();
+            let prefix = prefix.map_or(std::ptr::null(), |p| p.as_ptr());
+            let context = (&raw mut found).cast();
+            let hr = enumerate_blobs(&OBJECT, slot, prefix, context, Some(listed));
+            (hr, found)
+        }
+        let this: This = &OBJECT;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(
+            update(root, "one", &[("a", Some("alpha")), ("b", Some("beta"))]),
+            S_OK
+        );
+        let slot = Provider { root: root.into() }.container("Slot");
+        let both = vec![("a".to_owned(), 5), ("b".to_owned(), 4)];
+        assert_eq!(list(&slot, None), (S_OK, both.clone()));
+
+        let file = slot.dir.join("v1").join("0");
+        assert_eq!(std::fs::read(&file).unwrap(), b"alpha");
+        let resize = |len: u64| {
+            let blob = std::fs::OpenOptions::new().write(true).open(&file).unwrap();
+            blob.set_len(len).unwrap();
+            assert_eq!(std::fs::metadata(&file).unwrap().len(), len);
+        };
+        resize(u64::from(u32::MAX) + 1);
+
+        // What a read gave, by size: a failed assertion must not print a
+        // blob of that length.
+        let sizes = |names: Option<&[&str]>| {
+            let names = names.map(|names| names.iter().map(|n| n.to_string()).collect());
+            let size = |(name, data): (String, Vec<u8>)| (name, data.len());
+            read(&slot, names).map(|blobs| blobs.into_iter().map(size).collect::<Vec<_>>())
+        };
+        assert_eq!(sizes(None), Err(NO_ACCESS));
+        assert_eq!(sizes(Some(&["a"])), Err(NO_ACCESS));
+        assert_eq!(sizes(Some(&["b", "a"])), Err(NO_ACCESS));
+        assert_eq!(sizes(Some(&["b"])), Ok(vec![("b".to_owned(), 4)]));
+        // Through the API: nothing is written and the count stays.
+        let mut buffer = vec![0u64; 32];
+        let (out, size) = (buffer.as_mut_ptr().cast::<u8>(), 32 * 8);
+        let mut count = 7;
+        assert_eq!(
+            read_blobs(this, &slot, std::ptr::null(), &mut count, size, out),
+            NO_ACCESS
+        );
+        assert_eq!(count, 7);
+        assert!(
+            buffer.iter().all(|w| *w == 0),
+            "a refused read wrote something"
+        );
+        let mut block = block();
+        assert_eq!(
+            read_async(this, &slot, std::ptr::null(), 0, &mut block),
+            S_OK
+        );
+        assert_eq!(xasync::XAsyncGetStatus(&mut block, true), NO_ACCESS);
+
+        assert_eq!(list(&slot, None), (NO_ACCESS, Vec::new()));
+        assert_eq!(list(&slot, Some(c"a")), (NO_ACCESS, Vec::new()));
+        assert_eq!(list(&slot, Some(c"b")), (S_OK, vec![both[1].clone()]));
+
+        // One byte less fits 32 bits: the size is reported as it is.
+        resize(u64::from(u32::MAX));
+        let longest = vec![("a".to_owned(), u32::MAX), both[1].clone()];
+        assert_eq!(list(&slot, None), (S_OK, longest));
+
+        // Nothing else was wrong with the container.
+        resize(5);
+        assert_eq!(list(&slot, None), (S_OK, both));
+        let kept = vec![("a".into(), "alpha".into()), ("b".into(), "beta".into())];
+        assert_eq!(state(root), Some(("one".into(), kept)));
+    }
+
     /// Blob `i` of a result in `buffer`: its name and data, through the
     /// pointers the call left there.
     fn blob_at(buffer: &[u64], i: usize) -> (String, Vec<u8>) {
