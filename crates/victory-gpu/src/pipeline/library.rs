@@ -53,8 +53,17 @@ const EARLY_FILE: &str = "early-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 8192;
 
+#[cfg(test)]
+thread_local! {
+    /// How often this thread has asked for the library, which opens it
+    /// (and with it the host device) the first time in the process.
+    static ASKED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 fn library() -> Option<&'static Mutex<Library>> {
     static LIBRARY: OnceLock<Option<Mutex<Library>>> = OnceLock::new();
+    #[cfg(test)]
+    ASKED.with(|asked| asked.set(asked.get() + 1));
     LIBRARY
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
@@ -338,6 +347,42 @@ mod tests {
         assert_eq!(save_target(Some(&dir), open), Some((&dir, "library")));
         assert_eq!(opened.get(), 1);
         assert_eq!(save_target(Some(&dir), || None::<&str>), None);
+    }
+
+    fn asked() -> u32 {
+        ASKED.with(std::cell::Cell::get)
+    }
+
+    /// The rule above where it is applied: `save` itself, with no cache
+    /// folder (the tests set none), does not ask for the library. The
+    /// workers call it after every pipeline, outside the device tests'
+    /// lock; were it to ask, any test that queues a pipeline would make
+    /// the host device on a worker thread.
+    #[test]
+    fn a_save_without_a_cache_folder_asks_for_no_library() {
+        // Held in case the save does ask: that reaches the device.
+        let _serial = crate::testing::serial();
+        assert_eq!(DIR.get(), None, "the tests set no cache folder");
+        let before = asked();
+        save(true);
+        save(false);
+        assert_eq!(asked(), before, "a save asked for the library");
+    }
+
+    /// What the test above counts is counted: asking for the library is
+    /// seen on the asking thread, and only there.
+    #[test]
+    fn asking_for_the_library_is_counted() {
+        let Some((_gpu, _host)) = crate::testing::gpu() else {
+            return;
+        };
+        let before = asked();
+        let first = library().map(std::ptr::from_ref);
+        assert_eq!(asked(), before + 1);
+        assert_eq!(library().map(std::ptr::from_ref), first);
+        assert_eq!(asked(), before + 2);
+        let elsewhere = std::thread::spawn(asked).join();
+        assert_eq!(elsewhere.ok(), Some(0));
     }
 
     #[test]
