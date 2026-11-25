@@ -64,7 +64,28 @@ enum Stop {
     Fail(ShaderError),
 }
 
+/// The thread-group size D3D12 accepts (`[numthreads]`): each of x and y
+/// in 1 to `D3D12_CS_THREAD_GROUP_MAX_X`/`_Y` (1024), z in 1 to
+/// `D3D12_CS_THREAD_GROUP_MAX_Z` (64), and no more than
+/// `D3D12_CS_THREAD_GROUP_MAX_THREADS_PER_GROUP` (1024) threads in all.
+/// These are the host's public limits, not a console rule: a group the
+/// console might take beyond them is refused, not emulated.
+fn thread_group_fits(threads: [u32; 3]) -> bool {
+    let [x, y, z] = threads;
+    let each = (1..=1024).contains(&x) && (1..=1024).contains(&y) && (1..=64).contains(&z);
+    // Each factor is at most 1024, so the product is far below 2^32.
+    each && x * y * z <= 1024
+}
+
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    if let StageIo::Cs(cs) = parts.native.io
+        && !thread_group_fits(cs.threads)
+    {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "a thread group size outside the D3D12 limits",
+        });
+    }
     let mut bad = HashMap::new();
     loop {
         match Lower::new(parts, &bad).run() {
@@ -6985,6 +7006,15 @@ mod tests {
 
     /// Whether a synthetic compute program translates with these input registers.
     fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
+        lowers_threads(words, rsrc2, [1, 1, 1])
+    }
+
+    /// [`lowers`] with the thread-group size `threads`.
+    fn lowers_threads(
+        words: &[u32],
+        rsrc2: u32,
+        threads: [u32; 3],
+    ) -> Result<(), crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -6992,10 +7022,7 @@ mod tests {
             vgprs: 256,
             layout: vec![],
             used: vec![],
-            io: StageIo::Cs(ComputeIo {
-                rsrc2,
-                threads: [1, 1, 1],
-            }),
+            io: StageIo::Cs(ComputeIo { rsrc2, threads }),
             code,
         };
         let p = ir::build(&native.code, false, 256).unwrap();
@@ -7014,6 +7041,43 @@ mod tests {
             mesh_stride: 0,
         })
         .map(|l| drop(validated(l)))
+    }
+
+    /// A thread-group size comes from the title's container. One outside
+    /// what D3D12 takes (x and y up to 1024, z up to 64, 1024 threads in
+    /// all, none zero) is refused before anything multiplies its
+    /// components: 65536 x 65536 overflowed the product that decides the
+    /// wave size (a panic with overflow checks, a product of 0 without).
+    #[test]
+    fn thread_group_sizes_outside_d3d12_limits_are_refused() {
+        let refused = Err(crate::ShaderError::Unsupported {
+            offset: 0,
+            what: "a thread group size outside the D3D12 limits",
+        });
+        for threads in [
+            [65536, 65536, 1],
+            [0, 1, 1],
+            [1, 0, 1],
+            [1, 1, 0],
+            [1025, 1, 1],
+            [1, 1025, 1],
+            [1, 1, 65],
+            [32, 32, 2],
+            [u32::MAX, u32::MAX, u32::MAX],
+        ] {
+            assert_eq!(
+                lowers_threads(&[S_ENDPGM], 0, threads),
+                refused,
+                "{threads:?}"
+            );
+        }
+        for threads in [[1024, 1, 1], [1, 1024, 1], [4, 4, 64], [32, 32, 1]] {
+            assert_eq!(
+                lowers_threads(&[S_ENDPGM], 0, threads),
+                Ok(()),
+                "{threads:?}"
+            );
+        }
     }
 
     /// `lowered`, after dxil.dll has checked its container (a printed skip

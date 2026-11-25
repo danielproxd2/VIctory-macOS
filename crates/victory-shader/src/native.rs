@@ -168,17 +168,28 @@ impl NativeProgram {
     /// The code with each render target's export patched for its full
     /// 32-bit format, so exports carry the shader's values unconverted (as
     /// the console does at pipeline creation for that format).
-    pub fn patched_code(&self) -> Vec<u8> {
+    ///
+    /// A patch that does not lie inside the code is malformed.
+    /// [`native_programs`] refuses such a container already; a program
+    /// built by hand gets the same answer here.
+    pub fn patched_code(&self) -> Result<Vec<u8>, ShaderError> {
         let mut code = self.code.clone();
         if let StageIo::Ps { patches, .. } = &self.io {
             for p in patches {
-                let at = p.offset as usize * 4;
-                for (i, word) in p.code.iter().enumerate() {
-                    code[at + 4 * i..at + 4 * i + 4].copy_from_slice(&word.to_le_bytes());
+                let range = usize::try_from(p.offset)
+                    .ok()
+                    .and_then(|words| words.checked_mul(4))
+                    .zip(p.code.len().checked_mul(4))
+                    .and_then(|(at, len)| Some(at..at.checked_add(len)?));
+                let target = range
+                    .and_then(|r| code.get_mut(r))
+                    .ok_or(Malformed("export patch outside the code"))?;
+                for (bytes, word) in target.as_chunks_mut::<4>().0.iter_mut().zip(&p.code) {
+                    *bytes = word.to_le_bytes();
                 }
             }
         }
-        code
+        Ok(code)
     }
 }
 
@@ -328,9 +339,15 @@ impl ComputeIo {
         end.unwrap_or(0).max(self.user_sgprs()) + (self.rsrc2 & 1) as u8
     }
 
-    /// Thread id components in v0, v1, v2 (1 to 3).
-    pub fn thread_id_vgprs(&self) -> u8 {
-        (self.rsrc2 >> 11 & 3) as u8 + 1
+    /// Thread id components in v0, v1, v2 (1 to 3). The field holds the
+    /// count less one in two bits (`TIDIG_COMP_CNT`: x, x and y, or all
+    /// three, as the open AMD drivers program it); a thread id has no
+    /// fourth component, so the value 3 is malformed.
+    pub fn thread_id_vgprs(&self) -> Result<u8, ShaderError> {
+        match (self.rsrc2 >> 11 & 3) as u8 {
+            3 => Err(Malformed("a fourth thread id component")),
+            n => Ok(n + 1),
+        }
     }
 
     /// LDS bytes per thread group (512-byte granules).
@@ -529,14 +546,18 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
         let io = match stage {
             HwStage::Ps => ps_io(stage_data, code.len())?,
             HwStage::Vs => vs_io(stage_data)?,
-            HwStage::Cs => StageIo::Cs(ComputeIo {
-                rsrc2: u32_at(stage_data, CS_RSRC2)?,
-                threads: [
-                    u32_at(stage_data, CS_THREADS)?,
-                    u32_at(stage_data, CS_THREADS + 4)?,
-                    u32_at(stage_data, CS_THREADS + 8)?,
-                ],
-            }),
+            HwStage::Cs => {
+                let cs = ComputeIo {
+                    rsrc2: u32_at(stage_data, CS_RSRC2)?,
+                    threads: [
+                        u32_at(stage_data, CS_THREADS)?,
+                        u32_at(stage_data, CS_THREADS + 4)?,
+                        u32_at(stage_data, CS_THREADS + 8)?,
+                    ],
+                };
+                cs.thread_id_vgprs()?;
+                StageIo::Cs(cs)
+            }
             HwStage::Ms => ms_io(stage_data, u32_at(record, RECORD_LDS)?)?,
             _ => StageIo::None,
         };
@@ -804,7 +825,7 @@ mod tests {
         assert_eq!((&inputs[..], *input_addr), (&[input][..], 2));
         assert_eq!(patches.len(), 1);
         assert_eq!((patches[0].mrt, patches[0].offset), (1, 1));
-        let patched = p.patched_code();
+        let patched = p.patched_code().unwrap();
         assert_eq!(patched[..4], p.code[..4]);
         assert_eq!(patched[4..12], [0x1f, 0x18, 0, 0xf8, 0, 1, 2, 3]);
         assert_eq!(patched[12..], p.code[12..]);
@@ -866,14 +887,89 @@ mod tests {
         };
         assert_eq!(cs.user_sgprs(), 5);
         assert_eq!(cs.system_sgprs(), ([Some(5), Some(6), None], None));
-        assert_eq!((cs.thread_id_vgprs(), cs.lds_bytes()), (2, 1024));
+        assert_eq!((cs.thread_id_vgprs(), cs.lds_bytes()), (Ok(2), 1024));
         // 6 user SGPRs, all three group ids, v0-v2, no LDS.
         let cs = ComputeIo {
             rsrc2: 0x138C,
             threads: [8, 8, 1],
         };
         assert_eq!(cs.system_sgprs(), ([Some(6), Some(7), Some(8)], None));
-        assert_eq!((cs.thread_id_vgprs(), cs.lds_bytes()), (3, 0));
+        assert_eq!((cs.thread_id_vgprs(), cs.lds_bytes()), (Ok(3), 0));
+    }
+
+    /// `TIDIG_COMP_CNT` 3 would put a fourth thread id component in v3,
+    /// which no thread id has: the container is malformed, both as the
+    /// parser reads it and for a program built by hand.
+    #[test]
+    fn a_fourth_thread_id_component_is_malformed() {
+        let malformed = || Malformed("a fourth thread id component");
+        let io = |count: u32| ComputeIo {
+            rsrc2: count << 11,
+            threads: [8, 8, 1],
+        };
+        assert_eq!(io(2).thread_id_vgprs(), Ok(3));
+        assert_eq!(io(3).thread_id_vgprs(), Err(malformed()));
+
+        // v_mov_b32 v4, v0 (then v1, v2, v3); s_endpgm: v0 to v3 are read.
+        let code: Vec<u8> = [0x7E08_0300u32, 0x7E08_0301, 0x7E08_0302, 0x7E08_0303]
+            .into_iter()
+            .chain([0xBF81_0000])
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        let program = |count: u32| NativeProgram {
+            io: StageIo::Cs(io(count)),
+            ..crate::testkit::bare_program(HwStage::Cs, &code)
+        };
+        let parse = |count: u32| {
+            let blob = xbch(&crate::testkit::native_blob(&[program(count)]));
+            native_programs(&part(&[(KIND_NATIVE, &blob)]))
+        };
+        assert_eq!(parse(2).map(|p| p.len()), Ok(1));
+        assert_eq!(parse(3), Err(malformed()));
+
+        let raise = |count: u32| {
+            let native = program(count);
+            let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+            crate::io::raise(&p, &native).map(|io| {
+                io.inputs
+                    .iter()
+                    .filter(|i| matches!(i.1, crate::io::Input::ThreadIdInGroup(_)))
+                    .count()
+            })
+        };
+        assert_eq!(raise(2), Ok(3));
+        assert_eq!(raise(3), Err(malformed()));
+    }
+
+    /// An export patch names where it goes in dwords of code. The parser
+    /// refuses one outside the code; so does patching a program built by
+    /// hand, where it used to index past the end (a panic).
+    #[test]
+    fn a_patch_past_the_code_is_refused() {
+        let program = |offset: u32, words: usize| NativeProgram {
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![ExportPatch {
+                    mrt: 0,
+                    offset,
+                    code: vec![0x1122_3344; words],
+                }],
+            },
+            ..crate::testkit::bare_program(HwStage::Ps, &[0; 16])
+        };
+        let outside = Err(Malformed("export patch outside the code"));
+        // Four dwords of code: a patch may end at the end, not past it.
+        let last = program(2, 2).patched_code().unwrap();
+        assert_eq!(last[..8], [0; 8]);
+        assert_eq!(last[8..], [0x44, 0x33, 0x22, 0x11, 0x44, 0x33, 0x22, 0x11]);
+        assert_eq!(program(4, 0).patched_code(), Ok(vec![0; 16]));
+        assert_eq!(program(3, 2).patched_code(), outside);
+        assert_eq!(program(4, 1).patched_code(), outside);
+        assert_eq!(program(5, 0).patched_code(), outside);
+        assert_eq!(program(u32::MAX, 1).patched_code(), outside);
+        assert_eq!(program(0x4000_0000, 1).patched_code(), outside);
     }
 
     #[test]

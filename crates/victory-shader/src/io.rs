@@ -226,7 +226,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         // SGPRs after the user data.
         (StageIo::Cs(cs), HwStage::Cs) => {
             let (ids, info) = cs.system_sgprs();
-            let mut loaded: Vec<(Reg, Input)> = (0..cs.thread_id_vgprs())
+            let mut loaded: Vec<(Reg, Input)> = (0..cs.thread_id_vgprs()?)
                 .map(|c| (Reg::V(c), Input::ThreadIdInGroup(c)))
                 .collect();
             for (c, s) in ids.into_iter().enumerate() {

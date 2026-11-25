@@ -213,7 +213,7 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
-    let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+    let p = ir::build(&native.patched_code()?, native.wave64, native.vgprs)?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
     let st = structure::structure(&p);
@@ -320,7 +320,14 @@ pub fn emit(
     })
 }
 
-/// The rows of an `ISG1`/`OSG1` part.
+/// Rows (registers) of a stage's input or output signature: the public
+/// D3D12 limit (`D3D12_VS_INPUT_REGISTER_COUNT`,
+/// `D3D12_VS_OUTPUT_REGISTER_COUNT` and `D3D12_PS_INPUT_REGISTER_COUNT` are
+/// all 32), which the DXIL we emit must keep. This is the host's limit, not
+/// a console rule: a signature beyond it is refused, not emulated.
+const SIGNATURE_ROWS: u32 = 32;
+
+/// The rows of an `ISG1`/`OSG1` part. Each element takes one row.
 fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
     use crate::dxbc::u32_at;
     let count = u32_at(part, 0)? as usize;
@@ -396,7 +403,14 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
                 });
             }
         };
+        // A register past the signature's rows (`u32::MAX` is none) would
+        // size the tables built per row from a title's number.
         let register = u32_at(part, at + 20)?;
+        if register != u32::MAX && register >= SIGNATURE_ROWS {
+            return Err(ShaderError::Malformed(
+                "signature register past the 32 rows of a D3D12 signature",
+            ));
+        }
         out.push(container::SigElement {
             name: String::from_utf8_lossy(name).into_owned(),
             index: u32_at(part, at + 8)?,
@@ -457,6 +471,43 @@ mod tests {
         assert!(super::signature(&part).is_err());
     }
 
+    /// A signature row's register comes from the title's container and
+    /// sizes what is built per row (the PSV0 vectors and dependency table,
+    /// the view-id state). D3D12 has 32 rows per signature; a register
+    /// past them is malformed, at once: 0xFFFF_FFFE overflowed `row + 1`,
+    /// and 0x1000_0000 asked for a dependency table of billions of words.
+    #[test]
+    fn a_signature_register_past_the_limit_is_malformed() {
+        use crate::testkit::{self, Element};
+        let words = [0xBF81_0000u32]; // s_endpgm
+        let translate = |register: u32| {
+            let isg1 = [Element::float("TEXCOORD", 0, register, 0xF)];
+            let osg1 = [Element::float("SV_Target", 64, register, 0xF)];
+            let both = testkit::console_container(HwStage::Ps, &words, &isg1, &osg1);
+            let input = testkit::console_container(HwStage::Ps, &words, &isg1, &[]);
+            let output = testkit::console_container(HwStage::Ps, &words, &[], &osg1);
+            [both, input, output].map(|c| super::translate(&c).map(|s| s.stage))
+        };
+        let malformed = Err(ShaderError::Malformed(
+            "signature register past the 32 rows of a D3D12 signature",
+        ));
+        let started = std::time::Instant::now();
+        for register in [32, 0x1000_0000, 0xFFFF_FFFE] {
+            for result in translate(register) {
+                assert_eq!(result, malformed, "register {register:#x}");
+            }
+        }
+        // The last row and "no register" are not refused for their row.
+        for register in [31, u32::MAX] {
+            for result in translate(register) {
+                assert_ne!(result, malformed, "register {register:#x}");
+            }
+        }
+        // Loose on purpose (a slow, loaded machine): the table the old code
+        // built for 0x1000_0000 took minutes and gigabytes.
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+    }
+
     use super::container::SigElement;
     use super::shader::Shader;
     use super::*;
@@ -506,7 +557,7 @@ mod tests {
             container::signature(&[el("SV_Depth", 17, 9), el("SV_StencilRef", 20, 5)], false);
         let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
         let c = Container::parse(&bytes).unwrap();
-        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let p = ir::build(&native.patched_code().unwrap(), native.wave64, native.vgprs).unwrap();
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
@@ -544,15 +595,17 @@ mod tests {
             }),
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
-        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let p = ir::build(&native.patched_code().unwrap(), native.wave64, native.vgprs).unwrap();
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
         let container = crate::dxbc::build(&[]);
         let c = Container::parse(&container).unwrap();
-        if let Err(e) = emit(&c, &native, &p, &st, &io, &res) {
-            assert!(e.to_string().contains("its own value"), "{e}");
-        }
+        // The v_mov's result is missing and nothing uses it: the program
+        // translates, to a module the validator takes.
+        let out = emit(&c, &native, &p, &st, &io, &res);
+        assert_eq!(out.as_ref().map(|s| s.stage), Ok(HwStage::Cs));
+        crate::testing::dxil(&out.unwrap().dxil);
     }
 
     /// A pixel shader writing a constant colour.
@@ -703,7 +756,8 @@ mod tests {
             let bytes =
                 crate::dxbc::build(&[(super::FourCC::ISG1, &isg1), (super::FourCC::OSG1, &osg1)]);
             let c = super::Container::parse(&bytes).unwrap();
-            let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let p = crate::ir::build(&native.patched_code().unwrap(), native.wave64, native.vgprs)
+                .unwrap();
             let st = crate::structure::structure(&p).unwrap();
             let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
             let io = crate::io::raise(&p, &native).unwrap();
@@ -768,12 +822,16 @@ mod tests {
         let isg1 = super::container::signature(&[w_only], true);
         let bytes = crate::dxbc::build(&[(super::FourCC::ISG1, &isg1)]);
         let c = super::Container::parse(&bytes).unwrap();
-        let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let p =
+            crate::ir::build(&native.patched_code().unwrap(), native.wave64, native.vgprs).unwrap();
         let st = crate::structure::structure(&p).unwrap();
         let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = crate::io::raise(&p, &native).unwrap();
-        // Translated or refused with a reason; it must not panic.
-        let _ = super::emit(&c, &native, &p, &st, &io, &res);
+        // The read lies in no element and its value goes nowhere: the
+        // program translates, to a module the validator takes.
+        let out = super::emit(&c, &native, &p, &st, &io, &res);
+        assert_eq!(out.as_ref().map(|s| s.stage), Ok(super::HwStage::Ps));
+        crate::testing::dxil(&out.unwrap().dxil);
     }
 
     use crate::gfx10::asm;
