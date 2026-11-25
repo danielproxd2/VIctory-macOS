@@ -44,9 +44,15 @@ pub fn run(
     });
     let wanted = |dll: &str| title_dll(&resolver.host, dll);
     let title_dir = exe.parent().unwrap_or(Path::new("."));
-    // A missing manifest leaves id 0 and no storage quota.
+    // A missing manifest leaves id 0 and no storage quota, and so does
+    // what the reader does not take from one that is there: said here,
+    // because the title then keeps its storage under another id.
     let manifest = std::fs::read(title_dir.join("MicrosoftGame.config")).unwrap_or_default();
-    let title = victory_hle::runtime::Title::from_manifest_bytes(&manifest);
+    let manifest = victory_hle::runtime::Title::read_manifest(&manifest);
+    for refused in &manifest.refused {
+        println!("manifest       not taken as it stands: {refused}");
+    }
+    let title = manifest.title;
     let storage = cfg.data_subdir(&format!("{:08X}/storage", title.id))?;
     println!(
         "title          {:08X}, storage {} ({} MB)",

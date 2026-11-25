@@ -84,6 +84,164 @@ pub struct Title {
     pub storage_bytes: u64,
 }
 
+/// One of the three things a manifest tells us.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Field {
+    TitleId,
+    StoreId,
+    StorageSize,
+}
+
+impl Field {
+    /// The element's path from the root.
+    pub fn path(self) -> &'static str {
+        match self {
+            Field::TitleId => "Game/TitleId",
+            Field::StoreId => "Game/StoreId",
+            Field::StorageSize => "Game/PersistentLocalStorage/SizeMB",
+        }
+    }
+}
+
+/// A rule the manifest reader holds to that a manifest broke, so that the
+/// part it names was not taken ([`Manifest::refused`]). A title whose id
+/// was refused runs as title 00000000, with its storage in that folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// The file is neither UTF-8 nor UTF-16 behind a byte-order mark:
+    /// nothing of it was read.
+    Encoding,
+    /// A tag, comment or CDATA section never closes: nothing from its
+    /// start on was read.
+    UnclosedTag,
+    /// A quote inside a tag never closes, which makes the rest of the
+    /// file that tag: nothing from its start on was read.
+    UnbalancedQuote,
+    /// The element is given more than once: none of them was taken.
+    Repeated(Field),
+    /// `Game/TitleId` is not one to eight hexadecimal digits (a sign, a
+    /// `0x` or anything else in it): no id was taken.
+    TitleIdNotHex,
+    /// `Game/PersistentLocalStorage/SizeMB` is not a number in decimal
+    /// digits: no quota was taken.
+    SizeNotDecimal,
+}
+
+impl Refusal {
+    /// The rule's name, as the log has it.
+    pub fn rule(self) -> &'static str {
+        match self {
+            Refusal::Encoding => "encoding",
+            Refusal::UnclosedTag => "unclosed-tag",
+            Refusal::UnbalancedQuote => "unbalanced-quote",
+            Refusal::Repeated(_) => "repeated-element",
+            Refusal::TitleIdNotHex => "title-id-not-hex",
+            Refusal::SizeNotDecimal => "size-not-decimal",
+        }
+    }
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Refusal::Encoding => f.write_str(
+                "the file is neither UTF-8 nor UTF-16 behind a byte-order mark; nothing is read",
+            ),
+            Refusal::UnclosedTag => f.write_str(
+                "a tag, comment or CDATA section never closes; nothing from its start on is read",
+            ),
+            Refusal::UnbalancedQuote => f.write_str(
+                "a quote inside a tag never closes; nothing from the tag's start on is read",
+            ),
+            Refusal::Repeated(field) => {
+                write!(f, "{} is given more than once; none is taken", field.path())
+            }
+            Refusal::TitleIdNotHex => write!(
+                f,
+                "{} is not one to eight hexadecimal digits; no title id is taken",
+                Field::TitleId.path()
+            ),
+            Refusal::SizeNotDecimal => write!(
+                f,
+                "{} is not a number in decimal digits; no storage quota is taken",
+                Field::StorageSize.path()
+            ),
+        }
+    }
+}
+
+/// What a manifest gave ([`Title::read_manifest`]), and what of it was not
+/// taken and why.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Manifest {
+    pub title: Title,
+    /// Each rule the manifest broke, once, in the order: the file, then
+    /// title id, store id and storage size.
+    pub refused: Vec<Refusal>,
+}
+
+impl Manifest {
+    /// The manifest of `text`. Logs nothing.
+    fn parse(text: &str) -> Manifest {
+        let (elements, cut) = elements(text);
+        let mut refused: Vec<Refusal> = cut.into_iter().collect();
+        let mut get = |field: Field| {
+            let mut found = elements.iter().filter(|(p, _)| p == field.path());
+            match (found.next(), found.next()) {
+                (Some((_, text)), None) => Some(text.as_str()),
+                (Some(_), Some(_)) => {
+                    refused.push(Refusal::Repeated(field));
+                    None
+                }
+                (None, _) => None,
+            }
+        };
+        let (id, store_id, size) = (
+            get(Field::TitleId),
+            get(Field::StoreId),
+            get(Field::StorageSize),
+        );
+        // An element that is there and gives no value is a refusal, one
+        // that is not there is not.
+        let mut number = |value: Option<&str>, radix: u32, most: u64, rule: Refusal| {
+            let number = plain_number(value?, radix).filter(|n| *n <= most);
+            if number.is_none() {
+                refused.push(rule);
+            }
+            number
+        };
+        let id = number(id, 16, u32::MAX.into(), Refusal::TitleIdNotHex);
+        let id = id.map_or(0, |id| id as u32);
+        let storage_mb = number(size, 10, u64::MAX, Refusal::SizeNotDecimal);
+        let title = Title {
+            id,
+            store_id: store_id.unwrap_or_default().to_owned(),
+            storage: PathBuf::new(),
+            storage_bytes: storage_mb.map_or(0, |mb| mb.saturating_mul(1 << 20)),
+        };
+        // In the documented order, whatever order they were found in.
+        refused.sort_by_key(|r| match r {
+            Refusal::Encoding | Refusal::UnclosedTag | Refusal::UnbalancedQuote => 0,
+            Refusal::Repeated(Field::TitleId) | Refusal::TitleIdNotHex => 1,
+            Refusal::Repeated(Field::StoreId) => 2,
+            Refusal::Repeated(Field::StorageSize) | Refusal::SizeNotDecimal => 3,
+        });
+        Manifest { title, refused }
+    }
+
+    /// One warning for each refusal, naming its rule: a refused title id
+    /// means the title runs as 00000000, which must not pass unseen.
+    fn warned(self) -> Manifest {
+        for refused in &self.refused {
+            tracing::warn!(
+                rule = refused.rule(),
+                "the title's manifest is not taken as it stands: {refused}"
+            );
+        }
+        self
+    }
+}
+
 impl Title {
     /// Id, store id and storage quota from the manifest (zero or empty
     /// where it has none); the storage folder is left for the caller.
@@ -91,42 +249,35 @@ impl Title {
     /// How the console reads a manifest that is not what the tools write is
     /// not known, so nothing is guessed: an element that occurs more than
     /// once, a title id that is not plain hexadecimal digits and a size
-    /// that is not plain decimal digits all count as not given.
+    /// that is not plain decimal digits all count as not given. Each such
+    /// case is logged as a warning; [`Title::read_manifest`] also returns
+    /// them.
     pub fn from_manifest(text: &str) -> Title {
-        let elements = elements(text);
-        let get = |path: &str| {
-            let mut found = elements.iter().filter(|(p, _)| p == path);
-            match (found.next(), found.next()) {
-                (Some((_, text)), None) => Some(text.as_str()),
-                _ => None,
-            }
-        };
-        let digits = |v: &str, radix: u32| !v.is_empty() && v.chars().all(|c| c.is_digit(radix));
-        let id = get("Game/TitleId")
-            .filter(|v| digits(v, 16))
-            .and_then(|v| u32::from_str_radix(v, 16).ok());
-        let storage_mb = get("Game/PersistentLocalStorage/SizeMB")
-            .filter(|v| digits(v, 10))
-            .and_then(|v| v.parse().ok());
-        Title {
-            id: id.unwrap_or(0),
-            store_id: get("Game/StoreId").unwrap_or_default().to_owned(),
-            storage: PathBuf::new(),
-            storage_bytes: storage_mb.map_or(0, |mb: u64| mb.saturating_mul(1 << 20)),
-        }
+        Manifest::parse(text).warned().title
+    }
+
+    /// [`Title::read_manifest`] without its reasons (they are logged).
+    pub fn from_manifest_bytes(bytes: &[u8]) -> Title {
+        Title::read_manifest(bytes).title
     }
 
     /// [`Title::from_manifest`] of the manifest file's bytes: UTF-8, or
     /// UTF-16 behind a byte-order mark (XML requires the mark of a UTF-16
     /// document). Bytes that are neither say nothing about the title.
-    pub fn from_manifest_bytes(bytes: &[u8]) -> Title {
-        match manifest_text(bytes) {
-            Some(text) => Title::from_manifest(&text),
-            None => {
-                tracing::warn!("the title's manifest is neither UTF-8 nor marked UTF-16; ignored");
-                Title::default()
-            }
-        }
+    ///
+    /// With the title comes every [`Refusal`]: what the manifest holds
+    /// that was not taken, and by which rule. Each is logged as one
+    /// warning; the caller tells the user. A manifest that simply lacks an
+    /// element (or an empty file, as for no manifest) has none.
+    pub fn read_manifest(bytes: &[u8]) -> Manifest {
+        let manifest = match manifest_text(bytes) {
+            Some(text) => Manifest::parse(&text),
+            None => Manifest {
+                title: Title::default(),
+                refused: vec![Refusal::Encoding],
+            },
+        };
+        manifest.warned()
     }
 
     /// Where game saves live: next to persistent local storage, under the
@@ -134,6 +285,13 @@ impl Title {
     pub fn saves(&self) -> PathBuf {
         self.storage.with_file_name("saves")
     }
+}
+
+/// The number `value` is in digits of `radix` and nothing else (no sign,
+/// no prefix, no space), if it is one and fits 64 bits.
+fn plain_number(value: &str, radix: u32) -> Option<u64> {
+    let digits = !value.is_empty() && value.chars().all(|c| c.is_digit(radix));
+    digits.then(|| u64::from_str_radix(value, radix).ok())?
 }
 
 /// The text of a manifest file, if its bytes are text in its encoding.
@@ -152,41 +310,48 @@ fn manifest_text(bytes: &[u8]) -> Option<String> {
     }
 }
 
-/// Where the tag that `rest` starts with ends (just past its `>`), if it
-/// does. A `>` inside a quoted attribute value is part of the value, as in
-/// XML.
-fn tag_end(rest: &str) -> Option<usize> {
+/// Where the tag that `rest` starts with ends (just past its `>`), or why
+/// it does not. A `>` inside a quoted attribute value is part of the
+/// value, as in XML.
+fn tag_end(rest: &str) -> Result<usize, Refusal> {
     let mut quote = None;
     for (at, c) in rest.char_indices() {
         match (quote, c) {
             (None, '"' | '\'') => quote = Some(c),
             (Some(open), c) if c == open => quote = None,
-            (None, '>') => return Some(at + 1),
+            (None, '>') => return Ok(at + 1),
             _ => {}
         }
     }
-    None
+    Err(match quote {
+        Some(_) => Refusal::UnbalancedQuote,
+        None => Refusal::UnclosedTag,
+    })
 }
 
 /// Each element of an XML text as its path from the root (`Game/TitleId`)
 /// and its trimmed text up to the first child, the predefined entities
 /// decoded; comments, CDATA sections, declarations and attributes are
 /// skipped. Names are taken as written (a namespace prefix is part of the
-/// name), and the text ends at a tag that never closes.
-fn elements(text: &str) -> Vec<(String, String)> {
+/// name), and the text ends at a tag that never closes; that there was
+/// one, and of which kind, is the second value.
+fn elements(text: &str) -> (Vec<(String, String)>, Option<Refusal>) {
     let mut out = Vec::new();
     let mut path: Vec<&str> = Vec::new();
     let mut rest = text;
     while let Some(open) = rest.find('<') {
         rest = &rest[open..];
         let end = if rest.starts_with("<!--") {
-            rest.find("-->").map(|e| e + 3)
+            rest.find("-->").map(|e| e + 3).ok_or(Refusal::UnclosedTag)
         } else if rest.starts_with("<![CDATA[") {
-            rest.find("]]>").map(|e| e + 3)
+            rest.find("]]>").map(|e| e + 3).ok_or(Refusal::UnclosedTag)
         } else {
             tag_end(rest)
         };
-        let Some(end) = end else { break };
+        let end = match end {
+            Ok(end) => end,
+            Err(cut) => return (out, Some(cut)),
+        };
         let tag = &rest[1..end - 1];
         rest = &rest[end..];
         if tag.starts_with(['!', '?']) {
@@ -220,7 +385,7 @@ fn elements(text: &str) -> Vec<(String, String)> {
             path.pop();
         }
     }
-    out
+    (out, None)
 }
 
 static TITLE: Mutex<Option<Title>> = Mutex::new(None);
@@ -431,6 +596,265 @@ mod tests {
         }
     }
 
+    fn refused(text: &str) -> Vec<Refusal> {
+        let manifest = Title::read_manifest(text.as_bytes());
+        assert_eq!(manifest.title, Title::from_manifest(text), "{text}");
+        manifest.refused
+    }
+
+    /// A manifest that breaks one of the reader's rules still yields a
+    /// title (id 0 where the id was refused), and says which rule: the
+    /// caller reports it, so that a title does not run as 00000000 with
+    /// no word of why. A manifest that only lacks an element breaks none.
+    #[test]
+    fn a_refused_manifest_says_which_rule_it_broke() {
+        use Refusal::*;
+        let size = |size: &str| {
+            format!(
+                "<Game><PersistentLocalStorage><SizeMB>{size}</SizeMB>\
+                 </PersistentLocalStorage></Game>"
+            )
+        };
+        let id = |id: &str| format!("<Game><TitleId>{id}</TitleId></Game>");
+
+        // Nothing wrong, or nothing there.
+        let whole = format!(
+            "<?xml version=\"1.0\"?><Game note=\"a>b\">{ID}<StoreId>9ABC</StoreId>\
+             <PersistentLocalStorage><SizeMB>16</SizeMB></PersistentLocalStorage></Game>"
+        );
+        let none: &[Refusal] = &[];
+        for text in [
+            whole.as_str(),
+            "",
+            "<Game/>",
+            "<Game><StoreId>A</StoreId></Game>",
+            "text",
+        ] {
+            assert_eq!(refused(text), none, "{text}");
+        }
+        // A prefixed name is another element: the ones we know are simply
+        // not there, which is no broken rule.
+        assert_eq!(refused("<m:Game><m:TitleId>1</m:TitleId></m:Game>"), none);
+
+        // Said twice.
+        assert_eq!(
+            refused(&format!("<Game>{ID}{ID}</Game>")),
+            [Repeated(Field::TitleId)]
+        );
+        assert_eq!(
+            refused(&format!("<Game>{ID}<TitleId/></Game>")),
+            [Repeated(Field::TitleId)]
+        );
+        let two_roots = "<Game><TitleId>639AA8DD</TitleId><StoreId>A</StoreId></Game>\
+                         <Game><TitleId>11111111</TitleId><StoreId>B</StoreId></Game>";
+        assert_eq!(
+            refused(two_roots),
+            [Repeated(Field::TitleId), Repeated(Field::StoreId)]
+        );
+        assert_eq!(
+            refused("<Game><StoreId>A</StoreId><StoreId>A</StoreId></Game>"),
+            [Repeated(Field::StoreId)]
+        );
+        let twice = "<Game><PersistentLocalStorage><SizeMB>1</SizeMB><SizeMB>1</SizeMB>\
+                     </PersistentLocalStorage></Game>";
+        assert_eq!(refused(twice), [Repeated(Field::StorageSize)]);
+
+        // Not the plain digits the tools write.
+        for text in [
+            "+639AA8DD",
+            "-1",
+            "0x639AA8DD",
+            "639A A8DD",
+            "639AA8DD0",
+            "639AA8DG",
+            "",
+        ] {
+            let manifest = Title::read_manifest(id(text).as_bytes());
+            assert_eq!(manifest.refused, [TitleIdNotHex], "{text:?}");
+            assert_eq!(manifest.title.id, 0, "{text:?}");
+        }
+        assert_eq!(refused("<Game><TitleId/></Game>"), [TitleIdNotHex]);
+        assert_eq!(refused(&id("FFFFFFFF")), none);
+        for text in [
+            "+16",
+            "-16",
+            "0x10",
+            "1 6",
+            "16MB",
+            "1.5",
+            "",
+            "99999999999999999999",
+        ] {
+            let manifest = Title::read_manifest(size(text).as_bytes());
+            assert_eq!(manifest.refused, [SizeNotDecimal], "{text:?}");
+            assert_eq!(manifest.title.storage_bytes, 0, "{text:?}");
+        }
+        assert_eq!(refused(&size("18446744073709551615")), none);
+
+        // Cut short: by a quote that never closes, or a tag, comment or
+        // CDATA section that never does. What stood before it is taken.
+        let quote = "<Game note=\"><TitleId>639AA8DD</TitleId></Game>";
+        let manifest = Title::read_manifest(quote.as_bytes());
+        assert_eq!(
+            (manifest.title.id, &manifest.refused[..]),
+            (0, &[UnbalancedQuote][..])
+        );
+        let later = format!("<Game>{ID}<Other a='></Other></Game>");
+        let manifest = Title::read_manifest(later.as_bytes());
+        assert_eq!(
+            (manifest.title.id, &manifest.refused[..]),
+            (0x639A_A8DD, &[UnbalancedQuote][..])
+        );
+        for text in [
+            "<Game><TitleId",
+            "<Game><!-- <TitleId>639AA8DD</TitleId></Game>",
+            "<Game><![CDATA[ <TitleId>639AA8DD</TitleId></Game>",
+            "<",
+            "</",
+        ] {
+            assert_eq!(refused(text), [UnclosedTag], "{text}");
+        }
+
+        // Several at once: the file first, then id, store id, size.
+        let all = format!(
+            "<Game><PersistentLocalStorage><SizeMB>+16</SizeMB></PersistentLocalStorage>\
+             <StoreId>A</StoreId><StoreId>B</StoreId>{ID}{ID}<Other"
+        );
+        assert_eq!(
+            refused(&all),
+            [
+                UnclosedTag,
+                Repeated(Field::TitleId),
+                Repeated(Field::StoreId),
+                SizeNotDecimal
+            ]
+        );
+        assert_eq!(Title::from_manifest(&all), Title::default());
+
+        // Not text in its encoding: nothing is read, and that is the one
+        // reason.
+        let utf16: Vec<u8> = whole.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let marked = [&[0xff, 0xfe][..], &utf16].concat();
+        assert_eq!(Title::read_manifest(&marked).refused, none);
+        let odd = &marked[..marked.len() - 1];
+        let lone_surrogate = [&marked[..], &[0x00, 0xd8]].concat();
+        for bytes in [odd, &lone_surrogate, b"\xff", b"<Game>\xff</Game>"] {
+            let manifest = Title::read_manifest(bytes);
+            assert_eq!(manifest.refused, [Encoding], "{bytes:?}");
+            assert_eq!(manifest.title, Title::default(), "{bytes:?}");
+        }
+    }
+
+    /// The rules have names of their own, and their sentences name the
+    /// element they are about.
+    #[test]
+    fn refusals_name_their_rule() {
+        use Refusal::*;
+        let all = [
+            Encoding,
+            UnclosedTag,
+            UnbalancedQuote,
+            Repeated(Field::TitleId),
+            Repeated(Field::StoreId),
+            Repeated(Field::StorageSize),
+            TitleIdNotHex,
+            SizeNotDecimal,
+        ];
+        let names: std::collections::HashSet<&str> = all.iter().map(|r| r.rule()).collect();
+        assert_eq!(names.len(), 6, "{names:?}");
+        let sentences: std::collections::HashSet<String> =
+            all.iter().map(|r| r.to_string()).collect();
+        assert_eq!(sentences.len(), all.len(), "{sentences:?}");
+        assert!(TitleIdNotHex.to_string().contains("Game/TitleId"));
+        assert!(
+            Repeated(Field::StoreId)
+                .to_string()
+                .contains("Game/StoreId")
+        );
+        let size = "Game/PersistentLocalStorage/SizeMB";
+        assert!(SizeNotDecimal.to_string().contains(size));
+        assert!(Repeated(Field::StorageSize).to_string().contains(size));
+    }
+
+    /// Collects the rule each warning names, on the thread it is set for.
+    struct Warnings(std::sync::Arc<Mutex<Vec<String>>>);
+
+    impl tracing::Subscriber for Warnings {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Rule(String);
+            impl tracing::field::Visit for Rule {
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    if field.name() == "rule" {
+                        self.0 = value.to_owned();
+                    }
+                }
+                fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+            }
+            let mut rule = Rule("no rule".to_owned());
+            event.record(&mut rule);
+            if *event.metadata().level() != tracing::Level::WARN {
+                rule.0 += " (not a warning)";
+            }
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(rule.0);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// What reading `read` logs: the rule of each event, in order.
+    fn logged(read: impl FnOnce()) -> Vec<String> {
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        // A second subscriber, alive while ours is made: with only one in
+        // the process, tracing decides whether a warning already seen by
+        // another test is of interest by asking this thread's subscriber
+        // before ours is set, and the answer (no) sticks.
+        let other = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let _other = tracing::Dispatch::new(Warnings(other));
+        tracing::subscriber::with_default(Warnings(seen.clone()), read);
+        let seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+        seen.clone()
+    }
+
+    /// Each refusal is one warning that names its rule, whichever way the
+    /// manifest is read; a manifest that breaks no rule logs nothing.
+    #[test]
+    fn each_refusal_is_one_warning() {
+        let all = format!(
+            "<Game><PersistentLocalStorage><SizeMB>+16</SizeMB></PersistentLocalStorage>\
+             {ID}{ID}<Other a=\">"
+        );
+        let rules = ["unbalanced-quote", "repeated-element", "size-not-decimal"];
+        assert_eq!(logged(|| drop(Title::read_manifest(all.as_bytes()))), rules);
+        assert_eq!(
+            logged(|| drop(Title::from_manifest_bytes(all.as_bytes()))),
+            rules
+        );
+        assert_eq!(logged(|| drop(Title::from_manifest(&all))), rules);
+        assert_eq!(logged(|| drop(Title::read_manifest(b"\xff"))), ["encoding"]);
+        assert_eq!(
+            logged(|| drop(game("<TitleId>-1</TitleId>"))),
+            ["title-id-not-hex"]
+        );
+        assert_eq!(
+            logged(|| drop(Title::from_manifest("<Game><TitleId"))),
+            ["unclosed-tag"]
+        );
+        let none: [&str; 0] = [];
+        assert_eq!(logged(|| drop(game(ID))), none);
+        assert_eq!(logged(|| drop(Title::read_manifest(b""))), none);
+    }
+
     /// A small xorshift generator, so the random cases are the same on
     /// every run and host.
     struct Random(u64);
@@ -509,7 +933,7 @@ mod tests {
         let (mut with_id, mut without) = (0, 0);
         for _ in 0..20_000 {
             let text = random_manifest(&mut random);
-            let found = elements(&text);
+            let (found, _) = elements(&text);
             assert!(found.len() <= text.matches('<').count(), "{text:?}");
             let t = Title::from_manifest(&text);
             assert_eq!(t.storage, PathBuf::new());
@@ -517,6 +941,22 @@ mod tests {
             assert!(t.id == 0 || named("Game/TitleId"), "{text:?}");
             assert!(t.store_id.is_empty() || named("Game/StoreId"), "{text:?}");
             assert_eq!(t.storage_bytes % (1 << 20), 0, "{text:?}");
+            // A title id element that gave no id always has its reason:
+            // no manifest quietly becomes title 00000000.
+            let manifest = Manifest::parse(&text);
+            assert_eq!(manifest.title, t, "{text:?}");
+            let ids = found.iter().filter(|(path, _)| path == "Game/TitleId");
+            let ids: Vec<&str> = ids.map(|(_, value)| value.as_str()).collect();
+            if t.id == 0 && !ids.is_empty() {
+                let zero = ids.len() == 1 && plain_number(ids[0], 16) == Some(0);
+                let reason = |r: &Refusal| {
+                    matches!(
+                        r,
+                        Refusal::Repeated(Field::TitleId) | Refusal::TitleIdNotHex
+                    )
+                };
+                assert!(zero || manifest.refused.iter().any(reason), "{text:?}");
+            }
             // The file's encoding does not change what is read.
             assert_eq!(Title::from_manifest_bytes(text.as_bytes()), t, "{text:?}");
             let utf16 = text.encode_utf16().flat_map(u16::to_le_bytes);
