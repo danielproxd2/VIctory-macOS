@@ -147,6 +147,12 @@ extern "system" fn update_monitor(_: This, _monitor: *const c_void) -> bool {
 /// `XPackageUnregisterInstallationProgressChanged`: false only while a
 /// callback of the registration is executing, and none ever runs. The
 /// completed installation has no pending progress callbacks to wait for.
+///
+/// Never inlined, so that it is one function with one address: a function
+/// this small is otherwise copied into each part of an optimised build
+/// that names it, and the method table and upstream's test, which compares
+/// the table's slot with this function, would each hold a copy of its own.
+#[inline(never)]
 extern "system" fn unregister_progress(
     _: This,
     _monitor: *const c_void,
