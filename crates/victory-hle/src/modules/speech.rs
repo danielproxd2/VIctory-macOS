@@ -95,6 +95,14 @@ extern "system" fn stream_data(
     S_OK
 }
 
+// Closed captions, high contrast and speech to text stay unanswered. The
+// public reference says of each (XClosedCaptionGetProperties,
+// XHighContrastGetMode, XSpeechToTextSendString): "For this function to be
+// successful, closed captions must be enabled", and otherwise it "returns
+// an error code", which it does not name. Nothing here enables captions,
+// so a failure is the documented outcome; ours is `E_NOTIMPL` with every
+// output untouched (the test
+// `caption_contrast_and_speech_to_text_slots_fail_and_write_nothing`).
 static VTABLE: Methods<22> = Methods([
     query_interface as *const (),
     add_ref as *const (),
@@ -147,5 +155,85 @@ mod tests {
         );
         assert_eq!(u32::from_le_bytes(wav[24..28].try_into().unwrap()), 16_000);
         assert_eq!(used, 44);
+    }
+
+    /// Slots with no documented offline answer, called with the public
+    /// API's arguments: the exact failure, and nothing written.
+    #[test]
+    fn caption_contrast_and_speech_to_text_slots_fail_and_write_nothing() {
+        use crate::modules::xasync::E_NOTIMPL;
+        let this: This = &OBJECT;
+        assert_eq!(E_NOTIMPL as u32, 0x8000_4001);
+
+        // XClosedCaptionGetProperties(properties): three colours, two
+        // enumerations, a scale and a flag fit well inside 64 bytes.
+        type Properties = extern "system" fn(This, *mut u8) -> HRESULT;
+        let mut properties = [0xa5_u8; 64];
+        let get = method::<Properties>(&OBJECT, 0x18);
+        assert_eq!(get(this, properties.as_mut_ptr()), E_NOTIMPL);
+        assert_eq!(properties, [0xa5; 64]);
+
+        // The slot between them, taken to be
+        // XClosedCaptionSetEnabled(enabled); whatever it is, it fails.
+        type Enable = extern "system" fn(This, bool) -> HRESULT;
+        assert_eq!(method::<Enable>(&OBJECT, 0x20)(this, true), E_NOTIMPL);
+        // Enabling failed, so the properties still do.
+        assert_eq!(get(this, properties.as_mut_ptr()), E_NOTIMPL);
+        assert_eq!(properties, [0xa5; 64]);
+
+        // XHighContrastGetMode(mode).
+        type Mode = extern "system" fn(This, *mut u32) -> HRESULT;
+        let mut mode = 0xdead_beef_u32;
+        assert_eq!(method::<Mode>(&OBJECT, 0x28)(this, &mut mode), E_NOTIMPL);
+        assert_eq!(mode, 0xdead_beef);
+
+        // XSpeechToTextSendString(speakerName, content, type) and the
+        // rest of speech to text (position hint, hypothesis strings).
+        type Send = extern "system" fn(This, *const c_char, *const c_char, u32) -> HRESULT;
+        let send = method::<Send>(&OBJECT, 0x30);
+        assert_eq!(
+            send(this, c"Speaker".as_ptr(), c"Text".as_ptr(), 0),
+            E_NOTIMPL
+        );
+        type Bare = extern "system" fn(This) -> HRESULT;
+        for at in [0x38, 0x88, 0x90, 0x98, 0xa0] {
+            assert_eq!(method::<Bare>(&OBJECT, at)(this), E_NOTIMPL, "slot {at:#x}");
+        }
+    }
+
+    /// No voice is installed: the enumeration succeeds without calling
+    /// back, and a stream never writes past a buffer that is too small.
+    #[test]
+    fn no_voice_is_enumerated_and_short_buffers_are_refused_untouched() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static CALLS: AtomicU32 = AtomicU32::new(0);
+        extern "system" fn voice(_information: *const c_void, _context: *mut c_void) -> bool {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+        let this: This = &OBJECT;
+        type Voices = extern "system" fn(
+            This,
+            *mut c_void,
+            extern "system" fn(*const c_void, *mut c_void) -> bool,
+        ) -> HRESULT;
+        let enumerate = method::<Voices>(&OBJECT, 0x40);
+        assert_eq!(enumerate(this, std::ptr::null_mut(), voice), S_OK);
+        assert_eq!(CALLS.load(Ordering::SeqCst), 0);
+
+        type Data = extern "system" fn(This, *const u8, usize, *mut u8, *mut usize) -> HRESULT;
+        let data = method::<Data>(&OBJECT, 0x80);
+        let (mut wav, mut used) = ([0xa5_u8; 43], 0x55);
+        assert_eq!(
+            data(
+                this,
+                &raw const STREAM,
+                wav.len(),
+                wav.as_mut_ptr(),
+                &mut used
+            ),
+            crate::modules::xasync::E_NOT_SUFFICIENT_BUFFER
+        );
+        assert_eq!((wav, used), ([0xa5; 43], 0x55));
     }
 }
