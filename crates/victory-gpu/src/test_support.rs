@@ -75,7 +75,11 @@ fn skip_line(what: &str) -> String {
 /// shows what a passing test prints only on request, and a skipped test
 /// passes.
 pub fn skipped(what: &str) {
-    let _ = writeln!(std::io::stderr(), "{}", skip_line(what));
+    skipped_to(&mut std::io::stderr(), what);
+}
+
+fn skipped_to(out: &mut dyn Write, what: &str) {
+    let _ = writeln!(out, "{}", skip_line(what));
 }
 
 /// What a test that needs a device does.
@@ -94,18 +98,39 @@ fn verdict(available: bool, required: bool) -> Verdict {
     }
 }
 
+/// What the verdict does to a test: whether it has a device, after the
+/// [`SKIPPED`] line on `out` where it has none; or, where one is required
+/// and missing, what the test fails with (and no line: it did not skip).
+fn decide(available: bool, required: bool, out: &mut dyn Write) -> Result<bool, String> {
+    match verdict(available, required) {
+        Verdict::Run => Ok(true),
+        Verdict::Skip => {
+            skipped_to(out, NO_DEVICE);
+            Ok(false)
+        }
+        Verdict::Fail => Err(format!("VICTORY_REQUIRE_GPU=1: {NO_DEVICE}")),
+    }
+}
+
+/// `guard` and whether there is a device, as [`decide`] has it.
+///
+/// # Panics
+///
+/// With what [`decide`] fails with; `guard` is still held then, as a
+/// failing device test holds it.
+fn with_device<G>(guard: G, available: bool, required: bool, out: &mut dyn Write) -> (G, bool) {
+    match decide(available, required, out) {
+        Ok(device) => (guard, device),
+        Err(why) => panic!("{why}"),
+    }
+}
+
 /// The lock, and whether there is a device; without one, the [`SKIPPED`]
 /// line or, where a device is required, a panic.
 pub(crate) fn serial_with_device() -> (Serial, bool) {
     let guard = serial();
-    match verdict(crate::host_available(), require_gpu()) {
-        Verdict::Run => (guard, true),
-        Verdict::Skip => {
-            skipped(NO_DEVICE);
-            (guard, false)
-        }
-        Verdict::Fail => panic!("VICTORY_REQUIRE_GPU=1: {NO_DEVICE}"),
-    }
+    let (available, required) = (crate::host_available(), require_gpu());
+    with_device(guard, available, required, &mut std::io::stderr())
 }
 
 /// For a test that needs the host device: [`serial`]'s guard if there is
@@ -158,6 +183,50 @@ mod tests {
         assert_eq!(verdict(true, true), Verdict::Run);
         assert_eq!(verdict(false, false), Verdict::Skip);
         assert_eq!(verdict(false, true), Verdict::Fail);
+    }
+
+    /// What a test gets for each verdict, with the answer to "is there a
+    /// device" given by the test instead of the host: with one it runs and
+    /// nothing is printed; without one it is told so after exactly the
+    /// line runs are searched for; and where a device is required it
+    /// fails with a message that names the switch, without a skip line.
+    #[test]
+    fn a_run_without_a_device_prints_the_line_or_fails() {
+        let mut out = Vec::new();
+        assert_eq!(decide(true, false, &mut out), Ok(true));
+        assert_eq!(decide(true, true, &mut out), Ok(true));
+        assert_eq!(out, b"");
+
+        assert_eq!(decide(false, false, &mut out), Ok(false));
+        assert_eq!(out, b"skipped: no host D3D12 device\n");
+        assert_eq!(out, format!("{SKIPPED}\n").as_bytes());
+
+        let mut out = Vec::new();
+        let failed = decide(false, true, &mut out);
+        assert_eq!(
+            failed,
+            Err("VICTORY_REQUIRE_GPU=1: no host D3D12 device".to_owned())
+        );
+        assert_eq!(out, b"", "a failed test is not a skipped one");
+    }
+
+    /// The same through what the tests call: the guard comes back with
+    /// the answer, and the failure is a panic of the calling test (which
+    /// is what fails it) carrying the message.
+    #[test]
+    fn a_required_device_that_is_missing_fails_the_calling_test() {
+        let mut out = Vec::new();
+        assert_eq!(with_device("guard", true, true, &mut out), ("guard", true));
+        assert_eq!(
+            with_device("guard", false, false, &mut out),
+            ("guard", false)
+        );
+        assert_eq!(out, format!("{SKIPPED}\n").as_bytes());
+
+        let failed = std::panic::catch_unwind(|| with_device((), false, true, &mut Vec::new()));
+        let message = failed.expect_err("a missing required device does not return");
+        let message = message.downcast_ref::<String>().map(String::as_str);
+        assert_eq!(message, Some("VICTORY_REQUIRE_GPU=1: no host D3D12 device"));
     }
 
     /// Every skip is one line that starts the same way, and the one for a
