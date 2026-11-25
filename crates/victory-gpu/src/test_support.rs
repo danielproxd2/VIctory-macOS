@@ -304,6 +304,28 @@ pub fn no_depth(test: &str) {
     );
 }
 
+/// Whether a device test fails where the host gave the result it is known
+/// to give instead of the PC hardware's: `VICTORY_REQUIRE_PC_GPU=1`, the
+/// switch `victory-shader`'s tests have for the same.
+pub fn require_pc_gpu() -> bool {
+    required(std::env::var("VICTORY_REQUIRE_PC_GPU").ok().as_deref())
+}
+
+/// For a test that found the host doing what it is known to do instead of
+/// what the PC hardware does (`difference` says which, as `docs/macos.md`
+/// lists it under "Open differences under D3DMetal"): the line `skipped:
+/// <difference> (<test>)`. The caller has checked both that the host is
+/// the one the difference was measured on and that the result is the
+/// measured one.
+///
+/// # Panics
+///
+/// With `VICTORY_REQUIRE_PC_GPU=1`: that fails the test.
+pub fn host_differs(test: &str, difference: &str) {
+    let required = require_pc_gpu();
+    needs("VICTORY_REQUIRE_PC_GPU", difference, test, required, None);
+}
+
 /// What a test that needs a device does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Verdict {

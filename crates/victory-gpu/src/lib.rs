@@ -21,6 +21,8 @@ mod bindless;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]
+mod casts;
+#[cfg(windows)]
 mod clamp_bytecode;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]

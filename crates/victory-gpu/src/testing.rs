@@ -18,6 +18,16 @@ pub(crate) fn gpu() -> Option<(Serial, &'static crate::host::Host)> {
     crate::host::host().map(|host| (guard, host))
 }
 
+/// Whether `host` is Apple's D3DMetal: the process runs under Wine and the
+/// device's adapter names itself "AMD Compatibility Mode", as
+/// `victory-shader`'s tests recognise it. For the tests that show a
+/// difference measured there ([`crate::test_support::host_differs`]).
+#[cfg(windows)]
+pub(crate) fn d3dmetal(host: &crate::host::Host) -> bool {
+    crate::test_support::under_wine()
+        && crate::host::adapter_name(&host.device) == "AMD Compatibility Mode"
+}
+
 /// For a test whose own assertions hold without a device but which
 /// reaches the device where there is one (it creates a command list): the
 /// lock, and whether there is a device for the test to assert the host

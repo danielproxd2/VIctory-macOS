@@ -1347,7 +1347,9 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
         ..Default::default()
     };
     let mut texture: Option<ID3D12Resource> = None;
-    let mut castable_formats = if d.flags & DEPTH == 0 { castable(d.format) } else { Vec::new() };
+    // Without the formats this host was found to refuse in such a list
+    // (`crate::casts`; D3DMetal has some), all of them otherwise.
+    let mut castable_formats = if d.flags & DEPTH == 0 { crate::casts::taken(d.format, castable(d.format)) } else { Vec::new() };
     let mut initial = crate::states::legal_for(d.flags, crate::states::texture_state(state));
     // In a heap of textures if it fits there (`crate::placement`).
     // SAFETY: the description has the host layout (checked size).
@@ -1385,6 +1387,12 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
                 placement = Some(p);
             }
             Err(e) => {
+                // A host that refuses some of the castable formats: once
+                // more, castable to the others (`crate::casts`).
+                if crate::casts::learn(&host.device, &plain, &castable_formats) {
+                    crate::placement::unplace(p);
+                    return make_texture(d, state, clear);
+                }
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| tracing::warn!(error = %e, desc = ?d, "a texture not placed in a heap: committed"));
                 crate::placement::unplace(p);
@@ -1413,6 +1421,10 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
             )
         };
         if let Err(e) = made {
+            // As for a placed one: again without the formats refused.
+            if crate::casts::learn(&host.device, &plain, &castable_formats) {
+                return make_texture(d, state, clear);
+            }
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
                 tracing::warn!(error = %e, desc = ?d, "the host refuses castable formats: textures of one memory in other formats get their own host texture");
