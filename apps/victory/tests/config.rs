@@ -24,7 +24,8 @@ fn config(game: &Path, cache: &Path, data: &Path) -> Output {
         .expect("victory starts")
 }
 
-/// A folder outside the repository; `config` creates nothing.
+/// A folder outside the repository that does not exist; `config` creates
+/// nothing.
 fn outside(name: &str) -> PathBuf {
     std::env::temp_dir().join("victory-config-test").join(name)
 }
@@ -37,10 +38,30 @@ fn repo_root() -> PathBuf {
 
 #[test]
 fn config_with_paths_outside_the_repo_succeeds() {
-    let out = config(&outside("game"), &outside("cache"), &outside("data"));
+    // The game directory must be there; the others are made on first use.
+    let game = tempfile::tempdir().unwrap();
+    let out = config(game.path(), &outside("cache"), &outside("data"));
     let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!stdout.contains("POLICY VIOLATION"), "{stdout}");
-    assert_eq!(out.status.code(), Some(0), "{stdout}");
+    assert!(!stdout.contains("MISSING"), "{stdout}");
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+}
+
+#[test]
+fn config_with_a_game_dir_that_is_not_there_fails() {
+    let game = outside("no-game-here");
+    assert!(!game.exists(), "{} must not exist", game.display());
+    let out = config(&game, &outside("cache"), &outside("data"));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // The report is still printed in full, then the status says it failed.
+    assert!(stdout.contains("data_dir    :"), "{stdout}");
+    assert!(stdout.contains("(does not exist)"), "{stdout}");
+    assert!(!stdout.contains("POLICY VIOLATION"), "{stdout}");
+    assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
+    assert!(stderr.contains("the configured game_dir"), "{stderr}");
+    assert!(stderr.contains("is not a directory"), "{stderr}");
 }
 
 #[test]

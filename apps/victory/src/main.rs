@@ -109,7 +109,8 @@ enum Command {
         #[arg(last = true)]
         title_args: Vec<String>,
     },
-    /// Show the resolved configuration and check it.
+    /// Show the resolved configuration and check it: fails if a path
+    /// lies inside the repository or the game directory is not there.
     Config,
 }
 
@@ -190,8 +191,9 @@ fn dispatch(cli: Cli, out: &mut dyn Write) -> Result<()> {
     }
 }
 
-/// Prints `cfg` in full, then fails if `outside_repo` refuses one of its
-/// paths (the asset policy).
+/// Prints `cfg` in full, then fails if it cannot be used as it is: a path
+/// `outside_repo` refuses (the asset policy), or a game directory that is
+/// configured and is not there.
 fn show_config(
     cfg: &victory_core::Config,
     outside_repo: &dyn Fn(&std::path::Path) -> Result<(), String>,
@@ -221,6 +223,7 @@ fn show_config(
     for t in &cfg.test_titles {
         writeln!(out, "test_title  : {}", status(t))?;
     }
+    let mut problems = Vec::new();
     let mut violations = 0usize;
     for p in cfg
         .game_dir
@@ -233,11 +236,26 @@ fn show_config(
             violations += 1;
         }
     }
+    if violations > 0 {
+        problems.push(format!(
+            "{violations} configured path(s) violate the asset policy (see docs/asset-policy.md)"
+        ));
+    }
+    // The cache and data directories are created on first use; the game
+    // directory is the user's and nothing here can make it.
+    if let Some(game) = cfg.game_dir.as_ref().filter(|p| !p.is_dir()) {
+        writeln!(
+            out,
+            "MISSING: game_dir {} is not a directory",
+            game.display()
+        )?;
+        problems.push(format!(
+            "the configured game_dir {} is not a directory",
+            game.display()
+        ));
+    }
     // Scripts read the exit status, not the text.
-    anyhow::ensure!(
-        violations == 0,
-        "{violations} configured path(s) violate the asset policy (see docs/asset-policy.md)"
-    );
+    anyhow::ensure!(problems.is_empty(), "{}", problems.join("; "));
     Ok(())
 }
 
@@ -608,6 +626,7 @@ mod tests {
             format!("test_title  : {}  (does not exist)", shown("titles"))
         );
         assert!(!text.contains("POLICY VIOLATION"), "{text}");
+        assert!(!text.contains("MISSING"), "{text}");
 
         // No game directory configured is a configuration too.
         let cfg = Config {
@@ -618,6 +637,54 @@ mod tests {
         let text = report_of(|out| show_config(&cfg, &outside(&repo), out));
         assert_eq!(line(&text, "config file : "), "config file : (none)");
         assert_eq!(line(&text, "game_dir    : "), "game_dir    : (not set)");
+    }
+
+    #[test]
+    fn config_fails_when_the_game_dir_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let absent = tmp.path().join("absent");
+        let cfg = Config {
+            game_dir: Some(absent.clone()),
+            ..configured(tmp.path())
+        };
+        let (text, result) = report(|out| show_config(&cfg, &outside(&repo), out));
+        // The report is printed in full, then the command fails.
+        assert_eq!(
+            line(&text, "game_dir    : "),
+            format!("game_dir    : {}  (does not exist)", absent.display())
+        );
+        line(&text, "data_dir    : ");
+        assert_eq!(
+            line(&text, "MISSING: "),
+            format!("MISSING: game_dir {} is not a directory", absent.display())
+        );
+        assert_eq!(
+            result.expect_err("a missing game_dir").to_string(),
+            format!(
+                "the configured game_dir {} is not a directory",
+                absent.display()
+            )
+        );
+
+        // A file where the folder should be is no game directory either.
+        let file = crate::testing::write(tmp.path(), "a-file", b"not a folder");
+        let cfg = Config {
+            game_dir: Some(file.clone()),
+            ..cfg
+        };
+        let (text, result) = report(|out| show_config(&cfg, &outside(&repo), out));
+        assert_eq!(
+            line(&text, "game_dir    : "),
+            format!("game_dir    : {}", file.display())
+        );
+        assert_eq!(
+            result.expect_err("a file as game_dir").to_string(),
+            format!(
+                "the configured game_dir {} is not a directory",
+                file.display()
+            )
+        );
     }
 
     #[test]
@@ -635,6 +702,22 @@ mod tests {
         assert_eq!(
             result.expect_err("two paths inside").to_string(),
             "2 configured path(s) violate the asset policy (see docs/asset-policy.md)"
+        );
+
+        // Both kinds of fault are named when both are there.
+        let cfg = Config {
+            game_dir: Some(repo.join("game")),
+            ..cfg
+        };
+        let (text, result) = report(|out| show_config(&cfg, &outside(&repo), out));
+        assert_eq!(text.matches("POLICY VIOLATION: ").count(), 3, "{text}");
+        assert_eq!(
+            result.expect_err("three paths inside").to_string(),
+            format!(
+                "3 configured path(s) violate the asset policy (see docs/asset-policy.md); \
+                 the configured game_dir {} is not a directory",
+                repo.join("game").display()
+            )
         );
     }
 }
