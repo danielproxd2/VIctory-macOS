@@ -259,7 +259,12 @@ mod tests {
     fn example_config_parses() {
         let text = include_str!("../../../victory.example.toml");
         let parsed: FileConfig = toml::from_str(text).unwrap();
-        assert!(parsed.paths.game_dir.is_some());
+        // It is copied to victory.toml as it stands (setup.sh): no game is
+        // configured in it, since a game_dir that is set and is not there
+        // fails `victory config`, and the example's could be there on no
+        // machine. The line is in it, commented out.
+        assert_eq!(parsed.paths.game_dir, None);
+        assert!(text.contains("\n# game_dir = '"), "{text}");
 
         // The macOS section is commented out; its `key = value` lines must
         // be a valid [paths] table that names all three folders on Z:.

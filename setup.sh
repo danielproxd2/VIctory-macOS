@@ -80,10 +80,15 @@ fi
 # 7. VIctory itself.
 say "building VIctory"
 cargo build --quiet --release -p victory --target x86_64-pc-windows-gnullvm
+# The example names no game (a game_dir that is set and is not there fails
+# `victory config`), so the copy is a configuration that can be used.
 [[ -f victory.toml ]] || cp victory.example.toml victory.toml
-tools/macos/victory.sh config > /dev/null 2>&1 || die "VIctory did not start under Wine. Run tools/macos/victory.sh config to see why"
+# What proves the setup is that VIctory starts under Wine, which needs no
+# game. The configuration is shown; a fault in it is the user's to correct
+# and is not a failed setup (tools/macos/check-setup.sh).
+tools/macos/check-setup.sh || die "the setup is built, and VIctory did not start under Wine (see above). Run tools/macos/check-setup.sh to try again"
 
 print
 print -P "%F{green}Setup finished.%f"
-print "Put your own copy of the game in a folder, set game_dir in victory.toml, and start it with:"
+print "Put your own copy of the game in a folder outside this repository and start it with:"
 print "  tools/macos/victory.sh run --execute <the game's executable>"

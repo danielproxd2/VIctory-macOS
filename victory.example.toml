@@ -5,7 +5,11 @@
 
 [paths]
 # Your own dump of Grand Theft Auto VI.     env: VICTORY_GAME_DIR
-game_dir = 'D:\victory-data\game'
+# Not set here: a path that is set and is not there fails `victory config`,
+# and no path fits every machine. `run` and `inspect` take the executable on
+# the command line and work without it. Remove the `#` and name your folder
+# (on a Mac in the Z:\ form, see the macOS section below):
+# game_dir = 'D:\victory-data\game'
 
 # Derived data. Default: %LOCALAPPDATA%\victory\cache.   env: VICTORY_CACHE_DIR
 # cache_dir = 'D:\victory-data\cache'
@@ -37,7 +41,8 @@ test_titles = []
 # without victory.sh, the default is the one inside the prefix.
 # Instead of this file the launcher's environment can name the folders:
 # VICTORY_GAME_DIR, VICTORY_CACHE_DIR and VICTORY_DATA_DIR, in the same
-# Z:\ form. Replace the [paths] values above with these:
+# Z:\ form. Put these in place of the [paths] values above (for a game in
+# /Users/<you>/victory-data/game):
 # game_dir = 'Z:\Users\<you>\victory-data\game'
 # cache_dir = 'Z:\Users\<you>\victory-data\cache'
 # data_dir = 'Z:\Users\<you>\victory-data\data'

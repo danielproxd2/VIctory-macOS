@@ -548,6 +548,141 @@ exit {code}"#
     }
 }
 
+/// Runs check-setup.sh, the last step of setup.sh, with a stand-in cargo
+/// and the stand-in wine `wine` (a shell script's body; it stands for Wine
+/// running victory.exe with the arguments after the program's path).
+fn check_setup(name: &str, wine: &str) -> Output {
+    let dir = scratch(name);
+    fs::create_dir_all(dir.join("wine/lib/external/D3DMetal.framework")).unwrap();
+    script(&dir.join("bin/cargo"), "exit 0");
+    script(&dir.join("wine/bin/wine"), &format!("shift\n{wine}"));
+    // A config file of the test's own: without one named, the launcher
+    // would read the victory.toml of whoever runs the tests.
+    let config = dir.join("victory.toml");
+    fs::write(&config, "").unwrap();
+    Command::new(root().join("tools/macos/check-setup.sh"))
+        .env("CARGO", dir.join("bin/cargo"))
+        .env("WINE", dir.join("wine/bin/wine"))
+        .env("HOME", dir.join("home"))
+        .env("VICTORY_CONFIG", &config)
+        .env_remove("VICTORY_DATA_DIR")
+        .env_remove("WINEPREFIX")
+        .output()
+        .unwrap()
+}
+
+/// What victory.exe says for `--version`, and for `config` with no game
+/// configured: the state victory.example.toml ships in.
+const STARTS: &str = r#"case "$1" in
+    --version) echo "victory 0.1.0"; exit 0 ;;
+esac"#;
+
+/// A fresh setup has no game configured. The setup's last step proves that
+/// VIctory starts under Wine by its version, which needs no game, and
+/// shows the configuration.
+#[test]
+fn check_setup_passes_on_a_fresh_setup_with_no_game_configured() {
+    let out = check_setup(
+        "check-setup-fresh",
+        &format!(
+            r#"{STARTS}
+echo "game_dir    : (not set)"
+echo "NOTE: game_dir is not set: no game is configured yet."
+exit 0"#
+        ),
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let said = text(&out.stdout);
+    assert!(
+        said.contains("VIctory starts under Wine: victory 0.1.0"),
+        "{said}"
+    );
+    assert!(said.contains("NOTE: game_dir is not set"), "{said}");
+    assert_eq!(text(&out.stderr), "");
+}
+
+/// A configuration VIctory refuses is the user's file to correct, not a
+/// setup that failed: `config` exits 1 for a game_dir that is set and is
+/// not there, and the setup's last step still passes, showing the report
+/// and saying what to change. (Before, the setup required `config` to
+/// succeed and died with "VIctory did not start under Wine".)
+#[test]
+fn check_setup_reports_a_refused_configuration_and_still_passes() {
+    let out = check_setup(
+        "check-setup-refused-config",
+        &format!(
+            r#"{STARTS}
+echo "game_dir    : D:\\victory-data\\game  (does not exist)"
+echo "MISSING: game_dir D:\\victory-data\\game is not a directory"
+echo "Error: the configured game_dir D:\\victory-data\\game is not a directory" >&2
+exit 1"#
+        ),
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let said = text(&out.stdout);
+    assert!(said.contains("VIctory starts under Wine"), "{said}");
+    assert!(said.contains("MISSING: game_dir"), "{said}");
+    assert!(said.contains("Error: the configured game_dir"), "{said}");
+    let advice = text(&out.stderr);
+    assert!(!advice.contains("did not start"), "{advice}");
+    assert!(
+        advice.contains("its configuration cannot be used as it is"),
+        "{advice}"
+    );
+    assert!(advice.contains("remove the game_dir line"), "{advice}");
+}
+
+/// Where VIctory does not start, the step fails and shows what was said.
+#[test]
+fn check_setup_fails_when_victory_does_not_start() {
+    for (name, wine, shown) in [
+        (
+            "check-setup-no-start",
+            r#"echo "wine: could not load kernel32.dll" >&2
+exit 1"#,
+            "wine: could not load kernel32.dll",
+        ),
+        // Status 0 without the version is no start either.
+        ("check-setup-no-version", "echo nothing", "nothing"),
+    ] {
+        let out = check_setup(name, wine);
+        assert_eq!(out.status.code(), Some(1), "{name}: {}", text(&out.stdout));
+        assert_eq!(text(&out.stdout), "", "{name}");
+        let said = text(&out.stderr);
+        assert!(
+            said.contains("VIctory did not start under Wine"),
+            "{name}: {said}"
+        );
+        assert!(said.contains(shown), "{name}: {said}");
+    }
+}
+
+/// setup.sh ends on that step, and no longer on `config` succeeding; the
+/// file it copies for a new setup configures no game.
+#[test]
+fn setup_ends_on_the_check_that_needs_no_game() {
+    let setup = fs::read_to_string(root().join("setup.sh")).unwrap();
+    let last_step = setup
+        .split_once("# 7. VIctory itself.")
+        .expect("setup.sh has its seventh step")
+        .1;
+    assert!(
+        last_step.contains("\ntools/macos/check-setup.sh || die "),
+        "{last_step}"
+    );
+    assert!(!last_step.contains("victory.sh config"), "{last_step}");
+    assert!(
+        last_step.contains("cp victory.example.toml victory.toml"),
+        "{last_step}"
+    );
+    let example = fs::read_to_string(root().join("victory.example.toml")).unwrap();
+    let set: Vec<&str> = example
+        .lines()
+        .filter(|l| l.trim_start().starts_with("game_dir"))
+        .collect();
+    assert_eq!(set, [""; 0], "the example sets no game_dir");
+}
+
 /// The variable the launcher sets is the one the configuration reads.
 #[test]
 fn victory_sh_sets_the_variable_the_config_reads() {

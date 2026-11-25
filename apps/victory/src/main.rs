@@ -126,7 +126,8 @@ enum Command {
         title_args: Vec<String>,
     },
     /// Show the resolved configuration and check it: fails if a path
-    /// lies inside the repository or the game directory is not there.
+    /// lies inside the repository or the configured game directory is not
+    /// there. No game directory configured is said, and is no failure.
     Config,
 }
 
@@ -245,9 +246,15 @@ fn dispatch(cli: Cli, out: &mut dyn Write) -> Result<u32> {
     Ok(0)
 }
 
+/// What `config` says when no game directory is configured.
+const GAME_DIR_NOT_SET: &str = "NOTE: game_dir is not set: no game is configured yet. `run` and \
+     `inspect` take the executable on the command line and do not need it; to configure one, set \
+     VICTORY_GAME_DIR or [paths].game_dir in victory.toml (see victory.example.toml)";
+
 /// Prints `cfg` in full, then fails if it cannot be used as it is: a path
 /// `outside_repo` refuses (the asset policy), or a game directory that is
-/// configured and is not there.
+/// configured and is not there. No game directory configured at all is
+/// said, and is no failure.
 fn show_config(
     cfg: &victory_core::Config,
     outside_repo: &dyn Fn(&std::path::Path) -> Result<(), String>,
@@ -301,6 +308,12 @@ fn show_config(
         problems.push(format!(
             "{violations} configured path(s) violate the asset policy (see docs/asset-policy.md)"
         ));
+    }
+    // No game configured yet is a state of its own, and no fault: a fresh
+    // setup is in it, and `run`, `inspect` and every command that is given
+    // its paths work without one. It is said in words a script can find.
+    if cfg.game_dir.is_none() {
+        writeln!(out, "{GAME_DIR_NOT_SET}")?;
     }
     // The cache and data directories are created on first use; the game
     // directory is the user's and nothing here can make it.
@@ -720,6 +733,7 @@ mod tests {
         );
         assert!(!text.contains("POLICY VIOLATION"), "{text}");
         assert!(!text.contains("MISSING"), "{text}");
+        assert!(!text.contains("game_dir is not set"), "{text}");
 
         // No game directory configured is a configuration too.
         let cfg = Config {
@@ -731,6 +745,12 @@ mod tests {
         assert_eq!(line(&text, "config file : "), "config file : (none)");
         assert_eq!(line(&text, "game_dir    : "), "game_dir    : (not set)");
         assert_eq!(line(&text, "fidelityfx  : "), "fidelityfx  : (not set)");
+        // Said in so many words, and no fault: `report_of` took an `Ok`.
+        assert!(
+            line(&text, "NOTE: ").starts_with("NOTE: game_dir is not set"),
+            "{text}"
+        );
+        assert!(!text.contains("MISSING"), "{text}");
 
         // The host's FidelityFX folder is shown like the game directory.
         let cfg = Config {
