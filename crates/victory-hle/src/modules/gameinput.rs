@@ -1857,11 +1857,14 @@ mod tests {
             !unregister(&hub.object, token, 5000),
             "times out while it runs"
         );
+        // The start is taken before the thread exists: the callback cannot
+        // leave earlier than 50 ms after it, however long this thread
+        // waits for the processor between the two lines.
+        let start = Instant::now();
         let leave = std::thread::spawn(|| {
             std::thread::sleep(Duration::from_millis(50));
             LEAVE.store(true, Ordering::SeqCst);
         });
-        let start = Instant::now();
         assert!(unregister(&hub.object, token, u64::MAX), "waits for it");
         assert!(start.elapsed() >= Duration::from_millis(40));
         assert_eq!(FROM_INSIDE.load(Ordering::SeqCst), 1);

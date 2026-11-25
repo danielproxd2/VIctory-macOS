@@ -462,6 +462,9 @@ pub extern "system" fn WSAJoinLeaf(
 }
 
 /// `ConnectEx` as `WSAIoctl` hands it out: vetted, then the socket's own.
+// One copy in an optimised build too: `WSAIoctl` hands out its address,
+// and upstream's test compares what it hands out with this function.
+#[inline(never)]
 extern "system" fn connect_ex(
     s: Socket,
     name: *const u8,
@@ -600,6 +603,9 @@ struct MessageName {
     len: i32,
 }
 
+// One copy in an optimised build too: `WSAIoctl` hands out its address,
+// and upstream's test compares what it hands out with this function.
+#[inline(never)]
 pub extern "system" fn WSASendMsg(
     s: Socket,
     message: *const c_void,
