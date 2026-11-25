@@ -1606,16 +1606,36 @@ mod tests {
             plain.len(),
         );
         let number = page[0];
+        let started = std::time::Instant::now();
         let filler = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(2));
             // SAFETY: the leaked list, alive for the whole test.
             unsafe { std::ptr::write_volatile(at as *mut usize, number) };
+            started.elapsed()
         });
         enqueue(queue, &r);
         enqueue_status(queue, array, 0);
         void(queue, 0x30);
-        assert_eq!(wait(array, 0), S_OK);
-        filler.join().unwrap();
+        let status = wait(array, 0);
+        let filled = filler.join().unwrap();
+        // The list is read again for `LATE_LIST_TRIES` ms after the request
+        // (enqueued after `started`) first found it empty, so a list filled
+        // within that time of `started` was in time, whatever the host did.
+        // On a busy host the thread above may get to run only later (seen
+        // under Wine with other test runs on the machine): then the request
+        // fails as it should, and there is nothing to check here.
+        let window = std::time::Duration::from_millis(LATE_LIST_TRIES.into());
+        if status != S_OK && filled > window {
+            return crate::testing::skip_unless_required(
+                "VICTORY_REQUIRE_IDLE",
+                &format!(
+                    "the host ran the thread that fills the page list only after {} ms: \
+                     past the {LATE_LIST_TRIES} ms the list is read again for",
+                    filled.as_millis()
+                ),
+            );
+        }
+        assert_eq!(status, S_OK);
         // SAFETY: the page is mapped read-write.
         let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), plain.len()) };
         assert_eq!(seen, plain);
