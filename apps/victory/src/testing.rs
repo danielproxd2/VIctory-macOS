@@ -4,6 +4,7 @@
 use std::path::Path;
 
 use anyhow::Result;
+use victory_shader::HwStage;
 use victory_shader::testkit;
 
 /// What `command` wrote to its report, and how it ended.
@@ -35,6 +36,14 @@ pub(crate) fn line<'a>(text: &'a str, start: &str) -> &'a str {
     }
 }
 
+/// Says that the running test did not check something and why, as the
+/// line `skipped: <reason> (<test>)` past the test harness's capture.
+#[cfg(windows)]
+pub(crate) fn skip(reason: &str) {
+    let thread = std::thread::current();
+    victory_gpu::test_support::skipped(&format!("{reason} ({})", thread.name().unwrap_or("?")));
+}
+
 /// A console container with the vertex program that covers the screen.
 pub(crate) fn vertex_container() -> Vec<u8> {
     testkit::vs_fullscreen_triangle()
@@ -43,6 +52,13 @@ pub(crate) fn vertex_container() -> Vec<u8> {
 /// A console container with a pixel program that writes one colour.
 pub(crate) fn pixel_container() -> Vec<u8> {
     testkit::ps_constant([1.0, 0.5, 0.25, 1.0])
+}
+
+/// A console container with a hull program (`s_endpgm` alone), a stage the
+/// translator does not take.
+pub(crate) fn hull_container() -> Vec<u8> {
+    let end = victory_shader::gfx10::asm::S_ENDPGM;
+    testkit::console_container(HwStage::Hs, &[end], &[], &[])
 }
 
 /// One SGD5 record holding `payload`, as `victory_game::sgd5` reads it

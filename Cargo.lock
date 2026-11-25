@@ -655,6 +655,7 @@ dependencies = [
  "tempfile",
  "victory-core",
  "victory-game",
+ "victory-gpu",
  "victory-hle",
  "victory-loader",
  "victory-pe",

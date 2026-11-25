@@ -1,6 +1,12 @@
 //! The offline batch: every shader found goes through the translator, and
 //! what it cannot handle yet is tallied (decision 0003).
 
+//!
+//! Everything up to the emitted DXIL runs on any host. The two checks
+//! after it need Windows: `--validate` loads `dxil.dll` and `--pipelines`
+//! (and `VICTORY_PAIRS`) creates D3D12 pipelines. On another host they are
+//! refused before anything is read.
+
 use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -8,8 +14,11 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
+use victory_shader::emit;
+#[cfg(windows)]
 use victory_shader::emit::host::{self, Host};
-use victory_shader::emit::{self, validator::Validator};
+#[cfg(windows)]
+use victory_shader::emit::validator::Validator;
 use victory_shader::structure::{self, Atom, LaneExit};
 use victory_shader::{
     Container, FourCC, HwStage, NativeProgram, RootType, ShaderError, ir, native_programs,
@@ -149,20 +158,70 @@ struct Checks {
     /// Shaders named in `VICTORY_PAIRS` (`vs+ps,...`, label substrings),
     /// kept to build those pipelines after the walk.
     keep: Option<Kept>,
+    #[cfg(windows)]
     validator: Option<Validator>,
+    #[cfg(windows)]
     host: Option<(Host, emit::HostShader)>,
 }
 
-pub fn run(
-    paths: Vec<PathBuf>,
-    validate: bool,
-    pipelines: bool,
-    list: bool,
-    jobs: Option<usize>,
-    out: &mut dyn Write,
-) -> Result<()> {
+/// What `translate` was asked to do besides translating.
+#[derive(Default)]
+pub struct Options {
+    /// Check emitted DXIL with `dxil.dll`'s validator.
+    pub validate: bool,
+    /// Create a host D3D12 pipeline for each emitted shader.
+    pub pipelines: bool,
+    /// One line per program and outcome.
+    pub list: bool,
+    /// Worker threads; `None` for every logical core.
+    pub jobs: Option<usize>,
+    /// `VICTORY_PAIRS`: (vertex or mesh, pixel) label substrings whose
+    /// pipelines are created after the walk.
+    pub pairs: Vec<(String, String)>,
+}
+
+impl Options {
+    /// The pairs `VICTORY_PAIRS` names (`vs+ps,...`).
+    pub fn pairs_of(value: &str) -> Vec<(String, String)> {
+        value
+            .split(',')
+            .filter_map(|p| p.split_once('+'))
+            .map(|(v, p)| (v.trim().to_owned(), p.trim().to_owned()))
+            .collect()
+    }
+
+    /// Refuses what this host cannot do, before anything is read: the
+    /// validator is a Windows DLL and pipelines need a D3D12 device.
+    fn check_host(&self) -> Result<()> {
+        #[cfg(not(windows))]
+        for (asked, what, why) in [
+            (self.validate, "--validate", "dxil.dll is a Windows library"),
+            (self.pipelines, "--pipelines", "it creates D3D12 pipelines"),
+            (
+                !self.pairs.is_empty(),
+                "VICTORY_PAIRS",
+                "it creates D3D12 pipelines",
+            ),
+        ] {
+            anyhow::ensure!(!asked, "{what} needs a Windows host ({why})");
+        }
+        Ok(())
+    }
+}
+
+pub fn run(paths: Vec<PathBuf>, options: &Options, out: &mut dyn Write) -> Result<()> {
+    options.check_host()?;
     let paths = crate::default_paths(paths)?;
+    let &Options {
+        validate,
+        pipelines,
+        list,
+        jobs,
+        ref pairs,
+    } = options;
+    #[cfg(windows)]
     let dll = validate.then(Validator::default_path).flatten();
+    #[cfg(windows)]
     if validate {
         Validator::load(dll.as_deref()).map_err(anyhow::Error::msg)?;
         writeln!(
@@ -172,15 +231,13 @@ pub fn run(
                 .map_or("dxil.dll".into(), |p| p.display().to_string())
         )?;
     }
+    #[cfg(windows)]
     if pipelines {
         Host::new(false).map_err(anyhow::Error::msg)?;
     }
-    let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
-        .unwrap_or_default()
-        .split(',')
-        .filter_map(|p| p.split_once('+'))
-        .map(|(v, p)| (v.trim().to_owned(), p.trim().to_owned()))
-        .collect();
+    // Refused above.
+    #[cfg(not(windows))]
+    let _ = (validate, pipelines);
     let kept = std::sync::Arc::new(Mutex::new(Vec::new()));
     let threads =
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
@@ -197,6 +254,7 @@ pub fn run(
             let Ok(data) = std::fs::read(entry.path()) else {
                 continue;
             };
+            let path = entry.path();
             let jobs = sources(&data);
             let next = AtomicUsize::new(0);
             std::thread::scope(|s| {
@@ -208,15 +266,17 @@ pub fn run(
                         };
                         let mut checks = Checks {
                             keep: (!pairs.is_empty()).then(|| kept.clone()),
+                            #[cfg(windows)]
                             validator: validate
                                 .then(|| Validator::load(dll.as_deref()).ok())
                                 .flatten(),
+                            #[cfg(windows)]
                             host: pipelines
                                 .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
                                 .flatten(),
                         };
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            translate(job, entry.path(), &seen, &mut t, &mut checks);
+                            translate(job, path, &seen, &mut t, &mut checks);
                         }
                         lock(&total).merge(t);
                     });
@@ -282,11 +342,12 @@ pub fn run(
         "             {} emitted of {} mesh programs; {} validated, {} pipelines",
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
     )?;
+    #[cfg(windows)]
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
         let find = |name: &str| kept.iter().find(|(l, _)| l.contains(name));
-        for (v, p) in &pairs {
+        for (v, p) in pairs {
             let made = match (find(v), find(p)) {
                 (Some((_, vs)), Some((_, ps))) => if vs.stage == HwStage::Ms {
                     host.mesh_pipeline(vs, ps)
@@ -430,12 +491,7 @@ fn translate(
 }
 
 /// Validates an emitted shader if asked to.
-fn check(
-    mut shader: emit::HostShader,
-    t: &mut Tally,
-    checks: &mut Checks,
-    label: impl Fn() -> String,
-) {
+fn check(shader: emit::HostShader, t: &mut Tally, checks: &mut Checks, label: impl Fn() -> String) {
     if let Some(keep) = &checks.keep {
         lock(keep).push((label(), shader.clone()));
     }
@@ -452,6 +508,7 @@ fn check(
             &shader.dxil,
         );
     }
+    #[cfg(windows)]
     if let Some((h, stub_ps)) = &checks.host {
         let made = match shader.stage {
             HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),
@@ -469,6 +526,18 @@ fn check(
             Err(e) => t.fail(format!("pipeline: {e}"), &label),
         }
     }
+    #[cfg(windows)]
+    validate(shader, t, checks, label);
+}
+
+/// Has the validator check an emitted shader, if one was asked for.
+#[cfg(windows)]
+fn validate(
+    mut shader: emit::HostShader,
+    t: &mut Tally,
+    checks: &mut Checks,
+    label: impl Fn() -> String,
+) {
     let Some(v) = checks.validator.as_mut() else {
         return;
     };
@@ -683,4 +752,189 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::{
+        hull_container, line, pixel_container, report, report_of, sgd5_file, sgd5_record,
+        vertex_container, write,
+    };
+
+    /// One thread: the tests share the machine.
+    fn options() -> Options {
+        Options {
+            jobs: Some(1),
+            ..Options::default()
+        }
+    }
+
+    /// A folder with a vertex container as it is, a pixel container in a
+    /// packed SGD5 record, the same vertex container again and a hull
+    /// container.
+    fn shaders() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a-vs.bin", &vertex_container());
+        let record = sgd5_record("PS_Synthetic_0011aabb_Wrapped", 0x32, &pixel_container());
+        write(dir.path(), "b-ps.sgd5", &sgd5_file(&[record]));
+        write(dir.path(), "c-vs-again.bin", &vertex_container());
+        write(dir.path(), "d-hs.bin", &hull_container());
+        dir
+    }
+
+    #[test]
+    fn translate_tallies_a_synthetic_container() {
+        let dir = shaders();
+        let text = report_of(|out| run(vec![dir.path().into()], &options(), out));
+        assert_eq!(
+            line(&text, "containers "),
+            "containers   4 (1 duplicates skipped)"
+        );
+        assert!(
+            line(&text, "programs ").starts_with("programs     3 translated of 3 ("),
+            "{text}"
+        );
+        assert!(
+            line(&text, "I/O ").starts_with("I/O          2 of 2 vertex and pixel programs raised"),
+            "{text}"
+        );
+        // Emitted on every host; nothing was asked to check the result.
+        assert_eq!(
+            line(&text, "DXIL "),
+            "DXIL         2 emitted of 2 vertex and pixel programs; 0 validated, 0 pipelines"
+        );
+        assert!(!text.contains("validator "), "{text}");
+    }
+
+    #[test]
+    fn victory_pairs_is_a_list_of_vertex_and_pixel_names() {
+        assert_eq!(Options::pairs_of(""), []);
+        assert_eq!(
+            Options::pairs_of("VS_A+PS_A, VS_B + PS_B,not-a-pair"),
+            [
+                ("VS_A".to_owned(), "PS_A".to_owned()),
+                ("VS_B".to_owned(), "PS_B".to_owned())
+            ]
+        );
+    }
+
+    /// Off Windows the two checks and the pairs are refused before any
+    /// file is read: the report stays empty.
+    #[cfg(not(windows))]
+    #[test]
+    fn validate_and_pipelines_need_a_windows_host() {
+        let dir = shaders();
+        let asked = [
+            (
+                "--validate",
+                Options {
+                    validate: true,
+                    ..options()
+                },
+            ),
+            (
+                "--pipelines",
+                Options {
+                    pipelines: true,
+                    ..options()
+                },
+            ),
+            (
+                "VICTORY_PAIRS",
+                Options {
+                    pairs: Options::pairs_of("a-vs+b-ps"),
+                    ..options()
+                },
+            ),
+        ];
+        for (what, options) in asked {
+            let (text, result) = report(|out| run(vec![dir.path().into()], &options, out));
+            let error = result.expect_err(what).to_string();
+            assert!(
+                error.starts_with(&format!("{what} needs a Windows host (")),
+                "{error}"
+            );
+            assert_eq!(text, "", "{what}");
+        }
+        // Without them the same folder is translated.
+        let (_, result) = report(|out| run(vec![dir.path().into()], &options(), out));
+        result.unwrap();
+    }
+
+    /// `--pipelines` against the host's device (D3DMetal under Wine): each
+    /// emitted shader becomes a pipeline, the vertex program beside a stub
+    /// pixel shader and the pixel program beside a stub vertex shader.
+    #[cfg(windows)]
+    #[test]
+    fn translate_creates_a_pipeline_for_a_synthetic_container() {
+        let _one_device_test = victory_gpu::test_support::serial();
+        if let Err(e) = Host::new(false) {
+            assert!(
+                !victory_gpu::test_support::require_gpu(),
+                "VICTORY_REQUIRE_GPU=1: no host D3D12 device: {e}"
+            );
+            return crate::testing::skip("no host D3D12 device");
+        }
+        let dir = shaders();
+        let with_pipelines = Options {
+            pipelines: true,
+            list: true,
+            ..options()
+        };
+        let text = report_of(|out| run(vec![dir.path().into()], &with_pipelines, out));
+        assert_eq!(
+            line(&text, "DXIL "),
+            "DXIL         2 emitted of 2 vertex and pixel programs; 0 validated, 2 pipelines"
+        );
+        let vs = dir.path().join("a-vs.bin");
+        assert_eq!(
+            line(&text, &vs.display().to_string()),
+            format!("{}@0x0 Vs  pipeline created", vs.display())
+        );
+        let ps = dir.path().join("b-ps.sgd5");
+        let made = line(&text, &ps.display().to_string());
+        assert!(made.ends_with(" Ps  pipeline created"), "{text}");
+        assert!(!text.contains("pipeline: "), "{text}");
+    }
+
+    /// `--validate` with Microsoft's validator, where one can be loaded
+    /// (`VICTORY_DXIL`, else the newest Windows SDK's).
+    #[cfg(windows)]
+    #[test]
+    fn translate_validates_a_synthetic_container() {
+        let dll = Validator::default_path();
+        if let Err(e) = Validator::load(dll.as_deref()) {
+            let required = std::env::var("VICTORY_REQUIRE_DXIL").is_ok_and(|v| v.trim() == "1");
+            assert!(!required, "VICTORY_REQUIRE_DXIL=1: DXIL validation: {e}");
+            // Asked for and not there, the command fails and says why.
+            let validating = Options {
+                validate: true,
+                ..options()
+            };
+            let dir = shaders();
+            let (text, result) = report(|out| run(vec![dir.path().into()], &validating, out));
+            assert_eq!(result.expect_err("no validator").to_string(), e);
+            assert_eq!(text, "");
+            return crate::testing::skip(&format!("DXIL validation: {e}"));
+        }
+        let dir = shaders();
+        let validating = Options {
+            validate: true,
+            list: true,
+            ..options()
+        };
+        let text = report_of(|out| run(vec![dir.path().into()], &validating, out));
+        assert!(text.starts_with("validator    "), "{text}");
+        assert_eq!(
+            line(&text, "DXIL "),
+            "DXIL         2 emitted of 2 vertex and pixel programs; 2 validated, 0 pipelines"
+        );
+        let vs = dir.path().join("a-vs.bin");
+        assert_eq!(
+            line(&text, &vs.display().to_string()),
+            format!("{}@0x0 Vs  validated", vs.display())
+        );
+        assert!(!text.contains("validator: "), "{text}");
+    }
 }

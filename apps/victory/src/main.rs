@@ -9,7 +9,6 @@ mod run;
 mod shader;
 #[cfg(test)]
 mod testing;
-#[cfg(windows)]
 mod translate;
 
 use std::io::Write;
@@ -163,17 +162,16 @@ fn dispatch(cli: Cli, out: &mut dyn Write) -> Result<()> {
             list,
             jobs,
         } => {
-            #[cfg(windows)]
-            {
-                translate::run(paths, validate, pipelines, list, jobs, out)
-            }
-            // Translation checks shaders with the Windows DXC host, which
-            // other hosts do not have yet.
-            #[cfg(not(windows))]
-            {
-                let _ = (paths, validate, pipelines, list, jobs);
-                anyhow::bail!("translate needs a Windows host for now")
-            }
+            let options = translate::Options {
+                validate,
+                pipelines,
+                list,
+                jobs,
+                pairs: translate::Options::pairs_of(
+                    &std::env::var("VICTORY_PAIRS").unwrap_or_default(),
+                ),
+            };
+            translate::run(paths, &options, out)
         }
         Command::Run {
             exe,
@@ -719,5 +717,42 @@ mod tests {
                 repo.join("game").display()
             )
         );
+    }
+
+    /// `translate` is a command on every host.
+    #[test]
+    fn translate_runs_on_this_host() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::testing::write(dir.path(), "vs.bin", &crate::testing::vertex_container());
+        let folder = dir.path().to_str().unwrap();
+        let cli = Cli::try_parse_from(["victory", "translate", "--jobs", "1", folder]).unwrap();
+        let text = report_of(|out| dispatch(cli, out));
+        assert!(
+            line(&text, "programs ").starts_with("programs     1 translated of 1 ("),
+            "{text}"
+        );
+        assert!(
+            line(&text, "DXIL ").starts_with("DXIL         1 emitted of 1 vertex and pixel"),
+            "{text}"
+        );
+    }
+
+    /// What needs Windows says so on another host, and nothing else does.
+    #[cfg(not(windows))]
+    #[test]
+    fn translate_refuses_only_its_windows_checks_off_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::testing::write(dir.path(), "vs.bin", &crate::testing::vertex_container());
+        let folder = dir.path().to_str().unwrap();
+        for flag in ["--validate", "--pipelines"] {
+            let cli = Cli::try_parse_from(["victory", "translate", flag, folder]).unwrap();
+            let (text, result) = report(|out| dispatch(cli, out));
+            let error = result.expect_err(flag).to_string();
+            assert!(
+                error.starts_with(&format!("{flag} needs a Windows host")),
+                "{error}"
+            );
+            assert_eq!(text, "");
+        }
     }
 }

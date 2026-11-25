@@ -25,6 +25,8 @@ walkdir.workspace = true
 # (`testkit`) and PE images (`testing`).
 victory-shader = { workspace = true, features = ["host", "test-support"] }
 victory-pe = { workspace = true, features = ["test-support"] }
+# `test_support`: the skip line and the one-device-test-at-a-time lock.
+victory-gpu.workspace = true
 miniz_oxide.workspace = true
 tempfile.workspace = true
 
