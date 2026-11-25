@@ -1,13 +1,15 @@
-#define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1)"
+#define RS "RootConstants(num32BitConstants=4, b0), SRV(t0), UAV(u1), UAV(u0)"
 cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint unused; };
-RWByteAddressBuffer args : register(u0);
+// The title's records, read only; the clamped ones go to the list's own.
+ByteAddressBuffer args : register(t0);
+RWByteAddressBuffer dest : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
 RWByteAddressBuffer budget : register(u1);
 static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
-// Clamps the record at `at` in place; its cost.
+// Clamps the record at `at` into `dest`; its cost.
 uint clamped(uint at) {
     uint cost;
     if (kind <= 1) {
@@ -15,7 +17,14 @@ uint clamped(uint at) {
         uint count = min(args.Load(at), 1u << 24);
         uint instances = min(args.Load(at + 4), (1u << 26) / max(count, 1u));
         cost = count * instances;
-        args.Store2(at, uint2(count, instances));
+        dest.Store2(at, uint2(count, instances));
+        // The rest of the record as it is: first vertex and instance (4 words
+        // in all), or first index, base vertex and first instance (5).
+        if (kind == 1) {
+            dest.Store3(at + 8, args.Load3(at + 8));
+        } else {
+            dest.Store2(at + 8, args.Load2(at + 8));
+        }
     } else if (kind == 2) {
         uint3 g = min(args.Load3(at), uint3(65535, 65535, 65535));
         // x * y fits 32 bits; the whole count may not.
@@ -23,13 +32,13 @@ uint clamped(uint at) {
             g = uint3(0, 0, 0);
         }
         cost = g.x * g.y * g.z * 64;
-        args.Store3(at, g);
+        dest.Store3(at, g);
     } else {
         // Mesh dispatches: the console's are one-dimensional.
         uint3 g = args.Load3(at);
         g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
         cost = g.x * g.y * g.z * 128;
-        args.Store3(at, g);
+        dest.Store3(at, g);
     }
     return cost;
 }
@@ -71,7 +80,7 @@ void main(uint lane : SV_GroupIndex) {
         GroupMemoryBarrierWithGroupSync();
         if (costs[lane] == PAST) {
             // Draws keep their layout with no vertices; groups become zero.
-            args.Store(at, 0);
+            dest.Store(at, 0);
         }
     }
     if (lane == 0) {

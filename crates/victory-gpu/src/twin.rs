@@ -8,7 +8,7 @@
 //! contents move between the two by copies where the use changes: within
 //! a list where it records the change (`HostList::transition`), and at
 //! submission for each list's first use, from the side the lists before it
-//! left newer. A 16-bit depth plane in the host's 24-bit one (the
+//! left newer. A 16-bit depth plane in the host's 32-bit float one (the
 //! console's 16-bit depth with stencil) is converted on the way, so a
 //! value written as 16-bit depth compares equal to the same depth
 //! rasterised.
@@ -75,7 +75,7 @@ struct Route {
     /// Its place in the scratch buffer as the twin's texture has it.
     twin: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
     /// As the depth texture has it, where that differs: a 16-bit depth
-    /// plane the host keeps in 24 bits (32 per texel), converted.
+    /// plane the host keeps as 32-bit floats, converted.
     depth: Option<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
 }
 
@@ -465,10 +465,10 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
     }
 }
 
-/// 16-bit depth (unorm, two per dword) to the host's 24-bit depth plane (in
-/// the low 24 bits of 32) and back, in the scratch buffer: `u * (2^24 - 1)
-/// / 65535` rounded, exactly, and back to the 16-bit value whose 24-bit one
-/// is nearest.
+/// 16-bit depth (unorm, two per dword) to the host's 32-bit float depth
+/// plane and back, in the scratch buffer: `u` becomes `u` times
+/// `0x37800080` (the title's 1/65535; its tiled-lighting draws rasterise
+/// that very float and test it EQUAL), and a float back the nearest `u`.
 ///
 /// `depth_bytecode.rs` holds this shader compiled by Microsoft's compilers
 /// on a Windows runner (`cargo xtask embed-depth`), because Wine's HLSL
@@ -679,16 +679,19 @@ mod tests {
         }
     }
 
-    /// The model of the shader's `d24`: `u * (2^24 - 1) / 65535` rounded.
-    fn d24(u: u32) -> u32 {
-        u * 256 + (u * 255 + 32767) / 65535
+    /// The model of the shader's `depth`: `u` times the title's 1/65535,
+    /// as a float's bits.
+    fn depth_bits(u: u32) -> u32 {
+        (u as f32 * f32::from_bits(0x3780_0080)).to_bits()
     }
 
     /// The conversion on the device, recorded as `Twin::copy` records it:
-    /// a 5 by 2 plane of 16-bit depths becomes the 24-bit values of the
-    /// same depths, the odd last column leaves the dword after its row
-    /// alone, and the way back gives the 16-bit depth nearest to each
-    /// 24-bit value, whatever its high byte holds.
+    /// a 5 by 2 plane of 16-bit depths becomes the 32-bit floats of the
+    /// same depths (upstream's conversion since 2026-11-25; before it the
+    /// host plane was 24-bit and this test asserted `u * (2^24 - 1) /
+    /// 65535`), the odd last column leaves the dword after its row alone,
+    /// and the way back gives the 16-bit depth nearest to each float,
+    /// floats outside 0..1 saturated.
     #[test]
     fn depth_converts_both_ways_on_the_device() {
         let test = "twin::depth_converts_both_ways_on_the_device";
@@ -698,10 +701,13 @@ mod tests {
         let Some(c) = converter_for(test) else {
             return;
         };
-        assert_eq!((d24(0), d24(1), d24(65535)), (0, 256, 0xff_ffff));
+        // The title's own constant: 1 becomes it, and the far plane a float
+        // within two steps of 1.0 that goes back to 65535.
+        assert_eq!((depth_bits(0), depth_bits(1)), (0, 0x3780_0080));
+        assert!(1.0f32.to_bits().abs_diff(depth_bits(65535)) <= 2);
         const WIDTH: usize = 5;
         const HEIGHT: usize = 2;
-        // Bytes: the 16-bit plane, the 24-bit plane it becomes, a 24-bit
+        // Bytes: the 16-bit plane, the float plane it becomes, a float
         // plane of our own and the 16-bit plane that one becomes.
         const PITCH16: usize = 16;
         const PITCH32: usize = 32;
@@ -709,19 +715,21 @@ mod tests {
         const UNTOUCHED: u32 = 0xdead_beef;
         let depths: [u16; WIDTH * HEIGHT] =
             [0, 1, 2, 0x7fff, 0x8000, 0x8001, 0xfffe, 0xffff, 100, 257];
-        // 24-bit values on and between the 16-bit depths' own, with
-        // something in the byte above them: the nearest depth is wanted.
+        // Floats on and between the 16-bit depths' own (none near a half,
+        // where the rounding of the product would decide), and outside
+        // 0..1: the nearest depth is wanted.
+        let f = |depth: f32| (depth / 65535.0).to_bits();
         let near: [(u32, u16); WIDTH * HEIGHT] = [
-            (0, 0),
-            (0xff_ffff, 0xffff),
-            (d24(100) + 100, 100),
-            (d24(100) + 200, 101),
-            (d24(0x8000) - 1, 0x8000),
-            (0xab00_0000 | d24(77), 77),
-            (0xff00_0000 | (d24(77) - 120), 77),
-            (d24(0xffff) - 200, 0xfffe),
-            (120, 0),
-            (140, 1),
+            (0.0f32.to_bits(), 0),
+            (1.0f32.to_bits(), 0xffff),
+            (f(100.25), 100),
+            (f(100.75), 101),
+            (depth_bits(0x8000), 0x8000),
+            (depth_bits(77), 77),
+            (f(76.75), 77),
+            (f(65534.25), 0xfffe),
+            ((-1.0f32).to_bits(), 0),
+            (2.0f32.to_bits(), 0xffff),
         ];
         let words = 256 / 4;
         let (buffer, data) = host.shared_buffer(256).expect("a shared buffer");
@@ -771,7 +779,7 @@ mod tests {
             // The source stays as written.
             assert_eq!(half(in16 + y * PITCH16 + x * 2), depth, "source {i}");
             let got = after[(out32 + y * PITCH32 + x * 4) / 4];
-            assert_eq!(got, d24(u32::from(depth)), "depth {depth:#x} at {x}, {y}");
+            assert_eq!(got, depth_bits(u32::from(depth)), "depth {depth:#x} at {x}, {y}");
         }
         for (i, &(value, want)) in near.iter().enumerate() {
             let (x, y) = (i % WIDTH, i / WIDTH);
@@ -779,11 +787,63 @@ mod tests {
             assert_eq!(got, want, "{value:#x} at {x}, {y}");
         }
         for y in 0..HEIGHT {
-            // Past the odd width: no sixth 24-bit value, and a zero in the
-            // other half of the last pair of 16-bit ones.
+            // Past the odd width: no sixth float, and a zero in the other
+            // half of the last pair of 16-bit depths.
             let past = after[(out32 + y * PITCH32 + WIDTH * 4) / 4];
             assert_eq!(past, UNTOUCHED, "row {y}");
             assert_eq!(half(out16 + y * PITCH16 + WIDTH * 2), 0, "row {y}");
         }
+    }
+
+    /// A list that writes a depth texture through its twin and then reads
+    /// its depth side: its prelude owes a copy into the twin first. Every
+    /// barrier the prelude and the list issue starts from the state the
+    /// texture is in, as the debug layer checks (run light21: the prelude's
+    /// copy started from the states the list leaves).
+    #[test]
+    fn prelude_copies_start_from_the_real_states() {
+        use crate::host::tests::{issued, replay};
+        use windows::core::Interface;
+        let Some((_gpu, host)) = crate::testing::gpu() else {
+            return;
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 64,
+            Height: 64,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R16_TYPELESS,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+            ..Default::default()
+        };
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+        let mut texture: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation; our out pointer.
+        unsafe { host.device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, None, &mut texture) }.unwrap();
+        let depth = Arc::new(HostTexture::new(texture.unwrap(), DEPTH_WRITE, Vec::new()));
+        let twin = depth.twin.get_or_init(|| make(53, &depth.texture)).as_ref().unwrap();
+        let list = host.new_list().unwrap();
+        issued();
+        assert!(route(&list, &depth, twin, UNORDERED_ACCESS));
+        const PIXEL_SHADER_RESOURCE: u32 = 0x80;
+        assert!(!route(&list, &depth, twin, PIXEL_SHADER_RESOURCE));
+        if let Some(b) = list.move_texture(&depth, PIXEL_SHADER_RESOURCE) {
+            // SAFETY: an open list and a live texture.
+            unsafe { list.list.ResourceBarrier(&[b]) };
+        }
+        list.close();
+        let recorded = issued();
+        host.execute(&[&list]);
+        // The GPU runs the prelude, then the list.
+        let mut run = issued();
+        run.extend(recorded);
+        let key = |t: &HostTexture| t.texture.as_raw() as usize;
+        let mut states = std::collections::HashMap::from([(key(&depth), DEPTH_WRITE), (key(&twin.planes[0]), 0)]);
+        replay(&run, &mut states).unwrap();
+        // What the list left is what the next prelude starts from.
+        assert_eq!(states[&key(&depth)], depth.state.load(Relaxed));
+        assert_eq!(states[&key(&twin.planes[0])], twin.planes[0].state.load(Relaxed));
     }
 }

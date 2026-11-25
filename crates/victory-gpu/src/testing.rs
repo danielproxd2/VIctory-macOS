@@ -46,9 +46,23 @@ pub(crate) fn serial_with_device() -> (Serial, bool) {
 /// upstream ([`crate::test_support::no_hlsl`]).
 #[cfg(windows)]
 pub(crate) fn compiled(test: &str, source: &str, flags: u32) -> Option<Vec<u8>> {
+    compiled_as(test, source, (c"main", c"cs_5_1"), flags, true)
+}
+
+/// As [`compiled`], for the entry point and target profile `stage` (say
+/// `(c"vs", c"vs_5_1")`). `rooted`: the stage carries the source's
+/// `[RootSignature]`, and bytecode without that part is a refusal too.
+#[cfg(windows)]
+pub(crate) fn compiled_as(
+    test: &str,
+    source: &str,
+    (entry, target): (&std::ffi::CStr, &std::ffi::CStr),
+    flags: u32,
+    rooted: bool,
+) -> Option<Vec<u8>> {
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
     use windows::Win32::Graphics::Direct3D::ID3DBlob;
-    use windows::core::{PCSTR, s};
+    use windows::core::PCSTR;
     // The messages name the source by the test.
     let name = std::ffi::CString::new(test).expect("a test name without NUL");
     let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
@@ -60,8 +74,8 @@ pub(crate) fn compiled(test: &str, source: &str, flags: u32) -> Option<Vec<u8>> 
             PCSTR(name.as_ptr().cast()),
             None,
             None,
-            s!("main"),
-            s!("cs_5_1"),
+            PCSTR(entry.as_ptr().cast()),
+            PCSTR(target.as_ptr().cast()),
             flags,
             0,
             &mut code,
@@ -89,7 +103,7 @@ pub(crate) fn compiled(test: &str, source: &str, flags: u32) -> Option<Vec<u8>> 
     // vkd3d-shader's compiler builds some of these sources and leaves the
     // `[RootSignature]` attribute out of what it writes, and without that
     // part there is neither a root signature nor a pipeline to make.
-    if !crate::root::holds_a_root_signature(&code) {
+    if rooted && !crate::root::holds_a_root_signature(&code) {
         let text = "the compiler left the [RootSignature] out: no RTS0 part in the shader";
         crate::test_support::no_hlsl(test, text);
         return None;

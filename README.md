@@ -19,7 +19,7 @@ If you want to see GTA VI on a Mac, please star the repo and read <a href="CONTR
 </p>
 
 > [!IMPORTANT]
-> **The game is not playable yet, on the Mac or anywhere else.** VIctory on Windows boots the game, runs its menus, loads the world and shows it, but slowly (1-2 seconds per frame) and with rendering defects. This project makes the whole VIctory platform run on a Mac, so the Mac moves forward as VIctory does. No game files are included here or ever will be. You need your own copy of the game.
+> **The game is not playable yet, on the Mac or anywhere else.** VIctory on Windows boots the game, runs its menus at its own 30 fps, loads the world, plays the intro cutscene and reaches the prologue, the mission after it, with the graphics fully displayed, at about 1 frame per second. This project makes the whole VIctory platform run on a Mac, so the Mac moves forward as VIctory does. No game files are included here or ever will be. You need your own copy of the game.
 
 ## What works today
 

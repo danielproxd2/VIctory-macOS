@@ -143,6 +143,11 @@ enum Console {
     SeriesS,
 }
 
+/// Diagnostics: the heap bytes Rust code holds, for the statistics.
+#[cfg(all(windows, feature = "diagnostics"))]
+#[global_allocator]
+static ALLOC: victory_gpu::CountingAlloc = victory_gpu::CountingAlloc;
+
 /// An error ends the process with status 1 (and clap, which refuses the
 /// arguments, with 2). A title that ran to the end of its entry point ends
 /// it with what that returned; everything else that succeeds, with 0.

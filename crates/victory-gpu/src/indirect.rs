@@ -146,57 +146,65 @@ fn from_bytecode(device: &ID3D12Device, bytes: &[u8]) -> windows::core::Result<C
 }
 
 /// Records, in `list`, the clamp of `records` records of `kind` (PC
-/// argument numbering) `stride` bytes apart at host address `gpu` in
-/// `buffer`, and leaves the buffer ready to be read as arguments. Replaces
-/// the list's compute root signature and pipeline (callers bind theirs
-/// after). False if the clamp is not available.
-pub(crate) fn bound(
-    list: &HostList,
-    buffer: &ID3D12Resource,
-    gpu: u64,
-    (kind, stride, records): (u32, u32, u32),
-) -> bool {
+/// argument numbering) `stride` bytes apart at host address `gpu` (a title
+/// buffer's copy, only read) into the list's own argument buffer, left
+/// ready to be read as arguments: that buffer, for [`done`] after the
+/// execution. Replaces the list's compute root signature and pipeline
+/// (callers bind theirs after). `None` if the clamp is not available.
+///
+/// Title buffers' copies are never transitioned: they are common between
+/// submissions and every use promotes them (shader and root views, the
+/// input assembler, these reads), with unordered-access barriers for order.
+/// Only the list's argument buffer moves, common, unordered access,
+/// indirect argument, common: its states are known whatever order lists
+/// run in.
+// shortcut: a buffer a shader writes through an unordered view and the
+// input assembler then reads in one submission is, by the letter of D3D12,
+// promoted to a write state the input assembler may not use (the debug
+// layer cannot see view accesses; GPU-based validation might); upgrade to
+// per-list tracked buffer states if a driver or that validation minds.
+pub(crate) fn bound(list: &HostList, gpu: u64, (kind, stride, records): (u32, u32, u32)) -> Option<ID3D12Resource> {
     let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
-        return false;
+        return None;
     };
     if !gpu.is_multiple_of(4) || !stride.is_multiple_of(4) {
-        return false;
+        return None;
     }
+    let out = list.arguments(u64::from(stride) * u64::from(records.max(1)))?;
     let l = &list.list;
     let constants = [kind, stride, records, 0];
-    // SAFETY: an open list; our root signature, pipeline and a live buffer
-    // the caller's list holds.
+    // SAFETY: an open list; our root signature, pipeline and buffers, and
+    // a title buffer's copy the caller's list holds.
     unsafe {
         // Earlier shader writes (the title's argument passes) first.
-        l.ResourceBarrier(&[uav_barrier()]);
+        l.ResourceBarrier(&[
+            uav_barrier(),
+            transition(&out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+        ]);
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
         l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
-        l.SetComputeRootUnorderedAccessView(1, gpu);
+        l.SetComputeRootShaderResourceView(1, gpu);
         l.SetComputeRootUnorderedAccessView(2, budget);
+        l.SetComputeRootUnorderedAccessView(3, out.GetGPUVirtualAddress());
         // One group walks every record.
         l.Dispatch(records.min(1), 1, 1);
         l.ResourceBarrier(&[
             uav_barrier(),
-            transition(
-                buffer,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            ),
+            transition(&out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
         ]);
     }
-    true
+    Some(out)
 }
 
-/// After the execution: the buffer back to unordered access, where the
-/// title's passes keep using it.
-pub(crate) fn done(list: &HostList, buffer: &ID3D12Resource) {
+/// After the execution: the list's argument buffer back to common.
+pub(crate) fn done(list: &HostList, arguments: &ID3D12Resource) {
     // SAFETY: an open list and a live buffer.
     unsafe {
         list.list.ResourceBarrier(&[transition(
-            buffer,
+            arguments,
             D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COMMON,
         )])
     };
 }
@@ -271,9 +279,10 @@ mod tests {
     }
 
     /// Clamps `records` records of `kind`, filled by repeating `words`,
-    /// `calls` times in one list: each record's first word after (zero when
-    /// it runs empty). One record more follows them and must stay as
-    /// written. For a test that holds the host device.
+    /// `calls` times in one list: each record's first word in the list's
+    /// argument buffer after (zero when it runs empty). The title's copy,
+    /// one record more included, stays as written. For a test that holds
+    /// the host device.
     fn clamped(kind: u32, words: &[u32], records: u32, calls: u32) -> Vec<u32> {
         let host = super::host().expect("a host device: the test holds it");
         // Words in a record of `kind`.
@@ -294,16 +303,21 @@ mod tests {
                 data.add(at).write_volatile(words[at % words.len()]);
             }
             let gpu = buffer.GetGPUVirtualAddress();
+            let mut out = None;
             for _ in 0..calls {
-                assert!(super::bound(&list, &buffer, gpu, spec));
-                super::done(&list, &buffer);
+                let clamped = super::bound(&list, gpu, spec).unwrap();
+                super::done(&list, &clamped);
+                out = Some(clamped);
             }
             list.close();
             host.execute(&[&list]);
-            for at in all - per..all {
-                assert_eq!(data.add(at).read_volatile(), words[at % words.len()]);
+            for at in 0..all {
+                assert_eq!(data.add(at).read_volatile(), words[at % words.len()], "the title's copy as written");
             }
-            let first = |i: usize| data.add(i * per).read_volatile();
+            let mut out_data = std::ptr::null_mut();
+            let out = out.expect("at least one call");
+            out.Map(0, None, Some(&mut out_data)).unwrap();
+            let first = |i: usize| out_data.cast::<u32>().add(i * per).read_volatile();
             (0..records as usize).map(first).collect()
         }
     }
@@ -359,6 +373,63 @@ mod tests {
         let draws = clamped(0, &words, 8, 1);
         let ran: Vec<bool> = draws.iter().map(|&count| count != 0).collect();
         assert_eq!(ran, [true, true, false, false, false, false, false, false]);
+    }
+
+    /// Two lists clamping into their own argument buffers, run in either
+    /// order: every barrier starts from the buffer's current state (the
+    /// debug layer's rule; runs light19 and light21 had the title's GPU
+    /// heap moved to unordered access under the input assembler), the
+    /// title's copy is never transitioned, and all end common.
+    #[test]
+    fn argument_buffers_move_from_their_current_states() {
+        use crate::host::tests::{issued, replay};
+        use windows::core::Interface;
+        let Some((_gpu, host)) = crate::testing::gpu() else {
+            return;
+        };
+        if !clamp_for("indirect::argument_buffers_move_from_their_current_states") {
+            return;
+        }
+        let (title, data) = host.shared_buffer(1 << 16).unwrap();
+        // SAFETY: our mapped buffer; a live buffer.
+        let gpu = unsafe {
+            data.cast::<[u32; 3]>().write_volatile([70_000, 1, 1]);
+            title.GetGPUVirtualAddress()
+        };
+        let key = |r: &super::ID3D12Resource| r.as_raw() as usize;
+        for a_first in [true, false] {
+            let lists = [host.new_list().unwrap(), host.new_list().unwrap()];
+            issued();
+            let recorded: Vec<_> = lists
+                .iter()
+                .map(|l| {
+                    let out = super::bound(l, gpu, (2, 12, 1)).unwrap();
+                    super::done(l, &out);
+                    l.close();
+                    (out, issued())
+                })
+                .collect();
+            let order = if a_first { [0, 1] } else { [1, 0] };
+            host.execute(&[&lists[order[0]], &lists[order[1]]]);
+            let mut run = issued();
+            run.extend(order.iter().flat_map(|&i| recorded[i].1.clone()));
+            let mut states: std::collections::HashMap<usize, u32> =
+                [key(&title), key(&recorded[0].0), key(&recorded[1].0)].into_iter().map(|k| (k, 0)).collect();
+            replay(&run, &mut states).unwrap();
+            assert!(run.iter().all(|t| t.0 != key(&title)), "the title's copy is never transitioned");
+            assert!(states.values().all(|&s| s == 0), "all common again");
+            for (out, _) in &recorded {
+                let mut p = std::ptr::null_mut();
+                // SAFETY: a mapped buffer of ours, the lists have run.
+                let clamped = unsafe {
+                    out.Map(0, None, Some(&mut p)).unwrap();
+                    p.cast::<[u32; 3]>().read_volatile()
+                };
+                assert_eq!(clamped, [65_535, 1, 1]);
+            }
+            // SAFETY: as above.
+            assert_eq!(unsafe { data.cast::<[u32; 3]>().read_volatile() }, [70_000, 1, 1], "the title's copy as written");
+        }
     }
 
     /// The budget is the list's: a second execution of the same records

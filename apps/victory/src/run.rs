@@ -78,8 +78,9 @@ pub fn run(
     // Before the import registry is first used: it holds the module only
     // when the host's FidelityFX serves.
     victory_hle::modules::fidelityfx::use_host_dir(cfg.fidelityfx_dir.as_deref());
-    let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
-    let prepared = victory_loader::prepare(&original)?;
+    let prepared = victory_loader::prepare(
+        &std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?,
+    )?;
     // A DLL's entry point is its `DllMain`, which takes three arguments
     // and is not where a program starts: started as a title it would be
     // called with none and its answer taken for an exit code.
@@ -110,6 +111,8 @@ pub fn run(
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let image = victory_loader::load(&prepared, &images)?;
+    // Mapped: the patched bytes (the exe's size, 114 MB) are not needed.
+    drop(prepared);
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
     writeln!(
