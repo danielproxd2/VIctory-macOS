@@ -38,8 +38,10 @@ These are the open areas, roughly from most to least useful.
 1. Fork the repository and make a branch for your change.
 2. Keep each commit small, with a short subject line that says what it changes, such as `fix(gpu): keep the clamp's budget per list`.
 3. Add or update a test when you change behaviour. GPU behaviour is best tested under Wine with D3DMetal, as in the second command above.
-4. Run `cargo fmt`, `cargo clippy` and both test runs.
+4. Run `cargo xtask fmt`, `cargo clippy` and both test runs. Do not run `cargo fmt`.
 5. Open a pull request that says what changed, why, and how you tested it.
+
+`cargo xtask fmt` formats only the files that this fork added, and `cargo xtask fmt-check` checks the same files without writing. Files that also exist in VIctory keep VIctory's layout, even where this fork changed them, because VIctory does not format its code with rustfmt and every line that is only laid out differently here becomes a conflict at the next merge. In those files, write new lines in the style of the lines around them. The two commands find VIctory's files through a git remote named `upstream` (`git remote add upstream https://github.com/Marvisak/VIctory.git && git fetch upstream`); without that remote they check nothing and say so.
 
 ## Reporting a problem
 
