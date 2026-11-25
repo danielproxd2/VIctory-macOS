@@ -13,6 +13,16 @@ use crate::{Console, Unimplemented};
 /// ends the process with it, as the exit code of a Windows process is what
 /// its main function returns. (A title that calls `exit` itself ends the
 /// process with its code there and then.)
+///
+/// The source for that, checked against the page as fetched on 2026-11-24
+/// (https://learn.microsoft.com/windows/win32/api/processthreadsapi/nf-processthreadsapi-getexitcodeprocess,
+/// Remarks): the status of a process that has ended is one of three values,
+/// the second of them "The return value from the main or WinMain function
+/// of the process." The commit that introduced this behaviour quoted the
+/// sentence from memory; its wording is accurate, but for the capital of
+/// the first word. The other two values are the one given to `ExitProcess`
+/// or `TerminateProcess`, and the exception value of an unhandled exception
+/// that ended the process.
 #[cfg(windows)]
 pub fn run(
     exe: &Path,
@@ -34,6 +44,13 @@ pub fn run(
     // A DLL's entry point is its `DllMain`, which takes three arguments
     // and is not where a program starts: started as a title it would be
     // called with none and its answer taken for an exit code.
+    //
+    // The source, checked against the page as fetched on 2026-11-24
+    // (https://learn.microsoft.com/windows/win32/debug/pe-format#characteristics):
+    // of IMAGE_FILE_DLL (0x2000) it says that such files count as
+    // executable files for almost all purposes, "although they cannot be
+    // directly run." The commit that introduced this check quoted the last
+    // four words from memory; they are accurate.
     anyhow::ensure!(
         !(execute && prepared.info.is_dll()),
         "{} is a DLL, which cannot be started as a title (without --execute it is mapped and bound)",
