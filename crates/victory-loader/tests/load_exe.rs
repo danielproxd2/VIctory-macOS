@@ -320,6 +320,10 @@ fn exe_fixture_is_not_a_dll_and_has_tls() {
         "xgameruntime.dll!XGameRuntimeInitialize",
         "kernel32.dll!CreateThread",
         "kernel32.dll!GetCurrentThreadStackLimits",
+        // What it loads a DLL of its own with, and reads its package with.
+        "kernel32.dll!LoadLibraryW",
+        "kernel32.dll!GetProcAddress",
+        "kernel32.dll!ReadFile",
     ] {
         assert!(imports.iter().any(|i| i == wanted), "{wanted}: {imports:?}");
     }
@@ -376,15 +380,36 @@ fn bind_gives_the_exe_its_console_import_and_the_host_the_rest() {
         imports.contains(&"xgameruntime.dll!XGameRuntimeInitialize,hle"),
         "{run:#?}"
     );
-    assert!(
-        imports.contains(&"kernel32.dll!CreateThread,host"),
-        "{run:#?}"
-    );
+    for host in [
+        "kernel32.dll!CreateThread,host",
+        "kernel32.dll!LoadLibraryW,host",
+        "kernel32.dll!GetProcAddress,host",
+        "kernel32.dll!ReadFile,host",
+    ] {
+        assert!(imports.contains(&host), "{host}: {run:#?}");
+    }
     let missing: Vec<_> = imports.iter().filter(|i| i.ends_with(",missing")).collect();
     assert!(missing.is_empty(), "{missing:?}");
     assert_eq!(number(&run.printed, "missing"), Some(0), "{run:#?}");
     // The title called it and got the resolver's answer.
     assert_eq!(number(&run.log, "runtime"), Some(RUNTIME as u64));
+}
+
+/// The stand-in loads a DLL it ships and copies a file of its package to
+/// its temporary drive (`victory run`'s tests, apps/victory/tests/run.rs).
+/// Here the host answers those calls and has neither the DLL nor the
+/// package: the title is told so, writes nothing, and goes on to its end.
+#[test]
+fn the_exe_goes_on_without_its_late_dll_and_its_package() {
+    let run = Run::plain();
+    let seen = |name: &str| number(&run.log, name);
+    assert_eq!(seen("late_dll"), Some(0), "{run:#?}");
+    assert_eq!(seen("late_chain"), Some(0), "{run:#?}");
+    assert_eq!(seen("package_found"), Some(0), "{run:#?}");
+    assert_eq!(seen("temp_written"), Some(0), "{run:#?}");
+    assert_eq!(seen("temp_bytes"), Some(0), "{run:#?}");
+    let expected = EXIT_BASE + RUNTIME as u64;
+    assert_eq!(run.code, Some(expected as i32), "{run:#?}");
 }
 
 #[test]

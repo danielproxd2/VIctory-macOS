@@ -4,6 +4,16 @@
 //! has. victory-loader's tests run it (crates/victory-loader/tests/load_exe.rs)
 //! and read what it saw from the file `VICTORY_FIXTURE_LOG` names.
 //!
+//! At its start it also does what a title does there, and `victory run`'s
+//! tests (apps/victory/tests/run.rs) read what came of it: it loads a DLL
+//! it ships that nothing imports (`LoadLibraryW` of `title_b.dll`, which
+//! needs `title_a.dll`) and calls into it, and it reads a file of its
+//! package (`G:\standin-package.txt`) and writes what it read to a
+//! temporary file (`T:\standin-temp.txt`). Where the DLL or the package
+//! file is not there, it says so in its log and goes on: the loader's own
+//! tests run it bare, on a host that has neither. It writes nothing unless
+//! it found the package file first, so on such a host it writes nothing.
+//!
 //! It has no C runtime and no `std`: a runtime's start code ends in `exit`
 //! and sets up state shared with the process that hosts it, and what a
 //! runtime does at start differs between toolchains. Everything here is
@@ -28,6 +38,8 @@ const EXIT_BASE: u32 = 7;
 const FAILED_NO_LOG: u32 = 0xE001;
 const FAILED_THREADS: u32 = 0xE002;
 const FAILED_WRITE: u32 = 0xE003;
+/// The package file was there and the temporary file could not be written.
+const FAILED_TEMP: u32 = 0xE004;
 /// The process's exit code if this code panics (it has no reason to).
 const PANICKED: u32 = 0xE0FF;
 
@@ -60,6 +72,15 @@ unsafe extern "system" {
         written: *mut u32,
         overlapped: *mut c_void,
     ) -> i32;
+    fn ReadFile(
+        file: Handle,
+        bytes: *mut u8,
+        len: u32,
+        read: *mut u32,
+        overlapped: *mut c_void,
+    ) -> i32;
+    fn LoadLibraryW(name: *const u16) -> Handle;
+    fn GetProcAddress(module: Handle, name: *const u8) -> *const c_void;
     fn GetEnvironmentVariableW(name: *const u16, value: *mut u16, len: u32) -> u32;
     fn CreateThread(
         security: *const c_void,
@@ -264,6 +285,10 @@ pub extern "system" fn probe_exe_entry() -> u32 {
     // SAFETY: the import takes nothing; the loader bound it.
     let runtime = unsafe { XGameRuntimeInitialize() };
 
+    // Before the threads below start: a DLL that is loaded hears of them.
+    let late = load_late_dll();
+    let files = copy_package_to_temp();
+
     let block = local();
     // SAFETY: this thread's block, as large as the template.
     let (initial, guard) = unsafe { ((*block).value, (*block).guard) };
@@ -328,30 +353,220 @@ pub extern "system" fn probe_exe_entry() -> u32 {
         pair("block", seen.block.load(Ordering::SeqCst) as u64);
         written &= write_log(&text);
     }
+    let mut text = Text::new();
+    text.pair("late_dll", late.loaded.into());
+    text.pair("late_again", late.same_again.into());
+    text.pair("late_chain", late.chain.into());
+    text.pair("package_found", files.found.into());
+    text.pair("package_bytes", files.read.into());
+    text.pair("package_sum", files.read_sum.into());
+    text.pair("temp_written", files.written.into());
+    text.pair("temp_bytes", files.back.into());
+    text.pair("temp_sum", files.back_sum.into());
+    written &= write_log(&text);
     if !written {
         return FAILED_WRITE;
+    }
+    if files.found && (files.written != files.read || files.back != files.read) {
+        return FAILED_TEMP;
     }
     EXIT_BASE.wrapping_add(runtime as u32)
 }
 
-/// `VICTORY_FIXTURE_LOG`, NUL-terminated, in UTF-16.
-const LOG_VARIABLE: [u16; 20] = {
-    let ascii = b"VICTORY_FIXTURE_LOG\0";
-    let mut wide = [0u16; 20];
+/// `ascii` in UTF-16; the callers end it with a NUL.
+const fn wide<const N: usize>(ascii: &[u8; N]) -> [u16; N] {
+    let mut wide = [0u16; N];
     let mut i = 0;
-    while i < ascii.len() {
+    while i < N {
         wide[i] = ascii[i] as u16;
         i += 1;
     }
     wide
-};
+}
+
+/// `VICTORY_FIXTURE_LOG`, NUL-terminated, in UTF-16.
+const LOG_VARIABLE: [u16; 20] = wide(b"VICTORY_FIXTURE_LOG\0");
+
+/// The DLL the title loads itself: no image imports it. It imports
+/// `title_a.dll` in turn (tests/fixtures/title-b).
+const LATE_DLL: [u16; 12] = wide(b"title_b.dll\0");
+/// Its function that calls into `title_a.dll` and returns what it got,
+/// with a mark of its own.
+const LATE_FUNCTION: &core::ffi::CStr = c"title_b_chain";
+
+/// What came of loading [`LATE_DLL`].
+struct Late {
+    /// `LoadLibraryW` returned a module.
+    loaded: bool,
+    /// A second `LoadLibraryW` returned the same module.
+    same_again: bool,
+    /// What [`LATE_FUNCTION`] returned; 0 if it was not found.
+    chain: u32,
+}
+
+/// Loads the DLL the title ships and nothing imports, as a title does
+/// with a library it chooses at run time, and calls into it.
+fn load_late_dll() -> Late {
+    let mut late = Late {
+        loaded: false,
+        same_again: false,
+        chain: 0,
+    };
+    // SAFETY: a NUL-terminated name.
+    let module = unsafe { LoadLibraryW(LATE_DLL.as_ptr()) };
+    if module.is_null() {
+        return late;
+    }
+    late.loaded = true;
+    // SAFETY: as above.
+    late.same_again = unsafe { LoadLibraryW(LATE_DLL.as_ptr()) } == module;
+    // SAFETY: a loaded module and a NUL-terminated name.
+    let function = unsafe { GetProcAddress(module, LATE_FUNCTION.as_ptr().cast()) };
+    if !function.is_null() {
+        // SAFETY: tests/fixtures/title-b exports it with this signature.
+        let chain: unsafe extern "system" fn() -> u32 = unsafe { core::mem::transmute(function) };
+        // SAFETY: it takes nothing.
+        late.chain = unsafe { chain() };
+    }
+    late
+}
+
+/// A file of the title's package, on the drive a console title finds its
+/// package on, and a temporary file on the drive it has for those.
+const PACKAGE_FILE: [u16; 23] = wide(b"G:\\standin-package.txt\0");
+const TEMP_FILE: [u16; 20] = wide(b"T:\\standin-temp.txt\0");
+/// As much of either file as is read.
+const FILE_ROOM: usize = 256;
+
+/// What came of reading [`PACKAGE_FILE`] and copying it to [`TEMP_FILE`].
+struct Files {
+    /// The package file could be opened.
+    found: bool,
+    /// The bytes read from it, and their checksum ([`sum`]).
+    read: u32,
+    read_sum: u32,
+    /// The bytes written to the temporary file.
+    written: u32,
+    /// The bytes read back from the temporary file, and their checksum.
+    back: u32,
+    back_sum: u32,
+}
+
+/// Reads the package file and, if it is there, writes what it holds to the
+/// temporary file and reads that back. Without the package file nothing is
+/// written anywhere.
+fn copy_package_to_temp() -> Files {
+    const CREATE_ALWAYS: u32 = 2;
+    let mut files = Files {
+        found: false,
+        read: 0,
+        read_sum: 0,
+        written: 0,
+        back: 0,
+        back_sum: 0,
+    };
+    let mut bytes = [0u8; FILE_ROOM];
+    let Some(read) = read_file(&PACKAGE_FILE, &mut bytes) else {
+        return files;
+    };
+    files.found = true;
+    files.read = read as u32;
+    files.read_sum = sum(&bytes[..read]);
+    // SAFETY: a NUL-terminated path; the handle is closed below.
+    let temp = unsafe {
+        CreateFileW(
+            TEMP_FILE.as_ptr(),
+            GENERIC_WRITE,
+            0,
+            core::ptr::null(),
+            CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            core::ptr::null_mut(),
+        )
+    };
+    if !is_open(temp) {
+        return files;
+    }
+    // SAFETY: an open file and `read` bytes of ours; then closed.
+    unsafe {
+        WriteFile(
+            temp,
+            bytes.as_ptr(),
+            read as u32,
+            &mut files.written,
+            core::ptr::null_mut(),
+        );
+        CloseHandle(temp);
+    }
+    let mut back = [0u8; FILE_ROOM];
+    if let Some(read) = read_file(&TEMP_FILE, &mut back) {
+        files.back = read as u32;
+        files.back_sum = sum(&back[..read]);
+    }
+    files
+}
+
+const GENERIC_READ: u32 = 0x8000_0000;
+const GENERIC_WRITE: u32 = 0x4000_0000;
+const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+
+/// Whether `CreateFileW` returned a file (`INVALID_HANDLE_VALUE` is -1).
+fn is_open(file: Handle) -> bool {
+    !file.is_null() && file as isize != -1
+}
+
+/// Reads the start of the file `path` names (NUL-terminated) into `bytes`;
+/// how much was read, or `None` if it cannot be opened or read.
+fn read_file(path: &[u16], bytes: &mut [u8; FILE_ROOM]) -> Option<usize> {
+    const FILE_SHARE_READ: u32 = 1;
+    const OPEN_EXISTING: u32 = 3;
+    // SAFETY: a NUL-terminated path; the handle is closed below.
+    let file = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ,
+            core::ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            core::ptr::null_mut(),
+        )
+    };
+    if !is_open(file) {
+        return None;
+    }
+    let mut read = 0;
+    // SAFETY: an open file and room for as many bytes as it is told; then
+    // closed.
+    let ok = unsafe {
+        let ok = ReadFile(
+            file,
+            bytes.as_mut_ptr(),
+            FILE_ROOM as u32,
+            &mut read,
+            core::ptr::null_mut(),
+        );
+        CloseHandle(file);
+        ok
+    };
+    (ok != 0 && read as usize <= FILE_ROOM).then_some(read as usize)
+}
+
+/// A checksum of `bytes` (FNV-1a, 32 bits): bytes in another order or
+/// other bytes give another number. apps/victory/tests/run.rs has the same.
+fn sum(bytes: &[u8]) -> u32 {
+    let mut sum = 0x811C_9DC5u32;
+    for byte in bytes {
+        sum = (sum ^ u32::from(*byte)).wrapping_mul(0x0100_0193);
+    }
+    sum
+}
 
 /// Opens the file `VICTORY_FIXTURE_LOG` names, to add to its end.
 fn open_log() -> Option<Handle> {
     const FILE_APPEND_DATA: u32 = 4;
     const FILE_SHARE_READ_WRITE: u32 = 3;
     const OPEN_ALWAYS: u32 = 4;
-    const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
     static mut PATH: [u16; 1024] = [0; 1024];
     let path = &raw mut PATH;
     // SAFETY: only the entry point calls this, once; the buffer is as long
@@ -372,8 +587,7 @@ fn open_log() -> Option<Handle> {
             core::ptr::null_mut(),
         )
     };
-    // INVALID_HANDLE_VALUE is -1.
-    (!file.is_null() && file as isize != -1).then_some(file)
+    is_open(file).then_some(file)
 }
 
 /// Adds `text` to the log; false if there is no log or it took less.

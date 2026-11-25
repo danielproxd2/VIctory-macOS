@@ -1,5 +1,6 @@
 # A stand-in for a title's executable, used by victory-loader's integration
-# tests (crates/victory-loader/tests/load_exe.rs). It has its own entry
+# tests (crates/victory-loader/tests/load_exe.rs) and by the tests of
+# `victory run` (apps/victory/tests/run.rs). It has its own entry
 # point, static TLS it reaches the way an executable does, and imports from
 # a DLL that does not exist on a PC, so it only runs through victory-loader.
 [package]
