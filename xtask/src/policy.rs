@@ -56,8 +56,8 @@ const EXCEPTIONS: &[Exception] = &[
     Exception {
         path: "crates/victory-gpu/src/clamp_bytecode.rs",
         reason: "our own clamp.hlsl compiled by Microsoft's compilers, which Wine cannot run; written by `cargo xtask embed-clamp`, which prints this entry's numbers",
-        len: 40191,
-        fnv: 0xc6be13f15270dfea,
+        len: 49067,
+        fnv: 0xfa974a25879aa281,
     },
 ];
 
