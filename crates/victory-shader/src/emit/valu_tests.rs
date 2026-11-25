@@ -310,7 +310,8 @@ fn max_and_min_order_negative_zero_below_positive_zero() {
     ];
     // Under D3DMetal a -0 input reaches the shader as +0 (Apple's shader
     // converter or Metal's fast math), so the minimums cannot be checked
-    // there. docs/macos.md lists this as an open difference.
+    // there: each is left out with a skip line, so that a run shows it.
+    // docs/macos.md lists this as an open difference.
     use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
     // SAFETY: ntdll is always loaded; both names end with a NUL.
     let wine = unsafe {
@@ -322,6 +323,9 @@ fn max_and_min_order_negative_zero_below_positive_zero() {
     .is_some();
     for (name, op, want) in ops {
         if wine && want == nz {
+            crate::testing::skip(&format!(
+                "{name}: under Wine a -0 input reaches the shader as +0"
+            ));
             continue;
         }
         let shader = build_valu_cs(&vop3(op, 0, vgpr(1), vgpr(2), vgpr(3)));
