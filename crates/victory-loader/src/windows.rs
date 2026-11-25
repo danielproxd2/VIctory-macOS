@@ -230,15 +230,48 @@ impl ImportResolver for WithTitleDlls<'_> {
     }
 }
 
+/// Puts `bytes` at `path`, where another process of ours may be putting
+/// the same bytes at the same moment (the name says what is in the file),
+/// or may have the file mapped already.
 fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<()> {
-    if std::fs::read(path).is_ok_and(|existing| existing == bytes) {
+    let there = || std::fs::read(path).is_ok_and(|existing| existing == bytes);
+    if there() {
         return Ok(());
     }
-    let tmp = path.with_extension("tmp");
+    // Written under a name no other writer has, then renamed, so that the
+    // file at `path` is whole at every moment: two writers that shared one
+    // temporary file wrote into each other's, and one of them then renamed
+    // a file the other was still writing.
+    static WRITES: AtomicU64 = AtomicU64::new(0);
+    let unique = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("{}-{unique}.tmp", std::process::id()));
     std::fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("renaming to {}", path.display()))?;
-    Ok(())
+    // A file that is open or mapped elsewhere may refuse to be replaced.
+    // That is no failure once it holds these bytes, and a reader that was
+    // comparing it is gone a moment later.
+    let mut tries = 0;
+    let renamed = loop {
+        match std::fs::rename(&tmp, path) {
+            Err(_) if there() => {
+                let _ = std::fs::remove_file(&tmp);
+                break Ok(());
+            }
+            Err(_) if tries < RENAME_TRIES => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(&tmp);
+                break Err(error);
+            }
+            Ok(()) => break Ok(()),
+        }
+    };
+    renamed.with_context(|| format!("renaming to {}", path.display()))
 }
+
+/// How often [`write_if_changed`] tries again to replace a file in use.
+const RENAME_TRIES: u32 = 20;
 
 impl LoadedImage {
     pub fn base(&self) -> usize {
@@ -491,5 +524,126 @@ impl LoadedImage {
         crate::threads::unmapped(self.base());
         // SAFETY: guaranteed by the caller.
         unsafe { FreeLibrary(self.module) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    /// How many files the two writers of the test below write, and how far
+    /// apart in time.
+    const ROUNDS: u64 = 8;
+    const ROUND: Duration = Duration::from_millis(100);
+
+    /// What an image file holds here: 4 MiB written by a rule, so that a
+    /// file that is not whole is seen.
+    fn contents() -> Vec<u8> {
+        (0..4u32 << 20).map(|i| (i ^ (i >> 11)) as u8).collect()
+    }
+
+    fn round_file(dir: &Path, round: u64) -> PathBuf {
+        dir.join(format!("victory-image-{round:016x}.dll"))
+    }
+
+    /// In a child process of the next test: writes each round's file at the
+    /// moment the round starts, and says how it went.
+    #[test]
+    fn write_child() {
+        let (Some(dir), Some(start)) = (
+            std::env::var_os("VICTORY_WRITE_CHILD"),
+            std::env::var("VICTORY_WRITE_START").ok(),
+        ) else {
+            return;
+        };
+        let start = UNIX_EPOCH + Duration::from_millis(start.parse().unwrap());
+        let bytes = contents();
+        println!();
+        for round in 0..ROUNDS {
+            let at = start + ROUND * round as u32;
+            while SystemTime::now() < at {
+                std::thread::yield_now();
+            }
+            match write_if_changed(&round_file(Path::new(&dir), round), &bytes) {
+                Ok(()) => println!("round {round}: written"),
+                Err(error) => println!("round {round}: FAILED {error:#}"),
+            }
+        }
+    }
+
+    /// Two processes that put the same image at the same place at the same
+    /// time (two runs of one title) both succeed, and the file is whole.
+    #[test]
+    fn concurrent_writers_leave_a_whole_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // What a run that was cut short left behind.
+        for round in 0..ROUNDS {
+            std::fs::write(round_file(dir.path(), round), b"cut short").unwrap();
+        }
+        // Late enough for both children to be running.
+        let start = SystemTime::now() + Duration::from_secs(3);
+        let start = start.duration_since(UNIX_EPOCH).unwrap().as_millis();
+        let child = || {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "windows::tests::write_child", "--nocapture"])
+                .env("VICTORY_WRITE_CHILD", dir.path())
+                .env("VICTORY_WRITE_START", start.to_string())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        };
+        let children = [child(), child()];
+        let bytes = contents();
+        for child in children {
+            let out = child.wait_with_output().unwrap();
+            let text = String::from_utf8_lossy(&out.stdout);
+            let written: Vec<_> = text.lines().filter(|l| l.starts_with("round ")).collect();
+            let expected: Vec<_> = (0..ROUNDS)
+                .map(|round| format!("round {round}: written"))
+                .collect();
+            assert_eq!(written, expected, "{text}");
+            assert!(out.status.success(), "{text}");
+        }
+        for round in 0..ROUNDS {
+            let file = std::fs::read(round_file(dir.path(), round)).unwrap();
+            assert!(file == bytes, "round {round}: {} bytes", file.len());
+        }
+        // Nothing is left beside the files themselves.
+        let mut left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        let mut files: Vec<_> = (0..ROUNDS)
+            .map(|round| format!("victory-image-{round:016x}.dll"))
+            .collect();
+        files.sort();
+        assert_eq!(left, files);
+    }
+
+    /// A file that already holds the bytes is left as it is, and one that
+    /// holds others is replaced.
+    #[test]
+    fn write_if_changed_replaces_only_other_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.dll");
+        write_if_changed(&path, b"first").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+        let written = std::fs::metadata(&path).unwrap().modified().unwrap();
+        write_if_changed(&path, b"first").unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            written
+        );
+        write_if_changed(&path, b"second").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, ["image.dll"]);
     }
 }
