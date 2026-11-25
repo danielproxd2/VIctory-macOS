@@ -121,6 +121,31 @@ pub(crate) fn dropped_draws() -> u64 {
     DROPPED.load(Ordering::Relaxed)
 }
 
+/// The most render targets set at once: public D3D12's limit
+/// (`D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT`).
+pub(crate) const TARGETS: usize = 8;
+
+/// State calls refused for a count of the title's past what D3D12 has
+/// ([`TARGETS`]): nothing of such a call is read or reaches
+/// the host, and the state it would have set stays as it was.
+static REFUSED: AtomicU64 = AtomicU64::new(0);
+
+/// Counts a refused state call and says so (each power of two).
+/// shortcut: whether the console takes more is not known; D3D12 on the
+/// host does not, and the count would size what we read.
+pub(crate) fn refuse_state(what: &'static str, count: usize) {
+    let n = REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::warn!(what, count, refused = n, "more than D3D12 has; ignored");
+    }
+}
+
+/// State calls refused so far.
+#[cfg(test)]
+pub(crate) fn refused_state() -> u64 {
+    REFUSED.load(Ordering::Relaxed)
+}
+
 /// Marks the last traced draw as not run on the host.
 #[cfg(feature = "diagnostics")]
 fn dropped(pipeline: usize) {
@@ -324,8 +349,14 @@ impl State {
         self.index = view.copied().unwrap_or_default();
     }
 
-    /// Render targets and depth, set on the host list at once.
+    /// Render targets and depth, set on the host list at once. More
+    /// targets than D3D12 has ([`TARGETS`]) are refused: the count goes to
+    /// the host with the views, and the targets stay as they were.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
+        if handles.len() > TARGETS {
+            refuse_state("render targets", handles.len());
+            return;
+        }
         let Some(host) = crate::host::host() else {
             return;
         };

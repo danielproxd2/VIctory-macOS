@@ -1055,8 +1055,31 @@ mod state {
             }
         });
     }
-    /// `(count, handles, one range, depth)`: with one range, the handles
-    /// follow the first at the render target view size (128 bytes).
+    /// The handles of the `count` render targets of an OMSetRenderTargets
+    /// call: with one range they follow the first at the render target
+    /// view size (128 bytes). The count is the title's and sizes what is
+    /// read and kept, so `None` for more targets than D3D12 has, before
+    /// anything is read, and for a range that runs past the last address.
+    pub(super) fn target_handles(
+        count: u32,
+        handles: *const u64,
+        one_range: bool,
+    ) -> Option<Vec<u64>> {
+        if count as usize > crate::draw::TARGETS {
+            return None;
+        }
+        if !one_range || handles.is_null() || count == 0 {
+            return Some(items(handles, count).to_vec());
+        }
+        // SAFETY: the title passes the first handle.
+        let first = unsafe { *handles };
+        (0..u64::from(count))
+            .map(|i| first.checked_add(128 * i))
+            .collect()
+    }
+
+    /// `(count, handles, one range, depth)`. A count D3D12 does not have
+    /// is a refused call: the targets stay as they were.
     pub(super) extern "system" fn targets(
         this: This,
         count: u32,
@@ -1064,12 +1087,9 @@ mod state {
         one_range: i32,
         depth: *const u64,
     ) {
-        let handles: Vec<u64> = if one_range != 0 && !handles.is_null() {
-            // SAFETY: the title passes the first handle.
-            let first = unsafe { *handles };
-            (0..u64::from(count)).map(|i| first + 128 * i).collect()
-        } else {
-            items(handles, count).to_vec()
+        let Some(handles) = target_handles(count, handles, one_range != 0) else {
+            crate::draw::refuse_state("render targets", count as usize);
+            return;
         };
         // SAFETY: the title passes a handle or null.
         let depth = unsafe { depth.as_ref() }.copied().unwrap_or(0);
@@ -1600,6 +1620,74 @@ mod tests {
         dispatch(list, 1, 0x1_0000, 0x1_0000);
         dispatch(list, 1, u32::MAX, u32::MAX);
         assert_eq!(crate::draw::dropped_draws(), before + 2);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    /// The title's render target count sizes what is read and kept and
+    /// goes to the host: more targets than D3D12 has (8), or a range of
+    /// handles that runs past the last address, is a refused call, counted
+    /// and without a host call. (The sum used to be unchecked: a panic
+    /// with overflow checks, a wrapped handle without; and the count
+    /// sized a vector, of 32 GiB for the largest.)
+    #[cfg(windows)]
+    #[test]
+    fn render_targets_past_the_d3d12_limit_are_refused() {
+        use state::target_handles;
+        let handles: [u64; 9] = std::array::from_fn(|i| 0x1000 * (i as u64 + 1));
+        assert_eq!(
+            target_handles(8, handles.as_ptr(), false),
+            Some(handles[..8].to_vec())
+        );
+        assert_eq!(target_handles(9, handles.as_ptr(), false), None);
+        assert_eq!(target_handles(u32::MAX, handles.as_ptr(), false), None);
+        // One range: the handles follow the first.
+        assert_eq!(
+            target_handles(3, handles.as_ptr(), true),
+            Some(vec![0x1000, 0x1080, 0x1100])
+        );
+        assert_eq!(
+            target_handles(8, handles.as_ptr(), true).map(|h| h.len()),
+            Some(8)
+        );
+        assert_eq!(target_handles(9, handles.as_ptr(), true), None);
+        assert_eq!(target_handles(u32::MAX, handles.as_ptr(), true), None);
+        // A range from near the last address: two handles fit, not three.
+        let last = [u64::MAX - 200];
+        assert_eq!(
+            target_handles(2, last.as_ptr(), true),
+            Some(vec![u64::MAX - 200, u64::MAX - 72])
+        );
+        assert_eq!(target_handles(3, last.as_ptr(), true), None);
+        // No targets, or no handles: nothing is read.
+        let dangling = std::ptr::NonNull::<u64>::dangling().as_ptr();
+        assert_eq!(target_handles(0, dangling, true), Some(Vec::new()));
+        assert_eq!(target_handles(4, std::ptr::null(), true), Some(Vec::new()));
+
+        // Through the list's method (0x190) and the draw state.
+        let Some(_gpu) = crate::testing::gpu() else {
+            return;
+        };
+        let (allocator, list) = new_list();
+        type Targets = extern "system" fn(This, u32, *const u64, i32, *const u64);
+        let targets = crate::testing::list_slot::<Targets>(list, 0x190);
+        let null = std::ptr::null();
+        let before = crate::draw::refused_state();
+        targets(list, 9, handles.as_ptr(), 0, null);
+        targets(list, u32::MAX, handles.as_ptr(), 1, null);
+        targets(list, 3, last.as_ptr(), 1, null);
+        assert_eq!(crate::draw::refused_state(), before + 3);
+        // Eight targets are taken (null handles: no view, no target).
+        let none = [0u64; 9];
+        targets(list, 8, none.as_ptr(), 0, null);
+        assert_eq!(crate::draw::refused_state(), before + 3);
+        // The draw state refuses a longer list of handles itself.
+        let host = host_list(list).expect("a list of a host device");
+        let mut state = crate::draw::State::default();
+        state.set_targets(host, &none[..8], 0);
+        assert_eq!(crate::draw::refused_state(), before + 3);
+        state.set_targets(host, &none, 0);
+        assert_eq!(crate::draw::refused_state(), before + 4);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
     }
