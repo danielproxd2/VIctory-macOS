@@ -101,6 +101,17 @@ Not counted, so not caught by this rule:
 The size limit and the hex/base64 rule still apply to all of these, and
 review is what stands behind the check.
 
+### Hex literals in a row
+
+A second check, from upstream, counts hex digits and not literals. A file
+may hold no more than 512 hex digits in one run of `\xNN` escapes or `0x`
+literals. Only commas, backslashes, spaces and line breaks carry a run on;
+underscores and a type suffix (`0x4du8`) are part of the literal. Anything
+else, a bracket included, starts a new run. So one row of 257 bytes
+written as `0x4d, 0x5a, ...` fails, as does one of 65 `u32` words of eight
+digits, well below the 1024 literals of the rule above. A table written in
+hex stays under both limits; a decimal list is seen by the rule above only.
+
 ## If something slips through
 
 A follow-up commit is not enough. Rewrite history

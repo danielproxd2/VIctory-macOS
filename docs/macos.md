@@ -96,6 +96,17 @@ Later work replaces the Windows host underneath the title. That needs a Rosetta 
 
 Run `./setup.sh` from the top of the repository. It checks the Mac, installs the Homebrew tools, builds checksum-verified x86_64 GMP, Nettle, GnuTLS and FreeType, builds CrossOver Wine, adds D3DMetal from the Game Porting Toolkit in Downloads, and builds VIctory. The only manual step is downloading the toolkit from Apple. A clean run on an M4 on 24 November 2026 finished without help, and the full suite then passed (343 passed, 0 failed).
 
+## After merging upstream, 24 November 2026
+
+Upstream VIctory (`940d32f`) was merged into this port. What follows is what the merge changed for a Mac, measured on an M5 (macOS 27.0 beta) with the CrossOver Wine build.
+
+- `victory run --execute` now checks the CPU for AVX2 before it starts a title, and refuses with "this CPU does not support AVX2" where it is missing. Under Rosetta 2 a process sees AVX2 only if it was started with `ROSETTA_ADVERTISE_AVX=1`. Without the variable the check refuses, and nine tests of `apps/victory/tests/run.rs` failed on it; with it the check passes and the stand-in title runs. `tools/macos/victory.sh` already set the variable for the title's own sake, and `tools/macos/test-wine.sh` now sets it too unless the caller has set it, so the tests go through the check as a real run does. `VICTORY_SKIP_CPU_CHECK=1` turns the check off; neither script sets it, and a Mac does not need it.
+- A build that `victory run` knows by its hash needs its startup archive beside the executable (`appdata0.rpf` for Series 1.0.2.1). With `--execute` the file must be readable and start with the four bytes of an RPF9 header, or the run ends with "Cannot read startup archive" or "Invalid RPF9 header" before the title is mapped. The stand-in title of the tests is no known build ("build unknown" in its report), so the tests need no such file; the check itself is tested on files of a few bytes that the test writes.
+- `victory run --execute` no longer starts a title when a DLL it imports is neither in its folder, nor the host's, nor VIctory's: it names the DLLs and stops, and `--unimplemented zero` runs it anyway. `--strict` takes nothing from the host, so `--strict --execute` now stops there for any title that imports a host DLL. The test of the first call of a missing import therefore puts stand-in DLLs that export nothing into the title's folder.
+- `victory translate --cache` fills the shader cache `run` reads, and with `--pipelines` the pipeline library from the title's shader pack. Both need the Windows build, so on a Mac they run under Wine (`tools/macos/victory.sh translate --cache ...`); the native build refuses them by name.
+- `victory shader-info --effects` lists the effects of shader databases, and `shader-info` lists shader packs. Both run natively.
+- `VICTORY_FIDELITYFX_DIR`, or `fidelityfx_dir` under `[paths]` in the config file, names a folder with the PC FidelityFX DLLs. `victory config` shows it. It has not been tried under D3DMetal.
+
 ## Open differences under D3DMetal
 
 None is known in the shader tests. Measured on 24 November 2026 on an M5, macOS 27.0 beta (26A5406e), D3DMetal 4.0 beta 3, with the proving command of "The DXIL validator" above.
