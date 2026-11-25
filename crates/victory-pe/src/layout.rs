@@ -50,6 +50,12 @@ pub mod file_flags {
     pub const DLL: u16 = 0x2000;
 }
 
+/// `IMAGE_SECTION_HEADER::Characteristics` flags.
+pub mod section_flags {
+    /// `IMAGE_SCN_MEM_EXECUTE`: the section is mapped executable.
+    pub const MEM_EXECUTE: u32 = 0x2000_0000;
+}
+
 /// `IMAGE_OPTIONAL_HEADER64::DllCharacteristics` flags.
 pub mod dll_flags {
     pub const HIGH_ENTROPY_VA: u16 = 0x0020;

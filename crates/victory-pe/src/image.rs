@@ -119,7 +119,8 @@ impl CodeViewInfo {
     }
 }
 
-/// Upper bound on TLS callbacks we are willing to walk (defends against garbage).
+/// Upper bound on TLS callbacks we are willing to walk (defends against
+/// garbage). An array with more is refused, not cut short.
 const MAX_TLS_CALLBACKS: usize = 1024;
 
 impl ImageInfo {
@@ -143,7 +144,7 @@ impl ImageInfo {
             )));
         }
 
-        let sections = file
+        let sections: Vec<SectionInfo> = file
             .section_table()
             .iter()
             .map(|s| SectionInfo {
@@ -167,7 +168,13 @@ impl ImageInfo {
         };
         let delay_imports = parse_delay_imports(&file, opt.size_of_image())?;
         let exports = parse_exports(&file)?;
-        let tls = parse_tls(&file, data, opt.image_base())?;
+        let tls = parse_tls(
+            &file,
+            data,
+            opt.image_base(),
+            opt.size_of_image(),
+            &sections,
+        )?;
         let codeview = file.pdb_info()?.map(|cv| CodeViewInfo {
             pdb_path: String::from_utf8_lossy(cv.path()).into_owned(),
             guid: cv.guid(),
@@ -238,6 +245,24 @@ impl ImageInfo {
 
 fn has_flag(value: u16, flag: u16) -> bool {
     value & flag != 0
+}
+
+/// Whether the image may run code at `rva`: the address is inside the image
+/// and inside a section that is mapped executable. Addresses from the
+/// headers that we later call are checked with this, so a damaged header is
+/// an error with a cause and not a jump to a wild address.
+fn is_code(sections: &[SectionInfo], size_of_image: u32, rva: u32) -> bool {
+    rva < size_of_image
+        && sections.iter().any(|s| {
+            // As in `rva_to_file_offset`: without a virtual size, the raw
+            // size is the section's size.
+            let size = match s.virtual_size {
+                0 => s.file_size,
+                vs => vs,
+            };
+            s.characteristics & layout::section_flags::MEM_EXECUTE != 0
+                && rva.checked_sub(s.rva).is_some_and(|delta| delta < size)
+        })
 }
 
 fn utf8(bytes: &[u8]) -> String {
@@ -365,6 +390,8 @@ fn parse_tls(
     file: &PeFile64<'_>,
     data: &[u8],
     image_base: u64,
+    size_of_image: u32,
+    image_sections: &[SectionInfo],
 ) -> Result<Option<TlsInfo>, PeError> {
     let Some(dd) = file.data_directory(pe::IMAGE_DIRECTORY_ENTRY_TLS) else {
         return Ok(None);
@@ -382,16 +409,53 @@ fn parse_tls(
 
     let mut callback_rvas = Vec::new();
     if callbacks_va != 0 {
+        let outside = || PeError::Malformed("TLS callback array outside of sections".into());
         let array_rva = va_to_rva(callbacks_va, image_base)?;
-        let array = sections
-            .pe_data_at(data, array_rva)
-            .ok_or_else(|| PeError::Malformed("TLS callback array outside of sections".into()))?;
-        for slot in array.as_chunks::<8>().0.iter().take(MAX_TLS_CALLBACKS) {
-            let va = u64::from_le_bytes(*slot);
+        let section = sections
+            .iter()
+            .find(|s| s.pe_file_range_at(array_rva).is_some())
+            .ok_or_else(outside)?;
+        // The array's bytes in the file, up to the end of its section.
+        let array = section.pe_data_at(data, array_rva).ok_or_else(outside)?;
+        // What the section holds in memory from the array on. Past the file
+        // data that is zero fill, which may be the array's terminator.
+        let in_memory = section
+            .virtual_size
+            .get(LE)
+            .saturating_sub(array_rva.saturating_sub(section.virtual_address.get(LE)));
+        // Every exit of the loop is a terminator or an error: a list is
+        // never cut short, because the callbacks after the cut would
+        // silently not run.
+        for start in (0usize..).step_by(8) {
+            let in_section = u32::try_from(start)
+                .ok()
+                .and_then(|start| start.checked_add(8))
+                .is_some_and(|end| end <= in_memory);
+            if !in_section {
+                return Err(PeError::Malformed(
+                    "TLS callback array has no null terminator in its section".into(),
+                ));
+            }
+            let mut slot = [0u8; 8];
+            let file = array.get(start..).unwrap_or(&[]);
+            let backed = file.len().min(8);
+            slot[..backed].copy_from_slice(&file[..backed]);
+            let va = u64::from_le_bytes(slot);
             if va == 0 {
                 break;
             }
-            callback_rvas.push(va_to_rva(va, image_base)?);
+            if callback_rvas.len() == MAX_TLS_CALLBACKS {
+                return Err(PeError::Malformed(format!(
+                    "more than {MAX_TLS_CALLBACKS} TLS callbacks"
+                )));
+            }
+            let rva = va_to_rva(va, image_base)?;
+            if !is_code(image_sections, size_of_image, rva) {
+                return Err(PeError::Malformed(format!(
+                    "TLS callback at {rva:#x} is not in an executable section"
+                )));
+            }
+            callback_rvas.push(rva);
         }
     }
     Ok(Some(TlsInfo {
@@ -617,7 +681,7 @@ mod tests {
 
     #[test]
     fn rejects_tls_callbacks_below_the_image_base() {
-        let built = PeBuilder::new().tls_callbacks(&[0x1000]).build().unwrap();
+        let built = code().tls_callbacks(&[0x1000]).build().unwrap();
         let mut data = built.bytes;
         let info = ImageInfo::parse(&data).unwrap();
         let tls = info.tls.as_ref().unwrap();
@@ -628,6 +692,122 @@ mod tests {
             ImageInfo::parse(&data),
             Err(PeError::Malformed(_))
         ));
+    }
+
+    /// `.text` at RVA 0x1000 and `.data` at 0x2000, 0x40 bytes each.
+    fn code() -> PeBuilder {
+        PeBuilder::new()
+            .section(".text", scn::CODE, &[0xC3; 0x40])
+            .section(".data", scn::DATA, &[1; 0x40])
+    }
+
+    #[test]
+    fn rejects_tls_callback_outside_image() {
+        let ok = code().tls_callbacks(&[0x1000, 0x103F]).build().unwrap();
+        let info = ImageInfo::parse(&ok.bytes).unwrap();
+        assert_eq!(info.tls.unwrap().callback_rvas, [0x1000, 0x103F]);
+        let size_of_image = info.size_of_image;
+        // Past the end of the image, at its very end, and in the gap
+        // between `.text`'s last byte and the next section.
+        for rva in [0x10_0000, size_of_image, 0x1040, 0x1FFF] {
+            let data = code().tls_callbacks(&[0x1000, rva]).build().unwrap().bytes;
+            let why = malformed(ImageInfo::parse(&data));
+            assert_eq!(
+                why,
+                format!("TLS callback at {rva:#x} is not in an executable section")
+            );
+        }
+        // An executable section whose header reaches past SizeOfImage does
+        // not make an address out there part of the image.
+        let mut data = code()
+            .tls_callbacks(&[0x1000, size_of_image + 8])
+            .build()
+            .unwrap()
+            .bytes;
+        let text = crate::testing::section_header_offset(&data, 0).unwrap();
+        data[text + 8..text + 12].copy_from_slice(&0x10_0000u32.to_le_bytes());
+        let why = malformed(ImageInfo::parse(&data));
+        assert!(why.contains("not in an executable section"), "{why}");
+    }
+
+    #[test]
+    fn rejects_tls_callback_in_data_section() {
+        // `.data` is mapped, but not executable.
+        let data = code()
+            .tls_callbacks(&[0x1000, 0x2010])
+            .build()
+            .unwrap()
+            .bytes;
+        let why = malformed(ImageInfo::parse(&data));
+        assert_eq!(
+            why,
+            "TLS callback at 0x2010 is not in an executable section"
+        );
+        // The headers are not a section at all.
+        let data = code().tls_callbacks(&[0x80]).build().unwrap().bytes;
+        let why = malformed(ImageInfo::parse(&data));
+        assert_eq!(why, "TLS callback at 0x80 is not in an executable section");
+    }
+
+    #[test]
+    fn rejects_1025_tls_callbacks() {
+        let most = vec![0x1000u32; MAX_TLS_CALLBACKS];
+        let data = code().tls_callbacks(&most).build().unwrap().bytes;
+        let tls = ImageInfo::parse(&data).unwrap().tls.unwrap();
+        assert_eq!(tls.callback_rvas, most);
+        // One more used to be dropped without a word.
+        let one_more = vec![0x1000u32; MAX_TLS_CALLBACKS + 1];
+        let data = code().tls_callbacks(&one_more).build().unwrap().bytes;
+        let why = malformed(ImageInfo::parse(&data));
+        assert_eq!(why, "more than 1024 TLS callbacks");
+    }
+
+    #[test]
+    fn rejects_unterminated_tls_callbacks() {
+        let built = code().tls_callbacks(&[0x1000, 0x1020]).build().unwrap();
+        let info = ImageInfo::parse(&built.bytes).unwrap();
+        let array = built.tls_callbacks_rva.unwrap();
+        let terminator = info.rva_to_file_offset(array).unwrap() as usize + 16;
+        assert_eq!(layout::read_u64(&built.bytes, terminator), Some(0));
+        // The `.tls` section is the third; the array is the last thing in
+        // it, so its terminator is the section's last 8 bytes.
+        let header = crate::testing::section_header_offset(&built.bytes, 2).unwrap();
+        let virtual_size = layout::read_u32(&built.bytes, header + 8).unwrap();
+        assert_eq!(array + 24, info.sections[2].rva + virtual_size);
+
+        // A callback where the terminator was: the array runs into the end
+        // of its section. It used to be read as three callbacks.
+        let mut data = built.bytes.clone();
+        let callback = (info.image_base + 0x1000).to_le_bytes();
+        data[terminator..terminator + 8].copy_from_slice(&callback);
+        let why = malformed(ImageInfo::parse(&data));
+        assert_eq!(
+            why,
+            "TLS callback array has no null terminator in its section"
+        );
+        // The same when the section ends in the middle of a slot.
+        let mut data = built.bytes.clone();
+        data[header + 8..header + 12].copy_from_slice(&(virtual_size - 4).to_le_bytes());
+        let why = malformed(ImageInfo::parse(&data));
+        assert_eq!(
+            why,
+            "TLS callback array has no null terminator in its section"
+        );
+
+        // A terminator that is not in the file but in the section's zero
+        // fill is a terminator: the raw data ends after the second callback.
+        let mut data = built.bytes.clone();
+        data[terminator..terminator + 8].copy_from_slice(&callback);
+        data[header + 16..header + 20].copy_from_slice(&(virtual_size - 8).to_le_bytes());
+        let tls = ImageInfo::parse(&data).unwrap().tls.unwrap();
+        assert_eq!(tls.callback_rvas, [0x1000, 0x1020]);
+        // Raw data that ends inside a slot: the rest of the slot is zero.
+        // The one byte of the third slot that is left is the 0x00 its
+        // callback address starts with.
+        assert_eq!(callback[0], 0);
+        data[header + 16..header + 20].copy_from_slice(&(virtual_size - 7).to_le_bytes());
+        let tls = ImageInfo::parse(&data).unwrap().tls.unwrap();
+        assert_eq!(tls.callback_rvas, [0x1000, 0x1020]);
     }
 
     #[test]
