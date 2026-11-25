@@ -370,8 +370,17 @@ mod tests {
             }
         }
         cache.get_or_convert(&Junk, &input).unwrap();
+        // The junk is what the shader's key holds now (Junk's id and
+        // version are the translator's): the next lookup is a hit that
+        // does not decode, not a plain miss, which would count the same.
+        assert_eq!(CacheKey::new(&Junk, &input).to_hex(), key.to_hex());
+        assert_eq!(
+            cache.read(&key).as_deref(),
+            Some(&b"VSH1 whole, but not a shader"[..])
+        );
         assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 5);
+        assert_eq!(cache.read(&key), Some(encode(&shader())));
         assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 5);
 
