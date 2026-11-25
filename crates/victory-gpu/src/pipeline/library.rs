@@ -750,6 +750,24 @@ mod tests {
         assert_eq!(unseal(b"short".to_vec()), None);
     }
 
+    /// The pre-build's list is saved beside the sealed file but tagged
+    /// with the library's own bytes, as upstream tags it: what a save
+    /// writes holds for what the next start reads back out of the seal,
+    /// and not for the file's bytes. A library file without the mark (one
+    /// that a build without it wrote) is refused whole, so the library
+    /// starts empty and the list beside it is not used.
+    #[test]
+    fn the_prebuilt_list_holds_for_the_library_inside_the_seal() {
+        let blob = b"library bytes".to_vec();
+        let keys: HashSet<String> = ["one".to_owned(), "two".to_owned()].into();
+        let saved = list(&tag(&blob), &keys);
+        let file = seal(&blob);
+        let read = unseal(file.clone()).expect("a sealed file");
+        assert_eq!(listed(saved.as_bytes(), &tag(&read)), keys);
+        assert!(listed(saved.as_bytes(), &tag(&file)).is_empty());
+        assert_eq!(unseal(blob), None);
+    }
+
     /// A save without a cache folder must not open the library (and with
     /// it the host device): `pipeline::make`'s workers save after every
     /// pipeline, on their own threads, whatever test or title queued it.
