@@ -33,6 +33,9 @@ mod threads;
 mod thunks;
 #[cfg(windows)]
 mod tls;
+// Used on Windows only; built everywhere, so that its tests run on every host.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod tls_scan;
 #[cfg(windows)]
 mod windows;
 
