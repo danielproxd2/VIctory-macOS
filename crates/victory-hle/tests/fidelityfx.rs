@@ -1,7 +1,14 @@
 //! The host's FidelityFX through our entry points, called as Grand Theft
 //! Auto VI calls the console's: the title's descriptions, console objects,
 //! one upscaling of a flat colour, the output read back. Needs the PC build
-//! (`VICTORY_FIDELITYFX_DIR`) and a host GPU; skipped without them.
+//! (`VICTORY_FIDELITYFX_DIR`, a folder holding the PC FidelityFX SDK's
+//! `amd_fidelityfx_upscaler_dx12.dll` with an upscaler for the host GPU)
+//! and a host GPU. Without either the test passes after one line
+//! `skipped: <reason> (<test>)` on the process's own standard error, past
+//! the harness's capture, as the other tests' skips are; a run that is
+//! meant to prove the path sets `VICTORY_REQUIRE_FIDELITYFX=1` (the
+//! folder) and `VICTORY_REQUIRE_GPU=1` (the device), which make the lack
+//! a failure.
 #![cfg(windows)]
 
 use std::ffi::c_void;
@@ -155,10 +162,61 @@ fn half(bits: u16) -> f32 {
     if sign == 1 { -value } else { value }
 }
 
+/// What a test does that lacks something (`reason`): the line it prints
+/// before it passes, or, where the switch `var` is on in this run (its
+/// value is `value`; only `1` is on), the message it fails with.
+fn unmet(var: &str, value: Option<&str>, reason: &str, test: &str) -> Result<String, String> {
+    if value.is_some_and(|v| v.trim() == "1") {
+        Err(format!("{var}=1: {reason} ({test})"))
+    } else {
+        Ok(format!("skipped: {reason} ({test})"))
+    }
+}
+
+/// Fails the running test if the switch `var` is on; else prints its skip
+/// line to the process's own standard error, which the harness does not
+/// capture (what a passing test prints with `eprintln!` is shown to no
+/// one).
+fn skip_unless_required(var: &str, reason: &str) {
+    use std::io::Write;
+    let thread = std::thread::current();
+    let test = thread.name().unwrap_or("?");
+    match unmet(var, std::env::var(var).ok().as_deref(), reason, test) {
+        Ok(line) => {
+            let _ = writeln!(std::io::stderr(), "{line}");
+        }
+        Err(why) => panic!("{why}"),
+    }
+}
+
+/// A lack is the uniform skip line naming the reason and the test, and a
+/// failure naming the switch only when the switch is exactly `1`.
+#[test]
+fn a_lack_skips_visibly_or_fails_as_the_run_requires() {
+    let var = "VICTORY_REQUIRE_FIDELITYFX";
+    for off in [None, Some(""), Some("0"), Some("true"), Some("11")] {
+        assert_eq!(
+            unmet(var, off, "no folder", "a_test"),
+            Ok("skipped: no folder (a_test)".into()),
+            "{off:?}"
+        );
+    }
+    for on in ["1", " 1\n"] {
+        assert_eq!(
+            unmet(var, Some(on), "no folder", "a_test"),
+            Err("VICTORY_REQUIRE_FIDELITYFX=1: no folder (a_test)".into())
+        );
+    }
+}
+
 #[test]
 fn the_titles_upscaler_runs_on_the_host() {
-    let Some(dir) = std::env::var_os("VICTORY_FIDELITYFX_DIR") else {
-        eprintln!("VICTORY_FIDELITYFX_DIR not set; skipped");
+    // An empty value is no folder, as an unset one.
+    let Some(dir) = std::env::var_os("VICTORY_FIDELITYFX_DIR").filter(|d| !d.is_empty()) else {
+        skip_unless_required(
+            "VICTORY_REQUIRE_FIDELITYFX",
+            "no PC FidelityFX folder (VICTORY_FIDELITYFX_DIR is not set)",
+        );
         return;
     };
     // The debug layer, before anything makes the host device: it checks
@@ -172,7 +230,7 @@ fn the_titles_upscaler_runs_on_the_host() {
     }
     victory_hle::modules::fidelityfx::use_host_dir(Some(std::path::Path::new(&dir)));
     let Some(host) = victory_gpu::external::host_device() else {
-        eprintln!("no host GPU; skipped");
+        skip_unless_required("VICTORY_REQUIRE_GPU", "no host D3D12 device");
         return;
     };
 
