@@ -229,10 +229,14 @@ pub(crate) fn failure(dll: &str, name: &str) -> (ThreadError, i64) {
             let invalid = starts("CreateFile")
                 || starts("FindFirstFile")
                 || matches!(name, "GetFileAttributesW" | "GetFileAttributesA");
-            (
-                ThreadError::Win32(ERROR_PROC_NOT_FOUND),
-                if invalid { -1 } else { 0 },
-            )
+            let value = match name {
+                // Returns an `HRESULT`, for which 0 would say it worked:
+                // `HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND)`.
+                "CopyFile2" => i64::from(0x8007_007F_u32 as i32),
+                _ if invalid => -1,
+                _ => 0,
+            };
+            (ThreadError::Win32(ERROR_PROC_NOT_FOUND), value)
         }
     }
 }
@@ -252,6 +256,13 @@ impl Answer for () {
 impl Answer for i32 {
     fn answer(value: i64) -> i32 {
         value as i32
+    }
+}
+
+#[cfg(windows)]
+impl Answer for isize {
+    fn answer(value: i64) -> isize {
+        value as isize
     }
 }
 
@@ -543,6 +554,12 @@ mod tests {
         assert_eq!(failure("kernel32.dll", "FindFirstFileExW"), (win32, -1));
         assert_eq!(failure("kernel32.dll", "GetFileAttributesA"), (win32, -1));
         assert_eq!(failure("kernel32.dll", "GetFileAttributesExW"), (win32, 0));
+        assert_eq!(failure("kernel32.dll", "GetFullPathNameW"), (win32, 0));
+        assert_eq!(failure("kernel32.dll", "FindFirstFileExA"), (win32, -1));
+        // An `HRESULT`: never 0, which would say the copy was made.
+        let not_found = i64::from(0x8007_007F_u32 as i32);
+        assert_eq!(failure("kernel32.dll", "CopyFile2"), (win32, not_found));
+        assert!(not_found < 0, "a failure HRESULT");
         assert_eq!(failure("winhttp.dll", "WinHttpOpen"), (win32, 0));
         assert_eq!(failure("advapi32.dll", "RegOpenKeyExW"), (win32, 127));
         assert_eq!(failure("iphlpapi.dll", "IcmpSendEcho"), (win32, 0));
@@ -575,6 +592,7 @@ mod tests {
 
         let errno = ThreadError::Errno(40);
         assert_eq!(failure("ucrtbase.dll", "_wopen"), (errno, -1));
+        assert_eq!(failure("ucrtbase.dll", "_wfindfirst64"), (errno, -1));
         assert_eq!(failure("ucrtbase.dll", "fclose"), (errno, -1));
         assert_eq!(failure("ucrtbase.dll", "_wfopen"), (errno, 0));
         assert_eq!(failure("ucrtbase.dll", "fread"), (errno, 0));
