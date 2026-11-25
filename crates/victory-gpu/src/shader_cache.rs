@@ -3,7 +3,8 @@
 //! that translated it (the BLAKE3 of our executable), so a rebuilt
 //! translator never serves an old translation. Entries go through
 //! `victory-pipeline`'s content-addressed cache, which writes them
-//! atomically; an entry that does not read back is translated again.
+//! atomically and checks each against its length and hash when it is read;
+//! an entry that does not read back is translated again.
 //!
 //! The entry is our own encoding of [`HostShader`]: a field added to it
 //! must be added to `encode` and `decode` too (entries of older builds
@@ -13,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use victory_pipeline::{Cache, Converter};
+use victory_pipeline::{Cache, CacheKey, Converter};
 use victory_shader::emit::{HostShader, StaticSampler, UserData};
 use victory_shader::{HwStage, RootType};
 
@@ -110,22 +111,25 @@ fn cached(
         translate,
         ran: AtomicBool::new(false),
     };
+    let key = CacheKey::new(&converter, &input);
     for _ in 0..2 {
-        let path = cache
+        // The cache checks the entry against its own header; what comes
+        // back is what was stored.
+        let bytes = cache
             .get_or_convert(&converter, &input)
             .map_err(|e| format!("{e:#}"))?;
-        if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
+        if let Some(shader) = decode(&bytes) {
             let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
                 (&MISSES, "translated and cached")
             } else {
                 (&HITS, "from the cache")
             };
             counter.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(path = %path.display(), "shader {what}");
+            tracing::debug!(key = %key.to_hex(), "shader {what}");
             return Ok(shader);
         }
-        tracing::debug!(path = %path.display(), "unreadable shader cache entry; translating again");
-        let _ = std::fs::remove_file(&path);
+        tracing::debug!(key = %key.to_hex(), "unreadable shader cache entry; translating again");
+        cache.remove(&key);
     }
     MISSES.fetch_add(1, Ordering::Relaxed);
     (converter.translate)(container)
@@ -330,6 +334,46 @@ mod tests {
         assert_eq!(runs.load(Ordering::Relaxed), 3);
         assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 3);
+
+        // So is one bit changed inside the stored translation, which the
+        // shader's own encoding would read back as a different shader.
+        let input = [&build[..], container].concat();
+        let converter = Translate {
+            translate,
+            ran: AtomicBool::new(false),
+        };
+        let key = CacheKey::new(&converter, &input);
+        let entry = cache.path_for(&key);
+        let mut bytes = std::fs::read(&entry).unwrap();
+        let dxil = bytes
+            .windows(4)
+            .position(|w| w == b"DXBC")
+            .expect("the entry holds the shader's bytes");
+        bytes[dxil + 5] ^= 1;
+        std::fs::write(&entry, &bytes).unwrap();
+        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        assert_eq!(runs.load(Ordering::Relaxed), 4, "translated again");
+
+        // An entry that is whole but is not a shader is forgotten and
+        // translated again.
+        cache.remove(&key);
+        struct Junk;
+        impl Converter for Junk {
+            fn id(&self) -> &'static str {
+                "shader.dxil"
+            }
+            fn version(&self) -> u32 {
+                1
+            }
+            fn convert(&self, _: &[u8]) -> anyhow::Result<Vec<u8>> {
+                Ok(b"VSH1 whole, but not a shader".to_vec())
+            }
+        }
+        cache.get_or_convert(&Junk, &input).unwrap();
+        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        assert_eq!(runs.load(Ordering::Relaxed), 5);
+        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        assert_eq!(runs.load(Ordering::Relaxed), 5);
 
         // Failures are not stored.
         let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
