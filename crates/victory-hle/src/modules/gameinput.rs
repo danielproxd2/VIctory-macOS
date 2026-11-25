@@ -151,7 +151,7 @@ pub struct Object {
 
 #[repr(C)]
 pub struct Device {
-    vtable: &'static Table<21>,
+    vtable: &'static Table<22>,
     hub: *const Hub,
     index: usize,
     info: DeviceInfo,
@@ -931,6 +931,41 @@ extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     let speed = |level: f32| (level.clamp(0.0, 1.0) * f32::from(u16::MAX)) as u16;
     lock(&device.hub().source).rumble(device.index, speed(low), speed(high));
 }
+/// `IsForceFeedbackMotorPoweredOn`: "Returns false if the force feedback
+/// motor is not powered on." No device of ours has such a motor (the
+/// info's count is 0), so none is powered.
+extern "system" fn force_feedback_motor_powered_on(_: *const Device, _motor: u32) -> bool {
+    false
+}
+/// `CreateForceFeedbackEffect`: with no motor there is nothing to create
+/// an effect on; a COM out pointer is null on failure.
+extern "system" fn create_force_feedback_effect(
+    _: *const Device,
+    motor: u32,
+    _params: *const c_void,
+    out: Out,
+) -> HRESULT {
+    tracing::warn!(motor, "input force feedback not implemented");
+    fail(out, E_NOTIMPL)
+}
+/// `CreateRawDeviceReport`: raw device access is not implemented; the
+/// report pointer is null on failure.
+extern "system" fn create_raw_report(_: *const Device, id: u32, _kind: u32, out: Out) -> HRESULT {
+    tracing::warn!(id, "raw input device reports not implemented");
+    fail(out, E_NOTIMPL)
+}
+/// `GetRawDeviceFeature`: the report is "Set to `nullptr` on failure".
+extern "system" fn raw_feature(_: *const Device, id: u32, out: Out) -> HRESULT {
+    tracing::warn!(id, "raw input device features not implemented");
+    fail(out, E_NOTIMPL)
+}
+// The remaining device methods are in no page of the current public
+// reference (battery state, haptic motor state, input synchronization,
+// power off, raw output with response, raw I/O control and exclusive raw
+// access were removed after GameInput v0), so nothing establishes what
+// they answer. They write nothing and return `E_NOTIMPL` in the result
+// register, also where the method is declared `void` or `bool`
+// (`device_methods_without_a_documented_answer_write_nothing`).
 extern "system" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
     tracing::warn!(
         slot = format_args!("{SLOT:#x}"),
@@ -939,28 +974,32 @@ extern "system" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
     E_NOTIMPL
 }
 
-static DEVICE: Table<21> = Table([
-    no_interface as *const (),        // 0x00
-    add_ref as *const (),             // 0x08 AddRef
-    add_ref as *const (),             // 0x10 Release
-    device_info as *const (),         // 0x18
-    device_status as *const (),       // 0x20
-    unsupported::<0x28> as *const (), // battery
-    unsupported::<0x30> as *const (), // force feedback
-    unsupported::<0x38> as *const (), //
-    unsupported::<0x40> as *const (), //
-    unsupported::<0x48> as *const (), // haptics
-    set_rumble as *const (),          // 0x50
-    unsupported::<0x58> as *const (), // input synchronization
-    unsupported::<0x60> as *const (), //
-    unsupported::<0x68> as *const (), // power off
-    unsupported::<0x70> as *const (), // raw device access
-    unsupported::<0x78> as *const (), //
-    unsupported::<0x80> as *const (), //
-    unsupported::<0x88> as *const (), //
-    unsupported::<0x90> as *const (), //
-    unsupported::<0x98> as *const (), //
-    unsupported::<0xa0> as *const (), //
+static DEVICE: Table<22> = Table([
+    no_interface as *const (),                    // 0x00
+    add_ref as *const (),                         // 0x08 AddRef
+    add_ref as *const (),                         // 0x10 Release
+    device_info as *const (),                     // 0x18
+    device_status as *const (),                   // 0x20
+    unsupported::<0x28> as *const (),             // battery
+    create_force_feedback_effect as *const (),    // 0x30
+    force_feedback_motor_powered_on as *const (), // 0x38
+    unsupported::<0x40> as *const (),             // force feedback gain
+    unsupported::<0x48> as *const (),             // haptics
+    set_rumble as *const (),                      // 0x50
+    unsupported::<0x58> as *const (),             // input synchronization
+    unsupported::<0x60> as *const (),             //
+    unsupported::<0x68> as *const (),             // power off
+    create_raw_report as *const (),               // 0x70 raw device access
+    raw_feature as *const (),                     // 0x78
+    unsupported::<0x80> as *const (),             //
+    unsupported::<0x88> as *const (),             //
+    unsupported::<0x90> as *const (),             //
+    unsupported::<0x98> as *const (),             //
+    unsupported::<0xa0> as *const (),             // exclusive raw access
+    // The v0 interface ends with the release of that access, by the
+    // public GameInput.h of that version (not in the online reference):
+    // without a slot a call would run whatever follows the table.
+    unsupported::<0xa8> as *const (),
 ]);
 
 fn reading<'a>(this: *const Reading) -> &'a Reading {
@@ -1643,5 +1682,131 @@ mod tests {
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
         rumble(device, std::ptr::null());
         assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
+    }
+
+    /// `IsForceFeedbackMotorPoweredOn` is documented to return false for a
+    /// motor without power, and COM out pointers are null on failure.
+    #[test]
+    fn no_force_feedback_motor_is_powered_and_failed_creations_null_their_outputs() {
+        let (hub, _host) = fake();
+        for device in &hub.devices {
+            let device = device as *const Device;
+            // The whole result register, as a title's `bool` test may read
+            // more than the low byte.
+            type Powered = extern "system" fn(*const Device, u32) -> usize;
+            let powered = slot::<Powered, _>(device, 0x38);
+            for motor in [0, 1, u32::MAX] {
+                assert_eq!(powered(device, motor) & 0xff, 0, "motor {motor}");
+            }
+
+            type Effect = extern "system" fn(*const Device, u32, *const c_void, Out) -> HRESULT;
+            let mut out = 0x1234 as *const c_void;
+            let params = [0u8; 64];
+            let create = slot::<Effect, _>(device, 0x30);
+            assert_eq!(
+                create(device, 0, params.as_ptr().cast(), &mut out),
+                E_NOTIMPL
+            );
+            assert!(out.is_null());
+
+            type Report = extern "system" fn(*const Device, u32, u32, Out) -> HRESULT;
+            let mut out = 0x1234 as *const c_void;
+            assert_eq!(
+                slot::<Report, _>(device, 0x70)(device, 1, 2, &mut out),
+                E_NOTIMPL
+            );
+            assert!(out.is_null());
+
+            type Feature = extern "system" fn(*const Device, u32, Out) -> HRESULT;
+            let mut out = 0x1234 as *const c_void;
+            assert_eq!(
+                slot::<Feature, _>(device, 0x78)(device, 1, &mut out),
+                E_NOTIMPL
+            );
+            assert!(out.is_null());
+        }
+        assert_eq!(E_NOTIMPL as u32, 0x8000_4001);
+    }
+
+    /// Device methods the public reference no longer describes: each
+    /// leaves `E_NOTIMPL` in the result register and writes to none of its
+    /// arguments. Battery state, for one, stays as the caller had it.
+    #[test]
+    fn device_methods_without_a_documented_answer_write_nothing() {
+        let (hub, host) = fake();
+        let device = &hub.devices[0] as *const Device;
+        // One pointer argument (battery state, a haptic motor's state, a
+        // report to send): the buffer keeps its bytes.
+        type Pointer = extern "system" fn(*const Device, *mut u8) -> HRESULT;
+        for at in [0x28, 0x80, 0x88] {
+            let mut buffer = [0xa5_u8; 64];
+            let call = slot::<Pointer, _>(device, at);
+            assert_eq!(call(device, buffer.as_mut_ptr()), E_NOTIMPL, "slot {at:#x}");
+            assert_eq!(buffer, [0xa5; 64], "slot {at:#x}");
+        }
+        // Raw output with a response: the response pointer is not touched.
+        type Respond = extern "system" fn(*const Device, *const u8, Out) -> HRESULT;
+        let (request, mut response) = ([0u8; 8], 0x1234 as *const c_void);
+        let respond = slot::<Respond, _>(device, 0x90);
+        assert_eq!(respond(device, request.as_ptr(), &mut response), E_NOTIMPL);
+        assert_eq!(response as usize, 0x1234);
+        // Scalar arguments only, or none.
+        type Scalar = extern "system" fn(*const Device, u64) -> HRESULT;
+        for at in [0x40, 0x48, 0x58, 0x60, 0x68, 0x98, 0xa0, 0xa8] {
+            assert_eq!(
+                slot::<Scalar, _>(device, at)(device, 0),
+                E_NOTIMPL,
+                "slot {at:#x}"
+            );
+        }
+        // None of it reached the host.
+        assert!(host.lock().unwrap().rumble.is_empty());
+    }
+
+    #[test]
+    fn dispatcher_and_aggregate_fail_with_null_outputs() {
+        let (hub, _host) = fake();
+        let this: This = &hub.object;
+        let mut out = 0x1234 as *const c_void;
+        let dispatcher = slot::<extern "system" fn(This, Out) -> HRESULT, _>(this, 0x70);
+        assert_eq!(dispatcher(this, &mut out), E_NOTIMPL);
+        assert!(out.is_null());
+        let mut out = 0x1234 as *const c_void;
+        let aggregate = slot::<extern "system" fn(This, u32, Out) -> HRESULT, _>(this, 0x78);
+        assert_eq!(aggregate(this, GAMEPAD_KIND, &mut out), E_NOTIMPL);
+        assert!(out.is_null());
+    }
+
+    /// The source the runtime really uses (XInput and the keyboard on
+    /// Windows and Wine, nothing elsewhere) polls without a pad or a
+    /// focused window: the keyboard is a device, a pad is either a host
+    /// pad or the keyboard's stand-in, and keys carry no character.
+    #[test]
+    fn real_host_source_polls_without_error() {
+        let hub = Hub::new(host());
+        hub.poll();
+        hub.poll();
+        let (pads, fallback, keyboard) = {
+            let state = hub.state();
+            let connected = |i: usize| state.slots[i].connected;
+            (
+                (0..PADS).filter(|&i| connected(i)).count(),
+                connected(FALLBACK),
+                connected(KEYBOARD),
+            )
+        };
+        assert!(keyboard);
+        assert_eq!(fallback, pads == 0, "{pads} host pads");
+        let r = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
+        let count = slot::<extern "system" fn(*const Reading) -> u32, _>(r, 0x70)(r);
+        let state =
+            slot::<extern "system" fn(*const Reading, u32, *mut KeyState) -> u32, _>(r, 0x78);
+        let mut keys = [KeyState::default(); 256];
+        assert_eq!(state(r, 256, keys.as_mut_ptr()), count);
+        for key in &keys[..count as usize] {
+            assert!((0x08..=0xfe).contains(&key.virtual_key), "{key:?}");
+            assert_eq!(key.code_point, 0, "no characters: {key:?}");
+        }
+        release(r);
     }
 }
