@@ -157,6 +157,14 @@ impl ImageInfo {
             })
             .collect();
 
+        // 0 means the image has no entry point. Anything else is called.
+        let entry_rva = opt.address_of_entry_point();
+        if entry_rva != 0 && !is_code(&sections, opt.size_of_image(), entry_rva) {
+            return Err(PeError::Malformed(format!(
+                "entry point at {entry_rva:#x} is not in an executable section"
+            )));
+        }
+
         let dir_present = |index: usize| {
             file.data_directory(index)
                 .is_some_and(|d| d.virtual_address.get(LE) != 0 && d.size.get(LE) != 0)
@@ -189,7 +197,7 @@ impl ImageInfo {
             dll_characteristics: opt.dll_characteristics().0,
             image_base: opt.image_base(),
             size_of_image: opt.size_of_image(),
-            entry_rva: opt.address_of_entry_point(),
+            entry_rva,
             stack_reserve: opt.size_of_stack_reserve(),
             stack_commit: opt.size_of_stack_commit(),
             sections,
@@ -728,6 +736,29 @@ mod tests {
         data[text + 8..text + 12].copy_from_slice(&0x10_0000u32.to_le_bytes());
         let why = malformed(ImageInfo::parse(&data));
         assert!(why.contains("not in an executable section"), "{why}");
+    }
+
+    #[test]
+    fn rejects_entry_outside_code() {
+        let entry = |rva| ImageInfo::parse(&code().entry_rva(rva).build().unwrap().bytes);
+        assert_eq!(entry(0x1000).unwrap().entry_rva, 0x1000);
+        assert_eq!(entry(0x103F).unwrap().entry_rva, 0x103F);
+        // No entry point at all is not an error (a resource-only DLL).
+        assert_eq!(entry(0).unwrap().entry_rva, 0);
+        let size_of_image = entry(0).unwrap().size_of_image;
+        // In `.data`, in the headers, just past `.text`, at the end of the
+        // image and far outside it.
+        for rva in [0x2010, 0x80, 0x1040, size_of_image, 0xFFFF_FFF0] {
+            let why = malformed(entry(rva));
+            assert_eq!(
+                why,
+                format!("entry point at {rva:#x} is not in an executable section")
+            );
+        }
+        // A DLL's entry point is called too.
+        let dll = code().dll(true).entry_rva(0x2000).build().unwrap().bytes;
+        let why = malformed(ImageInfo::parse(&dll));
+        assert_eq!(why, "entry point at 0x2000 is not in an executable section");
     }
 
     #[test]
