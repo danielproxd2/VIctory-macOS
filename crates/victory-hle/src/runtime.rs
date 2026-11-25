@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use victory_pe::ImportSymbol;
+
 static MAIN_IMAGE_BASE: AtomicUsize = AtomicUsize::new(0);
 
 /// Records where the title's main image is mapped. The title expects
@@ -69,6 +71,51 @@ pub fn set_title_dll_loader(loader: TitleDllLoader) {
 
 pub fn load_title_dll(file: &str) -> Result<Option<usize>, String> {
     TITLE_DLL_LOADER.get().map_or(Ok(None), |load| load(file))
+}
+
+/// Finds an export of the title image mapped at a base address, by name or
+/// ordinal: `None` if the image has none, or if it is forwarded to one
+/// nobody has.
+pub type TitleExports = Box<dyn Fn(usize, &ImportSymbol) -> Option<usize> + Send + Sync>;
+
+static TITLE_EXPORTS: std::sync::OnceLock<TitleExports> = std::sync::OnceLock::new();
+
+/// Set once, by whoever mapped the title (it has the images and the
+/// resolver; see [`title_export_in`]); later calls are ignored.
+pub fn set_title_exports(exports: TitleExports) {
+    let _ = TITLE_EXPORTS.set(exports);
+}
+
+/// What the title's `GetProcAddress` answers for a title image. The host is
+/// never asked: its `GetProcAddress` follows a forwarded export by loading
+/// the DLL the forwarder names, which for a title's DLL is the file as the
+/// title ships it, not the copy we prepared and bound. Until
+/// [`set_title_exports`] is called, title images have no exports here.
+pub fn title_export(base: usize, symbol: &ImportSymbol) -> Option<usize> {
+    TITLE_EXPORTS.get()?(base, symbol)
+}
+
+/// The export `symbol` of the image among `images` that is mapped at
+/// `base`, as import binding resolves it: a forwarded export is followed
+/// through `inner` (our runtime, the host) and through `images`, never
+/// through the Windows loader. For [`set_title_exports`].
+#[cfg(windows)]
+pub fn title_export_in(
+    images: &[(String, victory_loader::LoadedImage)],
+    inner: &dyn victory_loader::ImportResolver,
+    base: usize,
+    symbol: &ImportSymbol,
+) -> Option<usize> {
+    use victory_loader::{ImportResolver, Resolution, WithTitleDlls};
+    let (name, _) = images.iter().find(|(_, image)| image.base() == base)?;
+    let resolver = WithTitleDlls {
+        inner,
+        dlls: images,
+    };
+    match resolver.resolve(name, symbol) {
+        Resolution::Found { address, .. } => Some(address),
+        Resolution::Missing => None,
+    }
 }
 
 /// What the title's manifest (`MicrosoftGame.config` beside its executable)

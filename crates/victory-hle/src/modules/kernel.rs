@@ -143,7 +143,8 @@ pub extern "system" fn LoadLibraryW(name: *const u16) -> *mut c_void {
     LoadLibraryExW(name, std::ptr::null_mut(), 0)
 }
 
-/// Looks up our implementations behind a pseudo handle; real modules go to
+/// Looks up our implementations behind a pseudo handle and the exports of
+/// the title's images in the images we mapped; the host's modules go to
 /// the host.
 pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void {
     // `NULL` is the process's exe, which for the title is its own image.
@@ -153,6 +154,9 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
         module
     };
     let Some(m) = registry().iter().find(|m| handle(m) == module) else {
+        if runtime::image_path(module as usize).is_some() {
+            return title_export(module as usize, name);
+        }
         return host_override(module, name).unwrap_or_else(|| host::get_proc_address(module, name));
     };
     // Values below 0x10000 are ordinals; we export by name only.
@@ -174,6 +178,30 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
         }
     }
 }
+
+/// An export of a title image we mapped, from whoever mapped it
+/// (`runtime::set_title_exports`), who resolves it as import binding does.
+/// The host is not asked: for a forwarded export it would load the DLL the
+/// forwarder names, the title's own file instead of our prepared copy.
+fn title_export(base: usize, name: *const u8) -> *mut c_void {
+    // Values below 0x10000 are ordinals.
+    let symbol = match u16::try_from(name as usize) {
+        Ok(ordinal) => victory_pe::ImportSymbol::Ordinal(ordinal),
+        Err(_) => victory_pe::ImportSymbol::Name {
+            hint: 0,
+            name: narrow(name),
+        },
+    };
+    match runtime::title_export(base, &symbol) {
+        Some(address) => address as *mut c_void,
+        None => {
+            host::set_last_error(ERROR_PROC_NOT_FOUND);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+const ERROR_PROC_NOT_FOUND: u32 = 127;
 
 /// What a host module's `name` (or ordinal) is bound to at import binding
 /// when we override it: a title that looks a function up by name must not

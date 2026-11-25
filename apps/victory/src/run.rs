@@ -126,14 +126,19 @@ pub fn run(
     victory_hle::runtime::use_console_timers();
     #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg);
-    let late = LateDlls {
+    let late = Arc::new(LateDlls {
         host: resolver.host.clone(),
         title_dir: title_dir.to_owned(),
         cache_dir: images,
         policy,
+        main: [(exe_name.to_ascii_lowercase(), image.clone())],
         mapped: std::sync::Mutex::new(dlls.clone()),
         lock: LoaderLock::default(),
-    };
+    });
+    let exports = Arc::clone(&late);
+    victory_hle::runtime::set_title_exports(Box::new(move |base, symbol| {
+        exports.export(base, symbol)
+    }));
     victory_hle::runtime::set_title_dll_loader(Box::new(move |file| {
         late.load(file).map_err(|e| format!("{e:#}"))
     }));
@@ -231,6 +236,8 @@ struct LateDlls {
     title_dir: std::path::PathBuf,
     cache_dir: std::path::PathBuf,
     policy: victory_loader::UnimplementedPolicy,
+    /// The title's executable, under its file name.
+    main: [(String, victory_loader::LoadedImage); 1],
     /// Every title DLL mapped so far, to bind new ones against.
     mapped: std::sync::Mutex<Vec<(String, victory_loader::LoadedImage)>>,
     lock: LoaderLock,
@@ -238,6 +245,23 @@ struct LateDlls {
 
 #[cfg(windows)]
 impl LateDlls {
+    /// Every `GetProcAddress` of the title on one of its own images comes
+    /// here: the export `symbol` of the image mapped at `base`, a forwarded
+    /// one followed as at import binding (our runtime, the host under the
+    /// same policy, the title's mapped DLLs).
+    fn export(&self, base: usize, symbol: &victory_pe::ImportSymbol) -> Option<usize> {
+        use victory_hle::runtime::title_export_in;
+        let hle = victory_hle::HleResolver::new(self.host.clone());
+        let mapped = self.mapped.lock().unwrap_or_else(|e| e.into_inner());
+        title_export_in(&mapped, &hle, base, symbol).or_else(|| {
+            let dlls = victory_loader::WithTitleDlls {
+                inner: &hle,
+                dlls: &mapped,
+            };
+            title_export_in(&self.main, &dlls, base, symbol)
+        })
+    }
+
     /// Every `LoadLibrary` of the title comes here first. Returns a title
     /// image called `file`, mapping it and the title DLLs it needs first,
     /// binding them and running their `DllMain` on the calling thread, as

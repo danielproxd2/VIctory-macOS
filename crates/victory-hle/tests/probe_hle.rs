@@ -9,7 +9,7 @@ use std::ffi::c_void;
 use std::path::Path;
 use std::sync::OnceLock;
 
-use victory_hle::modules::{files, xasync, xgameruntime};
+use victory_hle::modules::{files, kernel, xasync, xgameruntime};
 use victory_hle::{HleResolver, HostPolicy, runtime};
 use victory_loader::{
     BindReport, ImportResolver, LoadedImage, Provenance, Resolution, UnimplementedPolicy,
@@ -17,6 +17,7 @@ use victory_loader::{
 };
 use victory_pe::ImportSymbol;
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 
 #[path = "../../victory-loader/tests/common/mod.rs"]
 mod common;
@@ -493,4 +494,152 @@ fn allocation_hooks_of_the_main_image_are_called() {
     assert_eq!(said(&printed, "after_direct_alloc"), "2:1", "{printed}");
     assert_eq!(said(&printed, "after_direct_frees"), "2:3", "{printed}");
     assert_eq!(said(&printed, "after_defaults"), "2:3", "{printed}");
+}
+
+/// What tests/fixtures/title-a answers with.
+const TITLE_A_NAMED: u32 = 0x0A00_0001;
+const TITLE_A_BY_ORDINAL: u32 = 0x0A00_0007;
+
+/// In a child process of the next test, whose current folder is the
+/// title's: maps `title_b.dll` and what it imports, and asks our
+/// `GetProcAddress`, as the title would, for its exports.
+#[test]
+fn forwarders_child() {
+    if std::env::var(CHILD).as_deref() != Ok("forwarders") {
+        return;
+    }
+    let title_dir = std::env::current_dir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let dlls = victory_loader::load_title_dll("title_b.dll", &title_dir, cache.path(), &title_dll)
+        .unwrap();
+    let hle = HleResolver::default();
+    let resolver = WithTitleDlls {
+        inner: &hle,
+        dlls: &dlls,
+    };
+    for (name, dll) in &dlls {
+        dll.bind_imports(&resolver, UnimplementedPolicy::ReturnZero)
+            .unwrap();
+        runtime::set_image_path(dll.base(), &title_dir.join(name));
+    }
+    let image = |name: &str| -> LoadedImage {
+        let found = dlls.iter().find(|(n, _)| n == name);
+        found
+            .unwrap_or_else(|| panic!("{name} is mapped"))
+            .1
+            .clone()
+    };
+    let (title_a, title_b) = (image("title_a.dll"), image("title_b.dll"));
+    let lookup = |module: &LoadedImage, name: *const u8| -> usize {
+        kernel::GetProcAddress(module.base() as *mut c_void, name) as usize
+    };
+    let named = |module: &LoadedImage, name: &std::ffi::CStr| lookup(module, name.as_ptr().cast());
+    println!();
+
+    // Before whoever mapped the title says how its exports are found, a
+    // title image has none: the host is not asked in its place.
+    println!("unset={:#x}", named(&title_b, c"title_b_chain"));
+
+    let images = dlls.clone();
+    runtime::set_title_exports(Box::new(move |base, symbol| {
+        runtime::title_export_in(&images, &HleResolver::default(), base, symbol)
+    }));
+
+    // An export with code of its own.
+    let own = named(&title_b, c"title_b_chain");
+    println!("own={}", Some(own) == title_b.export("title_b_chain"));
+
+    // Forwarded to another title DLL, by name and by ordinal: the prepared
+    // copy's export, which answers when called.
+    let call = |address: usize| -> u32 {
+        if address == 0 {
+            return 0;
+        }
+        // SAFETY: an export of the fixtures that takes nothing, returns a
+        // `u32` and uses no import.
+        let f: extern "system" fn() -> u32 = unsafe { std::mem::transmute(address) };
+        f()
+    };
+    let forwarded = named(&title_b, c"title_b_forwarded");
+    println!(
+        "forwarded={}",
+        Some(forwarded) == title_a.export("title_a_named")
+    );
+    println!("forwarded_call={:#x}", call(forwarded));
+    let by_ordinal = named(&title_b, c"title_b_forwarded_ordinal");
+    let seventh = title_a.export_symbol(&ImportSymbol::Ordinal(7));
+    println!("forwarded_ordinal={}", Some(by_ordinal) == seventh);
+    println!("forwarded_ordinal_call={:#x}", call(by_ordinal));
+
+    // Forwarded to the host: the function import binding gives the title.
+    let to_host = named(&title_b, c"title_b_forwarded_host");
+    let pid = hle.resolve(
+        "kernel32.dll",
+        &ImportSymbol::Name {
+            hint: 0,
+            name: "GetCurrentProcessId".into(),
+        },
+    );
+    let host = Resolution::Found {
+        address: to_host,
+        provenance: Provenance::Host,
+    };
+    println!("forwarded_host={}", pid == host);
+    println!(
+        "forwarded_host_call={}",
+        call(to_host) == std::process::id()
+    );
+
+    // By ordinal, as `GetProcAddress` takes one: a value below 0x10000.
+    println!(
+        "ordinal={}",
+        Some(lookup(&title_a, 7 as *const u8)) == seventh
+    );
+
+    // No such export: null, and the error the host would set.
+    // SAFETY: sets and reads this thread's last error.
+    unsafe { windows_sys::Win32::Foundation::SetLastError(0) };
+    let absent = named(&title_b, c"title_b_absent");
+    // SAFETY: as above.
+    println!("absent={absent:#x} error={}", unsafe { GetLastError() });
+
+    // None of this made the host load the title's own title_a.dll, which
+    // lies in the current folder: the only title_a the process has is the
+    // prepared copy.
+    // SAFETY: a NUL-terminated name.
+    let hosts = unsafe { GetModuleHandleW(wide("title_a.dll").as_ptr()) } as usize;
+    println!("unprepared={}", hosts != 0 && hosts != title_a.base());
+}
+
+/// `GetProcAddress` on a title image is answered from the image we
+/// prepared, and a forwarded export as import binding resolves it. The
+/// host's `GetProcAddress` follows a forwarder by loading the DLL it
+/// names, and here the title's unprepared file of that name lies in the
+/// current folder, where the host would find it.
+#[test]
+fn getprocaddress_on_a_title_dll_follows_forwarders_into_prepared_images() {
+    let title_dir = tempfile::tempdir().unwrap();
+    for file in ["title_a.dll", "title_b.dll", "title_quiet.dll"] {
+        std::fs::copy(fixture(file), title_dir.path().join(file)).unwrap();
+    }
+    let printed = child("forwarders_child", "forwarders", title_dir.path());
+    assert_eq!(said(&printed, "unset"), "0x0", "{printed}");
+    assert_eq!(said(&printed, "own"), "true", "{printed}");
+    assert_eq!(said(&printed, "forwarded"), "true", "{printed}");
+    assert_eq!(
+        said(&printed, "forwarded_call"),
+        format!("{TITLE_A_NAMED:#x}"),
+        "{printed}"
+    );
+    assert_eq!(said(&printed, "forwarded_ordinal"), "true", "{printed}");
+    assert_eq!(
+        said(&printed, "forwarded_ordinal_call"),
+        format!("{TITLE_A_BY_ORDINAL:#x}"),
+        "{printed}"
+    );
+    assert_eq!(said(&printed, "forwarded_host"), "true", "{printed}");
+    assert_eq!(said(&printed, "forwarded_host_call"), "true", "{printed}");
+    assert_eq!(said(&printed, "ordinal"), "true", "{printed}");
+    assert_eq!(said(&printed, "absent"), "0x0 error=127", "{printed}");
+    assert_eq!(said(&printed, "unprepared"), "false", "{printed}");
 }
