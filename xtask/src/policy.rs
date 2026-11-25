@@ -59,6 +59,12 @@ const EXCEPTIONS: &[Exception] = &[
         len: 49067,
         fnv: 0xfa974a25879aa281,
     },
+    Exception {
+        path: "crates/victory-gpu/src/depth_bytecode.rs",
+        reason: "our own depth.hlsl compiled by Microsoft's compilers, which Wine cannot run; written by `cargo xtask embed-depth`, which prints this entry's numbers. Pinned now as the form without bytes: the shader was not built yet",
+        len: 407,
+        fnv: 0xfc04415facbf891a,
+    },
 ];
 
 /// Signatures of formats that must never be committed.
@@ -846,6 +852,38 @@ mod tests {
             super::check_exception(exception, &content),
             Vec::<String>::new(),
             "run `cargo xtask embed-clamp` again and enter the numbers it prints"
+        );
+    }
+
+    /// The embedded depth conversion is pinned the same way, before it is
+    /// built as well: whatever is at its path is the one file its
+    /// exception names. Once it holds bytecode it is a byte array, which
+    /// only the exception lets pass.
+    #[test]
+    fn depth_bytecode_passes_only_through_its_exception() {
+        let path = "crates/victory-gpu/src/depth_bytecode.rs";
+        let content = std::fs::read(crate::workspace_root().join(path)).unwrap();
+        // A checkout that rewrote line ends would differ from the pin.
+        assert!(!content.contains(&b'\r'), "line ends were rewritten");
+        let exception = super::EXCEPTIONS
+            .iter()
+            .find(|e| e.path == path)
+            .expect("an entry for the depth conversion bytecode");
+        assert_eq!(
+            super::check_exception(exception, &content),
+            Vec::<String>::new(),
+            "run `cargo xtask embed-depth` again and enter the numbers it prints"
+        );
+        // Anything else at the path fails, a byte more included.
+        let mut other = content.clone();
+        other.push(b'\n');
+        assert_eq!(super::check_exception(exception, &other).len(), 2);
+        let built = !String::from_utf8_lossy(&content).contains("const DXIL: &[u8] = &[];");
+        let problems = check(path, &content);
+        assert_eq!(
+            problems.iter().any(|p| p.contains("byte-array run")),
+            built,
+            "{problems:?}"
         );
     }
 

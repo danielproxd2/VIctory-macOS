@@ -30,15 +30,26 @@ enum Cmd {
     /// Write crates/victory-gpu/src/clamp_bytecode.rs from the output of
     /// the clamp-bytecode workflow (a folder with clamp.dxil and clamp.dxbc).
     EmbedClamp { folder: PathBuf },
+    /// Write crates/victory-gpu/src/depth_bytecode.rs from depth.dxil and
+    /// depth.dxbc in a folder (depth.hlsl compiled as the clamp-bytecode
+    /// workflow compiles clamp.hlsl).
+    EmbedDepth { folder: PathBuf },
 }
 
 fn main() -> Result<()> {
     let root = workspace_root();
     match Cli::parse().command {
         Cmd::Policy { staged } => policy::run(&root, staged),
-        Cmd::EmbedClamp { folder } => {
-            embed_clamp::run(&root.join("crates/victory-gpu/src"), &folder)
-        }
+        Cmd::EmbedClamp { folder } => embed_clamp::run(
+            &embed_clamp::CLAMP,
+            &root.join("crates/victory-gpu/src"),
+            &folder,
+        ),
+        Cmd::EmbedDepth { folder } => embed_clamp::run(
+            &embed_clamp::DEPTH,
+            &root.join("crates/victory-gpu/src"),
+            &folder,
+        ),
         Cmd::InstallHooks => {
             let status = Command::new("git")
                 .args(["config", "core.hooksPath", ".githooks"])

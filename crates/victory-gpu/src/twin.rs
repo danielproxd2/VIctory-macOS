@@ -649,40 +649,13 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
 /// the low 24 bits of 32) and back, in the scratch buffer: `u * (2^24 - 1)
 /// / 65535` rounded, exactly, and back to the 16-bit value whose 24-bit one
 /// is nearest.
-const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=8, b0), UAV(u0)"
-cbuffer C : register(b0) { uint width; uint height; uint pitch16; uint at16; uint pitch32; uint at32; uint toDepth; uint unused; };
-RWByteAddressBuffer buf : register(u0);
-uint d24(uint u) { return u * 256 + (u * 255 + 32767) / 65535; }
-uint u16(uint d) {
-    d &= 0xffffff;
-    uint u = min(d >> 8, 65535);
-    uint best = u;
-    int err = abs((int)d24(u) - (int)d);
-    if (u > 0 && abs((int)d24(u - 1) - (int)d) < err) { best = u - 1; err = abs((int)d24(u - 1) - (int)d); }
-    if (u < 65535 && abs((int)d24(u + 1) - (int)d) < err) { best = u + 1; }
-    return best;
-}
-[RootSignature(RS)]
-[numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-    uint x = id.x * 2;
-    uint y = id.y;
-    if (x >= width || y >= height) return;
-    uint a = at16 + y * pitch16 + x * 2;
-    uint b = at32 + y * pitch32 + x * 4;
-    bool two = x + 1 < width;
-    if (toDepth != 0) {
-        uint pair = buf.Load(a);
-        buf.Store(b, d24(pair & 0xffff));
-        if (two) buf.Store(b + 4, d24(pair >> 16));
-    } else {
-        uint lo = u16(buf.Load(b));
-        uint hi = two ? u16(buf.Load(b + 4)) : 0;
-        buf.Store(a, lo | hi << 16);
-    }
-}
-"#;
+///
+/// `depth_bytecode.rs` holds this shader compiled by Microsoft's compilers
+/// on a Windows runner (`cargo xtask embed-depth`), because Wine's HLSL
+/// compiler (vkd3d-shader) cannot build it; that bytecode is used only
+/// while its `SOURCE_HASH` names this text, and the system's compiler
+/// builds the shader otherwise, as it always did.
+const SOURCE: &str = include_str!("depth.hlsl");
 
 struct Converter {
     root: ID3D12RootSignature,
@@ -706,8 +679,53 @@ fn converter() -> Option<&'static Converter> {
     .as_ref()
 }
 
+/// The hash of the shader source, which names the bytecode it was built
+/// into (the hash `cargo xtask embed-depth` writes).
+fn source_hash() -> u64 {
+    crate::indirect::fnv(SOURCE.as_bytes())
+}
+
+/// Whether there is no prebuilt bytecode of the present `depth.hlsl`: none
+/// was embedded yet, or it was built from another source. It is not used
+/// then: the shader's constants and the scratch layout are this file's,
+/// and the bytecode's may differ.
+fn stale() -> bool {
+    crate::depth_bytecode::SOURCE_HASH != source_hash()
+}
+
 fn compile() -> windows::core::Result<Converter> {
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
+    // Prebuilt bytecode first, as long as it was built from this source.
+    if stale() {
+        tracing::warn!(
+            "no prebuilt depth conversion of this depth.hlsl (build it on a Windows \
+             runner and run `cargo xtask embed-depth`); compiling the shader here"
+        );
+    } else {
+        for bytes in [crate::depth_bytecode::DXIL, crate::depth_bytecode::DXBC] {
+            if bytes.is_empty() {
+                continue;
+            }
+            match from_bytecode(device, bytes) {
+                Ok(c) => return Ok(c),
+                Err(e) => tracing::warn!(error = %e, "prebuilt depth conversion refused"),
+            }
+        }
+    }
+    match compiled_here() {
+        Ok(bytes) => from_bytecode(device, &bytes),
+        Err((e, text)) => {
+            if !text.is_empty() {
+                tracing::warn!("depth conversion: {text}");
+            }
+            Err(e)
+        }
+    }
+}
+
+/// The shader compiled by the system's HLSL compiler, or its error and
+/// what the compiler said.
+fn compiled_here() -> Result<Vec<u8>, (windows::core::Error, String)> {
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
@@ -726,24 +744,26 @@ fn compile() -> windows::core::Result<Converter> {
             Some(&mut errors),
         )
     };
+    // SAFETY: a blob's own bytes, copied while it lives.
+    let bytes_of = |blob: &ID3DBlob| unsafe {
+        std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
+            .to_vec()
+    };
     if let Err(e) = compiled {
-        if let Some(errors) = errors {
-            // SAFETY: the blob's own bytes.
-            let text = unsafe {
-                std::slice::from_raw_parts(
-                    errors.GetBufferPointer().cast::<u8>(),
-                    errors.GetBufferSize(),
-                )
-            };
-            tracing::warn!("depth conversion: {}", String::from_utf8_lossy(text));
-        }
-        return Err(e);
+        let text = errors.as_ref().map(bytes_of).unwrap_or_default();
+        return Err((e, String::from_utf8_lossy(&text).into_owned()));
     }
-    let code = code.ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
+    match code {
+        Some(code) => Ok(bytes_of(&code)),
+        None => Err((windows::core::Error::empty(), String::new())),
+    }
+}
+
+/// The root signature and pipeline of compiled conversion bytecode, whose
+/// root signature is inside it.
+fn from_bytecode(device: &ID3D12Device, bytes: &[u8]) -> windows::core::Result<Converter> {
+    // SAFETY: the bytes live through both calls.
     unsafe {
-        let bytes =
-            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
         let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
@@ -785,5 +805,168 @@ mod tests {
         assert_eq!(again(DEPTH, &mut last, DEPTH, false), None);
         assert_eq!(again(DEPTH, &mut last, TWIN, true), Some(false));
         assert_eq!(last, Some(TWIN));
+    }
+
+    /// Whether there is a depth conversion for `test`, which needs one.
+    /// Without one the test did not run: while no bytecode of the present
+    /// `depth.hlsl` is embedded and Wine's compiler cannot build the
+    /// shader, that is the line `skipped: no prebuilt depth conversion
+    /// ... (<test>)`, or a failure with `VICTORY_REQUIRE_DEPTH=1`.
+    ///
+    /// # Panics
+    ///
+    /// Without a conversion for any other reason: the prebuilt bytecode
+    /// names this source and the host refused it, or the system's compiler
+    /// is Microsoft's (the process is not under Wine) and the shader did
+    /// not build.
+    fn converter_for(test: &str) -> Option<&'static Converter> {
+        if let Some(c) = converter() {
+            return Some(c);
+        }
+        assert!(
+            stale(),
+            "{test}: no depth conversion, though the prebuilt bytecode names this source"
+        );
+        assert!(
+            crate::test_support::under_wine(),
+            "{test}: no depth conversion, though the system's compiler is not Wine's"
+        );
+        crate::test_support::no_depth(test);
+        None
+    }
+
+    /// The fallback, as upstream has it: the system's compiler builds the
+    /// shader with its root signature inside, and the host takes it. Under
+    /// Wine that compiler is vkd3d-shader's, which refuses the source
+    /// (measured: "E5005: Method 'Load' is not defined on type
+    /// 'RWByteAddressBuffer'"): there, and only there, the test says
+    /// "skipped" with the compiler's text, or fails with
+    /// `VICTORY_REQUIRE_HLSL=1`.
+    #[test]
+    fn the_systems_compiler_builds_the_depth_conversion() {
+        let test = "twin::the_systems_compiler_builds_the_depth_conversion";
+        let Some((_gpu, host)) = crate::testing::gpu() else {
+            return;
+        };
+        match compiled_here() {
+            Ok(bytes) => {
+                assert!(crate::root::holds_a_root_signature(&bytes), "no RTS0 part");
+                let made = from_bytecode(&host.device, &bytes).map(|_| ());
+                assert_eq!(made, Ok(()));
+            }
+            Err((e, text)) => {
+                let text = format!("{e}: {}", text.trim_end_matches(['\0', '\n', '\r']));
+                assert!(crate::test_support::under_wine(), "{test}: {text}");
+                crate::test_support::no_hlsl(test, &text);
+            }
+        }
+    }
+
+    /// The model of the shader's `d24`: `u * (2^24 - 1) / 65535` rounded.
+    fn d24(u: u32) -> u32 {
+        u * 256 + (u * 255 + 32767) / 65535
+    }
+
+    /// The conversion on the device, recorded as `Twin::copy` records it:
+    /// a 5 by 2 plane of 16-bit depths becomes the 24-bit values of the
+    /// same depths, the odd last column leaves the dword after its row
+    /// alone, and the way back gives the 16-bit depth nearest to each
+    /// 24-bit value, whatever its high byte holds.
+    #[test]
+    fn depth_converts_both_ways_on_the_device() {
+        let test = "twin::depth_converts_both_ways_on_the_device";
+        let Some((_gpu, host)) = crate::testing::gpu() else {
+            return;
+        };
+        let Some(c) = converter_for(test) else {
+            return;
+        };
+        assert_eq!((d24(0), d24(1), d24(65535)), (0, 256, 0xff_ffff));
+        const WIDTH: usize = 5;
+        const HEIGHT: usize = 2;
+        // Bytes: the 16-bit plane, the 24-bit plane it becomes, a 24-bit
+        // plane of our own and the 16-bit plane that one becomes.
+        const PITCH16: usize = 16;
+        const PITCH32: usize = 32;
+        let (in16, out32, in32, out16) = (0usize, 64usize, 128usize, 192usize);
+        const UNTOUCHED: u32 = 0xdead_beef;
+        let depths: [u16; WIDTH * HEIGHT] =
+            [0, 1, 2, 0x7fff, 0x8000, 0x8001, 0xfffe, 0xffff, 100, 257];
+        // 24-bit values on and between the 16-bit depths' own, with
+        // something in the byte above them: the nearest depth is wanted.
+        let near: [(u32, u16); WIDTH * HEIGHT] = [
+            (0, 0),
+            (0xff_ffff, 0xffff),
+            (d24(100) + 100, 100),
+            (d24(100) + 200, 101),
+            (d24(0x8000) - 1, 0x8000),
+            (0xab00_0000 | d24(77), 77),
+            (0xff00_0000 | (d24(77) - 120), 77),
+            (d24(0xffff) - 200, 0xfffe),
+            (120, 0),
+            (140, 1),
+        ];
+        let words = 256 / 4;
+        let (buffer, data) = host.shared_buffer(256).expect("a shared buffer");
+        let data = data.cast::<u32>();
+        let list = host.new_list().expect("a list");
+        // SAFETY: our mapped buffer of 64 dwords, written before the list
+        // runs and read after it has; an open list, our pipeline and a
+        // live buffer.
+        let after: Vec<u32> = unsafe {
+            for at in 0..words {
+                data.add(at).write_volatile(UNTOUCHED);
+            }
+            for (i, &depth) in depths.iter().enumerate() {
+                let at = in16 + i / WIDTH * PITCH16 + i % WIDTH * 2;
+                data.cast::<u16>().add(at / 2).write_volatile(depth);
+            }
+            for (i, &(value, _)) in near.iter().enumerate() {
+                let at = in32 + i / WIDTH * PITCH32 + i % WIDTH * 4;
+                data.add(at / 4).write_volatile(value);
+            }
+            let l = &list.list;
+            l.SetComputeRootSignature(&c.root);
+            l.SetPipelineState(&c.pso);
+            l.SetComputeRootUnorderedAccessView(1, buffer.GetGPUVirtualAddress());
+            for (at16, at32, to_depth) in [(in16, out32, 1), (out16, in32, 0)] {
+                let constants = [
+                    WIDTH as u32,
+                    HEIGHT as u32,
+                    PITCH16 as u32,
+                    at16 as u32,
+                    PITCH32 as u32,
+                    at32 as u32,
+                    to_depth,
+                    0,
+                ];
+                l.SetComputeRoot32BitConstants(0, 8, constants.as_ptr().cast(), 0);
+                l.Dispatch((WIDTH as u32).div_ceil(2).div_ceil(64), HEIGHT as u32, 1);
+                l.ResourceBarrier(&[uav_barrier()]);
+            }
+            list.close();
+            host.execute(&[&list]);
+            (0..words).map(|at| data.add(at).read_volatile()).collect()
+        };
+        let half = |at: usize| (after[at / 4] >> (at % 4 * 8)) as u16;
+        for (i, &depth) in depths.iter().enumerate() {
+            let (x, y) = (i % WIDTH, i / WIDTH);
+            // The source stays as written.
+            assert_eq!(half(in16 + y * PITCH16 + x * 2), depth, "source {i}");
+            let got = after[(out32 + y * PITCH32 + x * 4) / 4];
+            assert_eq!(got, d24(u32::from(depth)), "depth {depth:#x} at {x}, {y}");
+        }
+        for (i, &(value, want)) in near.iter().enumerate() {
+            let (x, y) = (i % WIDTH, i / WIDTH);
+            let got = half(out16 + y * PITCH16 + x * 2);
+            assert_eq!(got, want, "{value:#x} at {x}, {y}");
+        }
+        for y in 0..HEIGHT {
+            // Past the odd width: no sixth 24-bit value, and a zero in the
+            // other half of the last pair of 16-bit ones.
+            let past = after[(out32 + y * PITCH32 + WIDTH * 4) / 4];
+            assert_eq!(past, UNTOUCHED, "row {y}");
+            assert_eq!(half(out16 + y * PITCH16 + WIDTH * 2), 0, "row {y}");
+        }
     }
 }

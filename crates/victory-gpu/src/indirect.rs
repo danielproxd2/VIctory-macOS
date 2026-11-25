@@ -53,7 +53,7 @@ fn clamp() -> Option<&'static Clamp> {
 }
 
 /// FNV-1a, the same hash `cargo xtask embed-clamp` writes.
-fn fnv(data: &[u8]) -> u64 {
+pub(crate) fn fnv(data: &[u8]) -> u64 {
     data.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
         (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
     })

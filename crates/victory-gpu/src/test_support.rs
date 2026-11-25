@@ -26,9 +26,10 @@
 //! instead. A test that cannot run for another reason says so with
 //! [`skipped`].
 //!
-//! Two more conditions of this platform have a line and a switch of their
-//! own ([`no_hlsl`], [`stale_clamp`]), so that a run can count the tests they kept from
-//! running and a run that is meant to prove them fails instead:
+//! Three more conditions of this platform have a line and a switch of their
+//! own ([`no_hlsl`], [`stale_clamp`], [`no_depth`]), so that a run can count
+//! the tests they kept from running and a run that is meant to prove them
+//! fails instead:
 //!
 //! * [`NO_HLSL`], `VICTORY_REQUIRE_HLSL=1`: a test compiles its own
 //!   shader with the system's HLSL compiler, and the host's cannot build
@@ -36,6 +37,8 @@
 //! * [`STALE_CLAMP`], `VICTORY_REQUIRE_CLAMP=1`: the prebuilt argument
 //!   clamp was built from an older `clamp.hlsl` and the host cannot
 //!   compile the shader itself.
+//! * [`NO_DEPTH`], `VICTORY_REQUIRE_DEPTH=1`: no bytecode of the present
+//!   `depth.hlsl` is embedded and Wine's compiler cannot build the shader.
 
 use std::io::Write;
 use std::sync::{Mutex, MutexGuard};
@@ -104,6 +107,33 @@ pub const NO_HLSL: &str = "the host HLSL compiler cannot build this test shader"
 /// used, and the host could not compile the shader either.
 pub const STALE_CLAMP: &str = "the prebuilt clamp bytecode is older than clamp.hlsl; \
      rebuild it with the clamp bytecode workflow";
+
+/// Why a test of the depth conversion did not run: `depth_bytecode.rs`
+/// holds no bytecode of the present `depth.hlsl` (none was embedded yet, or
+/// the source changed since), so there is none to use, and Wine's compiler
+/// cannot build the shader.
+pub const NO_DEPTH: &str = "no prebuilt depth conversion of this depth.hlsl; \
+     build it on a Windows runner and run `cargo xtask embed-depth`";
+
+/// Whether this process runs under Wine (its ntdll exports
+/// `wine_get_version`), where the system's HLSL compiler is vkd3d-shader's
+/// and not Microsoft's. The skips for a shader the system cannot compile
+/// are for that compiler only: anywhere else such a test fails.
+pub fn under_wine() -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+        // SAFETY: ntdll is always loaded, and both names end with a NUL.
+        unsafe {
+            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+            !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
 
 /// Whether a test whose own shader the host's HLSL compiler cannot build
 /// fails: `VICTORY_REQUIRE_HLSL=1`.
@@ -203,6 +233,30 @@ pub fn stale_clamp(test: &str) {
         STALE_CLAMP,
         test,
         require_clamp(),
+        None,
+    );
+}
+
+/// Whether a test that needs the depth conversion fails while no bytecode
+/// of the present `depth.hlsl` is embedded: `VICTORY_REQUIRE_DEPTH=1`.
+pub fn require_depth() -> bool {
+    required(std::env::var("VICTORY_REQUIRE_DEPTH").ok().as_deref())
+}
+
+/// For a test that needs the depth conversion while no bytecode of the
+/// present `depth.hlsl` is embedded and Wine's compiler cannot build the
+/// shader: the line `skipped: ` [`NO_DEPTH`] ` (<test>)`. The test returns
+/// after it.
+///
+/// # Panics
+///
+/// With `VICTORY_REQUIRE_DEPTH=1`: that fails the test.
+pub fn no_depth(test: &str) {
+    needs(
+        "VICTORY_REQUIRE_DEPTH",
+        NO_DEPTH,
+        test,
+        require_depth(),
         None,
     );
 }
@@ -399,6 +453,34 @@ mod tests {
             String::from_utf8(out).unwrap(),
             "skipped: the prebuilt clamp bytecode is older than clamp.hlsl; \
              rebuild it with the clamp bytecode workflow (indirect::a_test)\n"
+        );
+
+        let mut out = Vec::new();
+        assert_eq!(
+            unmet(
+                "VICTORY_REQUIRE_DEPTH",
+                NO_DEPTH,
+                "twin::a_test",
+                false,
+                &mut out
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "skipped: no prebuilt depth conversion of this depth.hlsl; build it on a \
+             Windows runner and run `cargo xtask embed-depth` (twin::a_test)\n"
+        );
+        assert_eq!(
+            unmet(
+                "VICTORY_REQUIRE_DEPTH",
+                NO_DEPTH,
+                "t",
+                true,
+                &mut Vec::new()
+            )
+            .unwrap_err(),
+            format!("VICTORY_REQUIRE_DEPTH=1: {NO_DEPTH} (t)")
         );
 
         let mut out = Vec::new();
