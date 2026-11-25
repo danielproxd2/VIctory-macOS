@@ -256,7 +256,8 @@ mod tests {
     use crate::dxbc::{Container, FourCC};
 
     /// The validator is not a rubber stamp: it takes a module we emit and
-    /// refuses the same container with one byte of the bitcode flipped.
+    /// refuses the same container with one byte of the bitcode flipped,
+    /// and with one feature bit of `SFI0` flipped.
     /// Without `dxil.dll` this is a printed skip (a failure with
     /// `VICTORY_REQUIRE_DXIL=1`).
     #[test]
@@ -288,5 +289,24 @@ mod tests {
         bad[start + 24 + (part.len() - 24) / 2] ^= 0xFF;
         let refused = validator.validate(&mut bad);
         assert!(refused.is_err(), "a corrupted module was accepted");
+        // A container that still parses but disagrees with its module (a
+        // feature bit the module does not use, set in `SFI0`) gets the
+        // validator's own verdict, not a failed call: measured with
+        // dxil.dll 1.9.2609, the flipped bitcode byte above makes
+        // `Validate` itself fail (0x80004005), while this one is reported
+        // as "Container part 'Feature Info' does not match expected for
+        // module." and "Validation failed.".
+        let part = Container::parse(&good)
+            .unwrap()
+            .part(FourCC::SFI0)
+            .unwrap()
+            .data;
+        let start = part.as_ptr() as usize - good.as_ptr() as usize;
+        let mut bad = good.clone();
+        bad[start] ^= 1;
+        let verdict = validator
+            .validate(&mut bad)
+            .expect_err("a wrong SFI0 was accepted");
+        assert!(verdict.contains("Validation failed"), "{verdict}");
     }
 }
