@@ -7,6 +7,7 @@
 //! rule is `cargo xtask policy`, which checks what git tracks.
 
 use std::path::{Component, Path, PathBuf};
+use std::sync::Once;
 
 /// Marker file at the root of the source tree.
 pub const ROOT_MARKER: &str = ".victory-root";
@@ -43,9 +44,16 @@ pub enum PolicyError {
 ///    Wine prefix inside the source tree makes all of `C:` part of the
 ///    tree, and a host symlink is an ordinary folder to Windows.
 pub fn ensure_outside_repo(path: &Path) -> Result<(), PolicyError> {
-    let compiled = compiled_workspace_root();
-    if let CompiledRoot::Unreadable(kind) = check(path, &compiled)? {
-        report_unreadable_root(&compiled, kind);
+    static REPORTED: Once = Once::new();
+    ensure_outside(path, &compiled_workspace_root(), &REPORTED)
+}
+
+/// [`ensure_outside_repo`] with the compiled-in source tree passed in, and
+/// with what remembers that check 1 could not be made: that is said once
+/// per `reported`, which is once per process for the public function.
+fn ensure_outside(path: &Path, compiled_root: &Path, reported: &Once) -> Result<(), PolicyError> {
+    if let CompiledRoot::Unreadable(kind) = check(path, compiled_root)? {
+        reported.call_once(|| report_unreadable_root(compiled_root, kind));
     }
     Ok(())
 }
@@ -61,7 +69,7 @@ enum CompiledRoot {
     Unreadable(std::io::ErrorKind),
 }
 
-/// Says, once per process, that check 1 could not be made.
+/// Says that check 1 could not be made.
 ///
 /// A tree that is not there is the normal case for a binary that runs on
 /// another machine, or under Wine on another drive than the tree's (where
@@ -69,22 +77,19 @@ enum CompiledRoot {
 /// such as a tree that may not be read, is a warning: the path was not
 /// compared with the tree and only the marker checks stand.
 fn report_unreadable_root(root: &Path, kind: std::io::ErrorKind) {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        if kind == std::io::ErrorKind::NotFound {
-            tracing::debug!(
-                root = %root.display(),
-                "asset policy: the source tree this binary was built from is not here"
-            );
-        } else {
-            tracing::warn!(
-                root = %root.display(),
-                error = %kind,
-                "asset policy: cannot read the source tree this binary was built from; \
-                 paths are only checked for the {ROOT_MARKER} marker"
-            );
-        }
-    });
+    if kind == std::io::ErrorKind::NotFound {
+        tracing::debug!(
+            root = %root.display(),
+            "asset policy: the source tree this binary was built from is not here"
+        );
+    } else {
+        tracing::warn!(
+            root = %root.display(),
+            error = %kind,
+            "asset policy: cannot read the source tree this binary was built from; \
+             paths are only checked for the {ROOT_MARKER} marker"
+        );
+    }
 }
 
 /// [`ensure_outside_repo`] with the compiled-in source tree passed in.
@@ -319,6 +324,7 @@ fn normalize(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt;
 
     #[test]
     fn rejects_paths_inside_this_repo() {
@@ -368,6 +374,41 @@ mod tests {
         ));
     }
 
+    /// Collects the log events of the code a test runs.
+    struct Events(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl tracing::Subscriber for Events {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Text(String);
+            impl tracing::field::Visit for Text {
+                fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+                    use fmt::Write;
+                    let _ = write!(self.0, " {}={value:?}", field.name());
+                }
+            }
+            let mut text = Text(event.metadata().level().to_string());
+            event.record(&mut text);
+            self.0.lock().unwrap().push(text.0);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// What `run` logs on this thread, one "LEVEL field=value ..." each.
+    fn events_of(run: impl FnOnce()) -> Vec<String> {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        tracing::subscriber::with_default(Events(events.clone()), run);
+        events.lock().unwrap().clone()
+    }
+
     #[test]
     fn unreadable_compiled_root_is_reported() {
         let tmp = tempfile::tempdir().unwrap();
@@ -377,12 +418,73 @@ mod tests {
             check(&path, &gone).unwrap(),
             CompiledRoot::Unreadable(std::io::ErrorKind::NotFound)
         );
+        // It is said, once for each `Once`, and a tree that is merely not
+        // here is not worth a warning.
+        let reported = Once::new();
+        let events = events_of(|| {
+            ensure_outside(&path, &gone, &reported).unwrap();
+            ensure_outside(&path.join("deeper"), &gone, &reported).unwrap();
+        });
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(events[0].starts_with("DEBUG "), "{events:?}");
+        assert!(
+            events[0].contains("is not here") && events[0].contains("no-such-tree"),
+            "{events:?}"
+        );
+        let again = events_of(|| ensure_outside(&path, &gone, &Once::new()).unwrap());
+        assert_eq!(again.len(), 1, "another `Once` reports again: {again:?}");
+        // A tree that was compared has nothing to report.
+        let tree = tmp.path().join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        for marked in [false, true] {
+            if marked {
+                std::fs::write(tree.join(ROOT_MARKER), "").unwrap();
+            }
+            let events = events_of(|| ensure_outside(&path, &tree, &Once::new()).unwrap());
+            assert_eq!(events, Vec::<String>::new(), "marked: {marked}");
+        }
         // The marker check still stands without the compiled-in tree.
         std::fs::write(tmp.path().join(ROOT_MARKER), "").unwrap();
         assert!(matches!(
             check(&path, &gone),
             Err(PolicyError::InsideRepo { .. })
         ));
+    }
+
+    /// A tree that is there but cannot be looked at is a warning: here its
+    /// path leads through a file.
+    #[cfg(unix)]
+    #[test]
+    fn compiled_root_that_cannot_be_read_is_a_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("file"), "").unwrap();
+        let root = tmp.path().join("file").join("tree");
+        let path = tmp.path().join("cache");
+        let kind = match check(&path, &root).unwrap() {
+            CompiledRoot::Unreadable(kind) => kind,
+            other => panic!("expected Unreadable, got {other:?}"),
+        };
+        assert_ne!(kind, std::io::ErrorKind::NotFound);
+        let reported = Once::new();
+        let events = events_of(|| {
+            ensure_outside(&path, &root, &reported).unwrap();
+            ensure_outside(&path, &root, &reported).unwrap();
+        });
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(events[0].starts_with("WARN "), "{events:?}");
+        assert!(
+            events[0].contains("cannot read the source tree")
+                && events[0].contains(ROOT_MARKER)
+                && events[0].contains(&root.display().to_string()),
+            "{events:?}"
+        );
+        // The path is still refused where a marker says so, without a word.
+        std::fs::write(tmp.path().join(ROOT_MARKER), "").unwrap();
+        let events = events_of(|| {
+            let refused = ensure_outside(&path, &root, &Once::new());
+            assert!(matches!(refused, Err(PolicyError::InsideRepo { .. })));
+        });
+        assert_eq!(events, Vec::<String>::new());
     }
 
     #[test]
