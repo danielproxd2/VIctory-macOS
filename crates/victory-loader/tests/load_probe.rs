@@ -77,6 +77,26 @@ impl ImportResolver for TestResolver {
     }
 }
 
+/// Passes every question on to `inner` and keeps what it answered: who
+/// provides each import, by the import's own name.
+struct Recording<'a> {
+    inner: &'a dyn ImportResolver,
+    answers: std::cell::RefCell<Vec<(String, Option<Provenance>)>>,
+}
+
+impl ImportResolver for Recording<'_> {
+    fn resolve(&self, dll: &str, symbol: &ImportSymbol) -> Resolution {
+        let answer = self.inner.resolve(dll, symbol);
+        let provenance = match answer {
+            Resolution::Found { provenance, .. } => Some(provenance),
+            Resolution::Missing => None,
+        };
+        let import = format!("{}!{symbol}", dll.to_ascii_lowercase());
+        self.answers.borrow_mut().push((import, provenance));
+        answer
+    }
+}
+
 fn host(dll: &str, name: &str) -> Option<usize> {
     let dll = CString::new(dll).ok()?;
     let name = CString::new(name).ok()?;
@@ -138,33 +158,79 @@ fn loads_binds_and_calls_probe() {
         // SAFETY: its imports are bound, and it depends on no other title DLL.
         unsafe { dll.attach() }.unwrap();
     }
+    let recording = Recording {
+        inner: &resolver,
+        answers: Default::default(),
+    };
     let report = image
-        .bind_imports(&resolver, UnimplementedPolicy::ReturnZero)
+        .bind_imports(&recording, UnimplementedPolicy::ReturnZero)
         .unwrap();
+    let answers = recording.answers.into_inner();
 
-    // Every import is accounted for, and each one of title_a.dll is bound
-    // to that DLL.
+    // Who provides each import the probe is written to have, by name. The
+    // probe's runtime imports more from the host, and which ones depends
+    // on the toolchain that built it, so those are held to a rule instead
+    // of a list: whatever is not named here comes from the host.
+    const FROM_HLE: [&str; 3] = [
+        "xgameruntime.dll!XGameRuntimeInitialize",
+        "kernel32.dll!GetTickCount",
+        "victory-probe-delayed.dll!VIctoryProbeDelayed",
+    ];
+    const FROM_TITLE: [&str; 3] = [
+        "title_a.dll!title_a_named",
+        "title_a.dll!#7",
+        "title_a.dll!TITLE_A_DATA",
+    ];
+    const FROM_HOST: &str = "kernel32.dll!GetCurrentProcessId";
+    const MISSING: &str = "victory-probe-missing.dll!VIctoryProbeNotImplemented";
+    let provided_by = |wanted: Option<Provenance>| -> Vec<&str> {
+        let mut names: Vec<_> = answers
+            .iter()
+            .filter(|(_, provenance)| *provenance == wanted)
+            .map(|(import, _)| import.as_str())
+            .collect();
+        names.sort_unstable();
+        names
+    };
+    let sorted = |names: &[&'static str]| {
+        let mut names = names.to_vec();
+        names.sort_unstable();
+        names
+    };
+    assert_eq!(provided_by(Some(Provenance::Hle)), sorted(&FROM_HLE));
+    assert_eq!(provided_by(Some(Provenance::Title)), sorted(&FROM_TITLE));
+    assert_eq!(provided_by(None), [MISSING]);
+    let from_host = provided_by(Some(Provenance::Host));
+    assert!(from_host.contains(&FROM_HOST), "{from_host:?}");
+
+    // The loader asked once for each import of the image, delay imports
+    // included, and for nothing else.
     let info = image.info();
-    let from_title_a = info
+    let mut asked: Vec<_> = answers.iter().map(|(import, _)| import.clone()).collect();
+    let mut imported: Vec<_> = info
         .imports
         .iter()
-        .filter(|m| m.dll.eq_ignore_ascii_case("title_a.dll"))
-        .map(|m| m.entries.len())
-        .sum::<usize>();
-    assert!(from_title_a > 0, "{imports:?}");
-    assert_eq!(report.title, from_title_a);
-    assert!(report.hle > 0);
-    assert!(report.host > 0);
-    let bound = info.imports.iter().chain(&info.delay_imports);
-    assert_eq!(
-        report.hle + report.host + report.title + report.missing.len(),
-        bound.map(|m| m.entries.len()).sum::<usize>()
-    );
-    let missing: Vec<_> = report.missing.iter().map(|m| m.symbol.as_str()).collect();
-    assert!(
-        missing.contains(&"VIctoryProbeNotImplemented"),
-        "{missing:?}"
-    );
+        .chain(&info.delay_imports)
+        .flat_map(|m| {
+            let dll = m.dll.to_ascii_lowercase();
+            m.entries.iter().map(move |e| format!("{dll}!{}", e.symbol))
+        })
+        .collect();
+    asked.sort_unstable();
+    imported.sort_unstable();
+    assert_eq!(asked, imported);
+
+    // Its report says the same: each count is the number of imports with
+    // that answer, and what is missing is missing by name.
+    assert_eq!(report.hle, FROM_HLE.len());
+    assert_eq!(report.title, FROM_TITLE.len());
+    assert_eq!(report.host, from_host.len());
+    let missing: Vec<_> = report
+        .missing
+        .iter()
+        .map(|m| format!("{}!{}", m.dll.to_ascii_lowercase(), m.symbol))
+        .collect();
+    assert_eq!(missing, [MISSING]);
 
     let call = |name: &str| -> usize { image.export(name).unwrap_or_else(|| panic!("{name}")) };
     // SAFETY: the exports have the signatures declared in the fixture and
