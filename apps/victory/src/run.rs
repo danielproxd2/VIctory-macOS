@@ -8,6 +8,11 @@ use crate::{Console, Unimplemented};
 /// Prepares, maps and binds the title `exe`, and with `execute` starts it
 /// and waits for its entry point to return. What is known before the title
 /// runs, and how it ended, goes to `out`.
+///
+/// Returns what the title's entry point returned, if it ran: the caller
+/// ends the process with it, as the exit code of a Windows process is what
+/// its main function returns. (A title that calls `exit` itself ends the
+/// process with its code there and then.)
 #[cfg(windows)]
 pub fn run(
     exe: &Path,
@@ -16,7 +21,7 @@ pub fn run(
     execute: bool,
     console: Console,
     out: &mut dyn Write,
-) -> Result<()> {
+) -> Result<Option<u32>> {
     use std::sync::Arc;
     use victory_hle::{HleResolver, HostPolicy};
     use victory_loader::{UnimplementedPolicy, WithTitleDlls};
@@ -112,7 +117,7 @@ pub fn run(
     out.write_all(bound(&exe_name, &report).as_bytes())?;
     if !execute {
         writeln!(out, "not executing (pass --execute to start the title)")?;
-        return Ok(());
+        return Ok(None);
     }
     // Whoever reads the report sees it before the title says anything.
     out.flush()?;
@@ -138,7 +143,7 @@ pub fn run(
         .join()
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
     writeln!(out, "title exited with {code}")?;
-    Ok(())
+    Ok(Some(code))
 }
 
 /// The lines of the report about one image's imports: who provides how
@@ -398,7 +403,7 @@ pub fn run(
     _: bool,
     _: Console,
     _: &mut dyn Write,
-) -> Result<()> {
+) -> Result<Option<u32>> {
     anyhow::bail!("running titles requires Windows")
 }
 
@@ -416,14 +421,8 @@ mod tests {
         for execute in [false, true] {
             let (text, result) = report(|out| {
                 let exe = Path::new("title.exe");
-                super::run(
-                    exe,
-                    Unimplemented::Trap,
-                    false,
-                    execute,
-                    Console::SeriesX,
-                    out,
-                )
+                let (trap, console) = (Unimplemented::Trap, Console::SeriesX);
+                super::run(exe, trap, false, execute, console, out).map(drop)
             });
             let error = result.expect_err("no loader here").to_string();
             assert_eq!(error, "running titles requires Windows");

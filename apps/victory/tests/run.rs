@@ -255,6 +255,10 @@ mod with_the_stand_in_title {
         std::fs::write(home.path("title").join("MicrosoftGame.config"), MANIFEST).unwrap();
         let run = home.victory(&["run".as_ref(), "--execute".as_ref(), title.as_os_str()]);
 
+        // What the title's entry point returned is how `victory` ends, as
+        // it is for a process whose main function returns.
+        assert_eq!(run.code, Some(EXIT_BASE), "{run:#?}");
+
         // The report: what was bound, then how the title ended.
         assert_eq!(
             run.stdout.lines().last(),
@@ -387,6 +391,8 @@ mod with_the_stand_in_title {
             title.as_os_str(),
         ];
         let run = home.victory(&args);
+        // A code that does not fit a byte arrives whole.
+        assert_eq!(run.code, Some(FAILED_NO_LOG), "{run:#?}");
         assert_eq!(
             run.stdout.lines().last(),
             Some(format!("title exited with {FAILED_NO_LOG}").as_str()),

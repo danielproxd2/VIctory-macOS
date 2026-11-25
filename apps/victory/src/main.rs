@@ -125,6 +125,9 @@ enum Console {
     SeriesS,
 }
 
+/// An error ends the process with status 1 (and clap, which refuses the
+/// arguments, with 2). A title that ran to the end of its entry point ends
+/// it with what that returned; everything else that succeeds, with 0.
 fn main() -> Result<()> {
     victory_core::logging::init("info");
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
@@ -133,28 +136,48 @@ fn main() -> Result<()> {
         return Ok(());
     }
     // Not locked: a running title's threads log while `run` is in here.
-    dispatch(Cli::parse(), &mut std::io::stdout())
+    match dispatch(Cli::parse(), &mut std::io::stdout())? {
+        Some(code) => end_with(code),
+        None => Ok(()),
+    }
 }
 
-/// Runs the command; its report goes to `out`.
-fn dispatch(cli: Cli, out: &mut dyn Write) -> Result<()> {
+/// Ends the process with the exit code of the title that ran in it.
+///
+/// Through the C runtime's `exit`, which is how a title ends the process
+/// itself and what returning from `main` comes to: its exit functions
+/// include the loader's detach of the title. `std::process::exit` goes
+/// to `ExitProcess` on Windows, past them.
+fn end_with(code: u32) -> ! {
+    unsafe extern "C" {
+        fn exit(code: i32) -> !;
+    }
+    // The runtime's own flush at the end of `main` is not reached.
+    let _ = std::io::stdout().flush();
+    // SAFETY: the C runtime's `exit`, with the same bits as the code.
+    unsafe { exit(code.cast_signed()) }
+}
+
+/// Runs the command; its report goes to `out`. Returns the exit code of
+/// the title, if `run --execute` ran one to the end of its entry point.
+fn dispatch(cli: Cli, out: &mut dyn Write) -> Result<Option<u32>> {
     match cli.command {
         Command::Inspect {
             file,
             imports,
             exports,
-        } => inspect::run(&file, imports, exports, out),
+        } => inspect::run(&file, imports, exports, out)?,
         Command::Census {
             paths,
             strict,
             missing,
-        } => census::run(paths, strict, missing, out),
-        Command::LibExports { lib, list } => inspect::lib_exports(&lib, list, out),
+        } => census::run(paths, strict, missing, out)?,
+        Command::LibExports { lib, list } => inspect::lib_exports(&lib, list, out)?,
         Command::ShaderInfo {
             paths,
             verbose,
             disasm,
-        } => shader::run(paths, verbose || disasm, disasm, out),
+        } => shader::run(paths, verbose || disasm, disasm, out)?,
         Command::Translate {
             paths,
             validate,
@@ -171,7 +194,7 @@ fn dispatch(cli: Cli, out: &mut dyn Write) -> Result<()> {
                     &std::env::var("VICTORY_PAIRS").unwrap_or_default(),
                 ),
             };
-            translate::run(paths, &options, out)
+            translate::run(paths, &options, out)?
         }
         Command::Run {
             exe,
@@ -180,13 +203,14 @@ fn dispatch(cli: Cli, out: &mut dyn Write) -> Result<()> {
             execute,
             console,
             title_args: _,
-        } => run::run(&exe, unimplemented, strict, execute, console, out),
+        } => return run::run(&exe, unimplemented, strict, execute, console, out),
         Command::Config => show_config(
             &victory_core::Config::load()?,
             &|path| victory_core::ensure_outside_repo(path).map_err(|e| e.to_string()),
             out,
-        ),
+        )?,
     }
+    Ok(None)
 }
 
 /// Prints `cfg` in full, then fails if it cannot be used as it is: a path
@@ -560,12 +584,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let image = crate::testing::write(dir.path(), "title.dll", &crate::testing::title_image());
         let cli = Cli::try_parse_from(["victory", "inspect", image.to_str().unwrap()]).unwrap();
-        let text = report_of(|out| dispatch(cli, out));
+        let text = report_of(|out| dispatch(cli, out).map(drop));
         assert_eq!(line(&text, "kind "), "kind           dll");
 
         let absent = dir.path().join("absent.dll");
         let cli = Cli::try_parse_from(["victory", "inspect", absent.to_str().unwrap()]).unwrap();
-        let (text, result) = report(|out| dispatch(cli, out));
+        let (text, result) = report(|out| dispatch(cli, out).map(drop));
         assert!(result.is_err());
         assert_eq!(text, "");
     }
@@ -726,7 +750,7 @@ mod tests {
         crate::testing::write(dir.path(), "vs.bin", &crate::testing::vertex_container());
         let folder = dir.path().to_str().unwrap();
         let cli = Cli::try_parse_from(["victory", "translate", "--jobs", "1", folder]).unwrap();
-        let text = report_of(|out| dispatch(cli, out));
+        let text = report_of(|out| dispatch(cli, out).map(drop));
         assert!(
             line(&text, "programs ").starts_with("programs     1 translated of 1 ("),
             "{text}"
@@ -746,7 +770,7 @@ mod tests {
         let folder = dir.path().to_str().unwrap();
         for flag in ["--validate", "--pipelines"] {
             let cli = Cli::try_parse_from(["victory", "translate", flag, folder]).unwrap();
-            let (text, result) = report(|out| dispatch(cli, out));
+            let (text, result) = report(|out| dispatch(cli, out).map(drop));
             let error = result.expect_err(flag).to_string();
             assert!(
                 error.starts_with(&format!("{flag} needs a Windows host")),
