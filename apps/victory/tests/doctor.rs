@@ -5,10 +5,10 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
-/// Runs `victory doctor` with no config file (the working directory has
-/// none) and with the cache and data folders in `home`. `game` is the
-/// configured game directory, if any.
-fn doctor(home: &Path, game: Option<&str>) -> Output {
+/// `victory doctor`, started where there is no victory.toml, with no
+/// variable of the caller's shell and with the cache and data folders in
+/// `home`.
+fn doctor_command(home: &Path) -> Command {
     let elsewhere = std::env::temp_dir();
     assert!(
         !elsewhere.join("victory.toml").exists(),
@@ -25,11 +25,31 @@ fn doctor(home: &Path, game: Option<&str>) -> Output {
         .env_remove("VICTORY_GAME_DIR")
         .env("VICTORY_CACHE_DIR", home.join("cache"))
         .env("VICTORY_DATA_DIR", home.join("data"));
+    command
+}
+
+/// Runs `victory doctor` with no config file (the working directory has
+/// none). `game` is the configured game directory, if any.
+fn doctor(home: &Path, game: Option<&str>) -> Output {
+    let mut command = doctor_command(home);
     if let Some(game) = game {
         command.env("VICTORY_GAME_DIR", game);
     }
     command.output().expect("victory starts")
 }
+
+/// Kept for as long as a child lives that may make a device: on Windows
+/// and under Wine the doctor makes one where there is one, and the device
+/// tests of this binary must not run beside it. Unlike
+/// `test_support::gpu` it asks for no device, so the test runs on every
+/// host. The native build makes no device and takes no lock.
+#[cfg(windows)]
+fn child_may_make_a_device() -> victory_gpu::test_support::Serial {
+    victory_gpu::test_support::serial()
+}
+
+#[cfg(not(windows))]
+fn child_may_make_a_device() {}
 
 /// The report's one line about `name`: its mark and what it says.
 #[track_caller]
@@ -106,6 +126,7 @@ fn doctor_runs_natively_and_says_what_it_did_not_check() {
 /// goes on to every other item and does not count it as a problem.
 #[test]
 fn doctor_names_the_example_game_dir_and_goes_on() {
+    let _device = child_may_make_a_device();
     let home = tempfile::tempdir().unwrap();
     let out = doctor(home.path(), Some(r"D:\victory-data\game"));
     let report = status_follows_the_marks(&out);
