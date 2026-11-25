@@ -27,88 +27,7 @@ use crate::host::{HostList, host, transition};
 /// runner, and `clamp_bytecode.rs` holds the result, because Wine's HLSL
 /// compiler (vkd3d-shader) cannot compile it; that bytecode is used only
 /// while its `SOURCE_HASH` names this text.
-const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1)"
-cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint unused; };
-RWByteAddressBuffer args : register(u0);
-// The list's work so far (vertex instances, threads): past the budget,
-// records run empty.
-RWByteAddressBuffer budget : register(u1);
-static const uint BUDGET = 1u << 27;
-// Groups of one dispatch; more run empty.
-static const uint GROUPS = 1u << 20;
-// Clamps the record at `at` in place; its cost.
-uint clamped(uint at) {
-    uint cost;
-    if (kind <= 1) {
-        // Draws: vertex or index count, then instances.
-        uint count = min(args.Load(at), 1u << 24);
-        uint instances = min(args.Load(at + 4), (1u << 26) / max(count, 1u));
-        cost = count * instances;
-        args.Store2(at, uint2(count, instances));
-    } else if (kind == 2) {
-        uint3 g = min(args.Load3(at), uint3(65535, 65535, 65535));
-        // x * y fits 32 bits; the whole count may not.
-        if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
-            g = uint3(0, 0, 0);
-        }
-        cost = g.x * g.y * g.z * 64;
-        args.Store3(at, g);
-    } else {
-        // Mesh dispatches: the console's are one-dimensional.
-        uint3 g = args.Load3(at);
-        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
-        cost = g.x * g.y * g.z * 128;
-        args.Store3(at, g);
-    }
-    return cost;
-}
-// A record past the budget (no cost reaches it).
-static const uint PAST = 0xffffffffu;
-groupshared uint costs[64];
-// One group walks the records in tiles of 64: every lane clamps its own
-// record, then the first lane charges the tile's records in order. No
-// other group shares the budget: a shared add wraps once enough records
-// are rejected, and a compare-exchange retries more the more records fit.
-[RootSignature(RS)]
-[numthreads(64, 1, 1)]
-void main(uint lane : SV_GroupIndex) {
-    uint left = 0;
-    if (lane == 0) {
-        left = BUDGET - min(budget.Load(0), BUDGET);
-    }
-    for (uint tile = 0; tile < records / 64 + min(records % 64, 1u); tile++) {
-        uint record = tile * 64 + lane;
-        uint at = record * stride;
-        uint cost = 0;
-        if (record < records) {
-            cost = clamped(at);
-        }
-        costs[lane] = cost;
-        GroupMemoryBarrierWithGroupSync();
-        if (lane == 0) {
-            for (uint i = 0; i < 64; i++) {
-                if (costs[i] > left) {
-                    // The first record that does not fit takes what is
-                    // left, so those after it run empty too.
-                    costs[i] = PAST;
-                    left = 0;
-                } else {
-                    left -= costs[i];
-                }
-            }
-        }
-        GroupMemoryBarrierWithGroupSync();
-        if (costs[lane] == PAST) {
-            // Draws keep their layout with no vertices; groups become zero.
-            args.Store(at, 0);
-        }
-    }
-    if (lane == 0) {
-        budget.Store(0, BUDGET - left);
-    }
-}
-"#;
+const SOURCE: &str = include_str!("clamp.hlsl");
 
 struct Clamp {
     root: ID3D12RootSignature,
@@ -146,10 +65,22 @@ pub(crate) fn source_hash() -> u64 {
     fnv(SOURCE.as_bytes())
 }
 
+/// Whether the prebuilt bytecode was built from another source than the
+/// present `clamp.hlsl`. It is not used then: the shader's dispatch and
+/// its records' layout are this file's, and the bytecode's may differ.
+fn stale() -> bool {
+    crate::clamp_bytecode::SOURCE_HASH != source_hash()
+}
+
 fn make() -> windows::core::Result<Clamp> {
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
     // Prebuilt bytecode first, as long as it was built from this source.
-    if crate::clamp_bytecode::SOURCE_HASH == source_hash() {
+    if stale() {
+        tracing::warn!(
+            "the prebuilt argument clamp is older than clamp.hlsl and is not used \
+             (rebuild it with the clamp bytecode workflow); compiling the shader here"
+        );
+    } else {
         for bytes in [crate::clamp_bytecode::DXIL, crate::clamp_bytecode::DXBC] {
             if bytes.is_empty() {
                 continue;
@@ -298,9 +229,38 @@ mod tests {
 
     /// The prebuilt bytecode is the one in use: its hash names this source.
     /// Otherwise the shader is compiled here, which Wine cannot do.
+    ///
+    /// While this fails the embed is stale: `clamp.hlsl` changed and
+    /// `clamp_bytecode.rs` was not rebuilt (the clamp bytecode workflow on
+    /// a Windows runner, then `cargo xtask embed-clamp` and the policy
+    /// entry it prints). Under Wine there is no argument clamp then, and
+    /// every indirect execution is dropped. The tests below that need the
+    /// clamp say "skipped" meanwhile; this one must stay red.
     #[test]
     fn prebuilt_clamp_names_this_source() {
         assert_eq!(crate::clamp_bytecode::SOURCE_HASH, super::source_hash());
+    }
+
+    /// Whether there is a clamp for `test`, which needs one. Without one
+    /// the test did not run: while the prebuilt bytecode is stale and the
+    /// host cannot compile the shader itself, that is the line `skipped:
+    /// the prebuilt clamp bytecode is older than clamp.hlsl; ...
+    /// (<test>)`, or a failure with `VICTORY_REQUIRE_CLAMP=1`.
+    ///
+    /// # Panics
+    ///
+    /// Without a clamp for any other reason: the prebuilt bytecode names
+    /// this source and the host refused it, which no rebuild explains.
+    fn clamp_for(test: &str) -> bool {
+        if super::clamp().is_some() {
+            return true;
+        }
+        assert!(
+            super::stale(),
+            "{test}: no clamp, though the prebuilt bytecode names this source"
+        );
+        crate::test_support::stale_clamp(test);
+        false
     }
 
     /// The clamp compiles with the system's compiler and the host takes it.
@@ -309,6 +269,9 @@ mod tests {
         let Some(_gpu) = crate::testing::gpu() else {
             return;
         };
+        if !clamp_for("indirect::argument_clamp_builds") {
+            return;
+        }
         assert!(super::clamp().is_some());
     }
 
@@ -358,6 +321,9 @@ mod tests {
         let Some(_gpu) = crate::testing::gpu() else {
             return;
         };
+        if !clamp_for("indirect::rejected_records_do_not_wrap_the_budget") {
+            return;
+        }
         let Some(draws) = clamped(0, &[u32::MAX], 128, 1) else {
             return; // no host GPU here
         };
@@ -374,6 +340,9 @@ mod tests {
         let Some(_gpu) = crate::testing::gpu() else {
             return;
         };
+        if !clamp_for("indirect::the_budget_goes_to_the_first_records") {
+            return;
+        }
         let Some(draws) = clamped(0, &[3 << 18, 1, 0, 0], 200, 1) else {
             return; // no host GPU here
         };
@@ -391,6 +360,9 @@ mod tests {
         let Some(_gpu) = crate::testing::gpu() else {
             return;
         };
+        if !clamp_for("indirect::a_record_that_does_not_fit_ends_the_budget") {
+            return;
+        }
         let mut words = [1 << 24, 3, 0, 0].repeat(3);
         words.extend([3, 1, 0, 0].repeat(6));
         let Some(draws) = clamped(0, &words, 8, 1) else {
@@ -407,6 +379,9 @@ mod tests {
         let Some(_gpu) = crate::testing::gpu() else {
             return;
         };
+        if !clamp_for("indirect::a_spent_budget_stays_spent") {
+            return;
+        }
         let Some(twice) = clamped(1, &[u32::MAX], 64, 2) else {
             return; // no host GPU here
         };
