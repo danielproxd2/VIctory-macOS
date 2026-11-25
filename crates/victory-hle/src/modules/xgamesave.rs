@@ -26,7 +26,7 @@ use std::sync::Mutex;
 
 use super::xasync::{self, AsyncBlock, E_INVALIDARG};
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, query_interface, text,
+    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, put, query_interface, text,
 };
 use super::{storage, xuser};
 use crate::runtime;
@@ -688,6 +688,37 @@ static DELETE: u8 = 0;
 static READ: u8 = 0;
 static SUBMIT: u8 = 0;
 
+/// The provider of the running title for `config`, as a handle.
+fn open_provider(config: *const c_char) -> Result<*mut Provider, HRESULT> {
+    let saves = runtime::title().saves();
+    if saves.parent().is_none_or(|p| p.as_os_str().is_empty()) {
+        return Err(NO_ACCESS);
+    }
+    Provider::open(&saves, text(config).as_deref()).map(give)
+}
+
+/// `XGameSaveInitializeProvider`: done before it returns, as documented
+/// for the blocking call. Nothing is ever synchronised, so the provider is
+/// the one the async call makes. The handle is null on failure.
+extern "system" fn initialize(
+    _: This,
+    _user: *const c_void,
+    config: *const c_char,
+    _sync_on_demand: bool,
+    out: *mut *mut Provider,
+) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    let (provider, hr) = match open_provider(config) {
+        Ok(provider) => (provider, S_OK),
+        Err(hr) => (std::ptr::null_mut(), hr),
+    };
+    // SAFETY: checked non-null; the title passes room for a handle.
+    unsafe { out.write(provider) };
+    hr
+}
+
 extern "system" fn initialize_async(
     _: This,
     _user: *const c_void,
@@ -695,12 +726,7 @@ extern "system" fn initialize_async(
     _sync_on_demand: bool,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    let saves = runtime::title().saves();
-    let result = if saves.parent().is_none_or(|p| p.as_os_str().is_empty()) {
-        Err(NO_ACCESS)
-    } else {
-        Provider::open(&saves, text(config).as_deref()).map(|p| xasync::bytes(give(p)))
-    };
+    let result = open_provider(config).map(xasync::bytes);
     xasync::finished_with(block, (&raw const INIT).cast(), result)
 }
 extern "system" fn initialize_result(
@@ -712,6 +738,14 @@ extern "system" fn initialize_result(
 }
 extern "system" fn close_provider(_: This, provider: *mut Provider) {
     take(provider);
+}
+
+/// `XGameSaveGetRemainingQuota`.
+extern "system" fn quota(_: This, provider: *const Provider, out: *mut i64) -> HRESULT {
+    match get(provider) {
+        Some(p) if !out.is_null() => put(out, p.remaining() as i64),
+        _ => E_INVALIDARG,
+    }
 }
 
 extern "system" fn quota_async(
@@ -728,17 +762,31 @@ extern "system" fn quota_result(_: This, block: *mut AsyncBlock, out: *mut i64) 
     xasync::result(block, (&raw const QUOTA_CALL).cast(), out)
 }
 
+/// What deleting the container `name` of `provider` comes to.
+fn delete_named(provider: *const Provider, name: *const c_char) -> HRESULT {
+    match (get(provider), text(name)) {
+        (Some(p), Some(name)) if valid_container(&name) => delete(&p.root, &name),
+        (Some(_), Some(_)) => INVALID_CONTAINER_NAME,
+        _ => E_INVALIDARG,
+    }
+}
+
+/// `XGameSaveDeleteContainer`.
+extern "system" fn delete_container(
+    _: This,
+    provider: *const Provider,
+    name: *const c_char,
+) -> HRESULT {
+    delete_named(provider, name)
+}
+
 extern "system" fn delete_async(
     _: This,
     provider: *const Provider,
     name: *const c_char,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    let hr = match (get(provider), text(name)) {
-        (Some(p), Some(name)) if valid_container(&name) => delete(&p.root, &name),
-        (Some(_), Some(_)) => INVALID_CONTAINER_NAME,
-        _ => E_INVALIDARG,
-    };
+    let hr = delete_named(provider, name);
     xasync::finished(block, (&raw const DELETE).cast(), hr)
 }
 extern "system" fn delete_result(_: This, block: *mut AsyncBlock) -> HRESULT {
@@ -778,6 +826,23 @@ extern "system" fn enumerate_containers(
     S_OK
 }
 
+/// `XGameSaveEnumerateContainerInfoByName`: the containers whose names
+/// start with `prefix`; without a prefix (it is optional), all of them.
+extern "system" fn enumerate_containers_by_name(
+    _: This,
+    provider: *const Provider,
+    prefix: *const c_char,
+    context: *mut c_void,
+    callback: Option<ContainerCallback>,
+) -> HRESULT {
+    let (Some(p), Some(callback)) = (get(provider), callback) else {
+        return E_INVALIDARG;
+    };
+    let prefix = text(prefix).unwrap_or_default();
+    report(&p.root, |n| n.starts_with(&prefix), context, callback);
+    S_OK
+}
+
 /// The container exists once an update to it is submitted.
 extern "system" fn create_container(
     _: This,
@@ -795,6 +860,16 @@ extern "system" fn create_container(
 }
 extern "system" fn close_container(_: This, container: *mut Container) {
     take(container);
+}
+
+/// `XGameSaveEnumerateBlobInfo`: every blob of the container.
+extern "system" fn enumerate_all_blobs(
+    this: This,
+    container: *const Container,
+    context: *mut c_void,
+    callback: Option<BlobCallback>,
+) -> HRESULT {
+    enumerate_blobs(this, container, std::ptr::null(), context, callback)
 }
 
 extern "system" fn enumerate_blobs(
@@ -975,6 +1050,11 @@ extern "system" fn delete_blob(_: This, update: *mut Update, name: *const c_char
     }
 }
 
+/// `XGameSaveSubmitUpdate`: the update is committed before it returns.
+extern "system" fn submit(_: This, update: *const Update) -> HRESULT {
+    get(update).map_or(E_INVALIDARG, Update::submit)
+}
+
 extern "system" fn submit_async(_: This, update: *const Update, block: *mut AsyncBlock) -> HRESULT {
     let hr = get(update).map_or(E_INVALIDARG, Update::submit);
     xasync::finished(block, (&raw const SUBMIT).cast(), hr)
@@ -988,37 +1068,38 @@ static VTABLE: Methods<30> = Methods([
     query_interface as *const (),
     add_ref as *const (),
     add_ref as *const (),
-    missing::<3> as *const (),         // 0x18 initialize (blocking)
-    initialize_async as *const (),     // 0x20
-    initialize_result as *const (),    // 0x28
-    close_provider as *const (),       // 0x30
-    missing::<7> as *const (),         // 0x38 remaining quota (blocking)
-    quota_async as *const (),          // 0x40
-    quota_result as *const (),         // 0x48
-    missing::<10> as *const (),        // 0x50 delete (blocking)
-    delete_async as *const (),         // 0x58
-    delete_result as *const (),        // 0x60
-    container_info as *const (),       // 0x68
-    enumerate_containers as *const (), // 0x70
-    missing::<15> as *const (),        // 0x78 by name prefix
-    create_container as *const (),     // 0x80
-    close_container as *const (),      // 0x88
-    missing::<18> as *const (),        // 0x90 all blob info
-    enumerate_blobs as *const (),      // 0x98 by name prefix
-    read_blobs as *const (),           // 0xa0
-    read_async as *const (),           // 0xa8
-    read_result as *const (),          // 0xb0
-    create_update as *const (),        // 0xb8
-    close_update as *const (),         // 0xc0
-    write_blob as *const (),           // 0xc8
-    delete_blob as *const (),          // 0xd0
-    missing::<27> as *const (),        // 0xd8 submit (blocking)
-    submit_async as *const (),         // 0xe0
-    submit_result as *const (),        // 0xe8
+    initialize as *const (),                   // 0x18 blocking
+    initialize_async as *const (),             // 0x20
+    initialize_result as *const (),            // 0x28
+    close_provider as *const (),               // 0x30
+    quota as *const (),                        // 0x38 blocking
+    quota_async as *const (),                  // 0x40
+    quota_result as *const (),                 // 0x48
+    delete_container as *const (),             // 0x50 blocking
+    delete_async as *const (),                 // 0x58
+    delete_result as *const (),                // 0x60
+    container_info as *const (),               // 0x68
+    enumerate_containers as *const (),         // 0x70
+    enumerate_containers_by_name as *const (), // 0x78
+    create_container as *const (),             // 0x80
+    close_container as *const (),              // 0x88
+    enumerate_all_blobs as *const (),          // 0x90
+    enumerate_blobs as *const (),              // 0x98 by name prefix
+    read_blobs as *const (),                   // 0xa0
+    read_async as *const (),                   // 0xa8
+    read_result as *const (),                  // 0xb0
+    create_update as *const (),                // 0xb8
+    close_update as *const (),                 // 0xc0
+    write_blob as *const (),                   // 0xc8
+    delete_blob as *const (),                  // 0xd0
+    submit as *const (),                       // 0xd8 blocking
+    submit_async as *const (),                 // 0xe0
+    submit_result as *const (),                // 0xe8
 ]);
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::CStr;
     use std::io::BufRead;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -1981,5 +2062,334 @@ mod tests {
         assert_eq!(count, 2);
         assert_eq!(blob_at(&buffer, 0), ("a".into(), b"alpha".to_vec()));
         assert_eq!(blob_at(&buffer, 1), ("b".into(), b"beta".to_vec()));
+    }
+
+    type Initialize =
+        extern "system" fn(This, *const c_void, *const c_char, bool, *mut *mut Provider) -> HRESULT;
+    type Quota = extern "system" fn(This, *const Provider, *mut i64) -> HRESULT;
+    type DeleteContainer = extern "system" fn(This, *const Provider, *const c_char) -> HRESULT;
+    type ByName = extern "system" fn(
+        This,
+        *const Provider,
+        *const c_char,
+        *mut c_void,
+        Option<ContainerCallback>,
+    ) -> HRESULT;
+    type AllBlobs =
+        extern "system" fn(This, *const Container, *mut c_void, Option<BlobCallback>) -> HRESULT;
+    type SubmitNow = extern "system" fn(This, *const Update) -> HRESULT;
+
+    /// Writes `blobs` to the container `name` through the slots a title
+    /// calls, committing with the blocking submit (0xd8).
+    fn save_now(provider: *const Provider, name: &CStr, display: &CStr, blobs: &[(&CStr, &[u8])]) {
+        let this: This = &OBJECT;
+        let mut container = std::ptr::null_mut();
+        assert_eq!(
+            create_container(this, provider, name.as_ptr(), &mut container),
+            S_OK
+        );
+        let mut update = std::ptr::null_mut();
+        assert_eq!(
+            create_update(this, container, display.as_ptr(), &mut update),
+            S_OK
+        );
+        for (blob, data) in blobs {
+            assert_eq!(
+                write_blob(this, update, blob.as_ptr(), data.as_ptr(), data.len()),
+                S_OK
+            );
+        }
+        assert_eq!(method::<SubmitNow>(&OBJECT, 0xd8)(this, update), S_OK);
+        close_update(this, update);
+        close_container(this, container);
+    }
+
+    extern "system" fn container_name(info: *const ContainerInfo, context: *mut c_void) -> bool {
+        // SAFETY: valid during the callback; the context is the test's list.
+        let (info, (names, most)) =
+            unsafe { (&*info, &mut *context.cast::<(Vec<String>, usize)>()) };
+        names.push(text(info.name).unwrap());
+        names.len() < *most
+    }
+
+    /// The names slot 0x78 reports for `prefix`, stopping after `most`.
+    fn by_name(provider: *const Provider, prefix: Option<&CStr>, most: usize) -> Vec<String> {
+        let mut seen = (Vec::new(), most);
+        let prefix = prefix.map_or(std::ptr::null(), CStr::as_ptr);
+        let list = method::<ByName>(&OBJECT, 0x78);
+        let context = (&raw mut seen).cast();
+        assert_eq!(
+            list(&OBJECT, provider, prefix, context, Some(container_name)),
+            S_OK
+        );
+        seen.0
+    }
+
+    extern "system" fn blob_size_of(info: *const BlobInfo, context: *mut c_void) -> bool {
+        // SAFETY: valid during the callback; the context is the test's list.
+        let (info, (blobs, most)) =
+            unsafe { (&*info, &mut *context.cast::<(Vec<(String, u32)>, usize)>()) };
+        blobs.push((text(info.name).unwrap(), info.size));
+        blobs.len() < *most
+    }
+
+    const BLOCKING_CHILD: &str = "VICTORY_SAVE_BLOCKING";
+
+    /// In a child process of the next test (the provider of the blocking
+    /// initialize is the running title's, which is the process's): a
+    /// title that saves and loads with the blocking calls only.
+    #[test]
+    fn blocking_child() {
+        let Some(dir) = std::env::var_os(BLOCKING_CHILD) else {
+            return;
+        };
+        let this: This = &OBJECT;
+        let initialize = method::<Initialize>(&OBJECT, 0x18);
+        let quota = method::<Quota>(&OBJECT, 0x38);
+        let user = std::ptr::null();
+
+        // Before the title is known there is nowhere to save: the handle
+        // is null on failure.
+        let mut provider = 0x1234 as *mut Provider;
+        let hr = initialize(this, user, c"scid".as_ptr(), false, &mut provider);
+        assert_eq!((hr, provider.is_null()), (NO_ACCESS, true));
+        let nowhere = std::ptr::null_mut();
+        assert_eq!(
+            initialize(this, user, c"scid".as_ptr(), false, nowhere),
+            E_INVALIDARG
+        );
+
+        runtime::set_title(runtime::Title {
+            id: 1,
+            storage: PathBuf::from(dir).join("storage"),
+            ..Default::default()
+        });
+        assert_eq!(
+            initialize(this, user, c"scid".as_ptr(), false, &mut provider),
+            S_OK
+        );
+        assert!(!provider.is_null());
+        let mut before = -1;
+        assert_eq!(quota(this, provider, &mut before), S_OK);
+        assert!(before > 0 && before as u64 <= QUOTA, "{before}");
+        save_now(
+            provider,
+            c"Slot",
+            c"Chapter 1",
+            &[(c"world", b"hello"), (c"player.dat", b"xy")],
+        );
+        let mut after = -1;
+        assert_eq!(quota(this, provider, &mut after), S_OK);
+        // Seven bytes fewer, unless the disk has less room than the quota.
+        assert!(after <= before, "{before} then {after}");
+        if before as u64 == QUOTA {
+            assert_eq!(after as u64, QUOTA - 7);
+        }
+        close_provider(this, provider);
+
+        // A provider initialized afresh reads the save back.
+        let mut provider = std::ptr::null_mut();
+        assert_eq!(
+            initialize(this, user, c"scid".as_ptr(), true, &mut provider),
+            S_OK
+        );
+        let mut container = std::ptr::null_mut();
+        assert_eq!(
+            create_container(this, provider, c"Slot".as_ptr(), &mut container),
+            S_OK
+        );
+        let mut count = 2;
+        let wanted = [c"player.dat".as_ptr(), c"world".as_ptr()];
+        let mut buffer = [0u64; 16];
+        let room = size_of_val(&buffer);
+        let out = buffer.as_mut_ptr().cast::<u8>();
+        assert_eq!(
+            read_blobs(this, container, wanted.as_ptr(), &mut count, room, out),
+            S_OK
+        );
+        assert_eq!(count, 2);
+        close_container(this, container);
+        close_provider(this, provider);
+        println!("ROUND TRIP DONE");
+    }
+
+    #[test]
+    fn blocking_slots_round_trip_a_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = crate::testing::child(
+            "modules::xgamesave::tests::blocking_child",
+            &[(BLOCKING_CHILD, dir.path().as_os_str())],
+        );
+        let (printed, complaints) = crate::testing::printed(&out);
+        assert!(out.status.success(), "{printed}{complaints}");
+        assert!(printed.contains("ROUND TRIP DONE"), "{printed}{complaints}");
+        // What the child saved is under the title's data folder, whole.
+        let provider = Provider::open(&dir.path().join("saves"), Some("scid")).unwrap();
+        assert_eq!(
+            state(&provider.root),
+            Some((
+                "Chapter 1".into(),
+                vec![
+                    ("player.dat".into(), "xy".into()),
+                    ("world".into(), "hello".into())
+                ]
+            ))
+        );
+    }
+
+    #[test]
+    fn containers_are_listed_by_prefix() {
+        let saves = tempfile::tempdir().unwrap();
+        let provider = give(Provider::open(saves.path(), Some("scid")).unwrap());
+        for name in [c"Profile/Slot_1", c"Profile/Slot_2", c"Auto"] {
+            save_now(provider, name, c"", &[(c"a", b"1")]);
+        }
+        assert_eq!(
+            by_name(provider, Some(c"Profile/"), usize::MAX),
+            ["Profile/Slot_1", "Profile/Slot_2"]
+        );
+        assert_eq!(
+            by_name(provider, Some(c"Profile/Slot_2"), usize::MAX),
+            ["Profile/Slot_2"]
+        );
+        assert_eq!(
+            by_name(provider, Some(c"profile"), usize::MAX),
+            [""; 0],
+            "names are exact"
+        );
+        // The prefix is optional: none and the empty one list everything,
+        // as the enumeration without a prefix does.
+        let all = ["Auto", "Profile/Slot_1", "Profile/Slot_2"];
+        assert_eq!(by_name(provider, None, usize::MAX), all);
+        assert_eq!(by_name(provider, Some(c""), usize::MAX), all);
+        // The callback ends the enumeration by returning false.
+        assert_eq!(by_name(provider, None, 1), ["Auto"]);
+
+        let list = method::<ByName>(&OBJECT, 0x78);
+        let none = std::ptr::null_mut();
+        assert_eq!(
+            list(&OBJECT, provider, c"".as_ptr(), none, None),
+            E_INVALIDARG
+        );
+        let no_provider = std::ptr::null();
+        assert_eq!(
+            list(
+                &OBJECT,
+                no_provider,
+                c"".as_ptr(),
+                none,
+                Some(container_name)
+            ),
+            E_INVALIDARG
+        );
+        close_provider(&OBJECT, provider);
+    }
+
+    #[test]
+    fn blob_info_lists_sizes() {
+        let this: This = &OBJECT;
+        let saves = tempfile::tempdir().unwrap();
+        let provider = give(Provider::open(saves.path(), Some("scid")).unwrap());
+        save_now(
+            provider,
+            c"Slot",
+            c"",
+            &[(c"world", b"hello"), (c"empty", b""), (c"map", b"xyz")],
+        );
+        let all_blobs = method::<AllBlobs>(&OBJECT, 0x90);
+        let blobs_of = |container: *const Container, most: usize| {
+            let mut seen: (Vec<(String, u32)>, usize) = (Vec::new(), most);
+            let context = (&raw mut seen).cast();
+            assert_eq!(
+                all_blobs(this, container, context, Some(blob_size_of)),
+                S_OK
+            );
+            seen.0
+        };
+        let mut container = std::ptr::null_mut();
+        assert_eq!(
+            create_container(this, provider, c"Slot".as_ptr(), &mut container),
+            S_OK
+        );
+        let expected = [
+            ("empty".to_owned(), 0),
+            ("map".to_owned(), 3),
+            ("world".to_owned(), 5),
+        ];
+        assert_eq!(blobs_of(container, usize::MAX), expected);
+        assert_eq!(
+            blobs_of(container, 2),
+            expected[..2],
+            "false ends the enumeration"
+        );
+        // The same blobs as the enumeration by prefix gives for no prefix.
+        let mut by_prefix: (Vec<(String, u32)>, usize) = (Vec::new(), usize::MAX);
+        let context = (&raw mut by_prefix).cast();
+        assert_eq!(
+            enumerate_blobs(this, container, c"".as_ptr(), context, Some(blob_size_of)),
+            S_OK
+        );
+        assert_eq!(by_prefix.0, expected);
+        close_container(this, container);
+
+        // A container nothing was submitted to has no blobs; that is no error.
+        let mut unsaved = std::ptr::null_mut();
+        assert_eq!(
+            create_container(this, provider, c"Unsaved".as_ptr(), &mut unsaved),
+            S_OK
+        );
+        assert_eq!(blobs_of(unsaved, usize::MAX), []);
+        let none = std::ptr::null_mut();
+        assert_eq!(all_blobs(this, unsaved, none, None), E_INVALIDARG);
+        assert_eq!(
+            all_blobs(this, std::ptr::null(), none, Some(blob_size_of)),
+            E_INVALIDARG
+        );
+        close_container(this, unsaved);
+        close_provider(this, provider);
+    }
+
+    #[test]
+    fn blocking_delete_removes_the_container() {
+        let this: This = &OBJECT;
+        let saves = tempfile::tempdir().unwrap();
+        let provider = give(Provider::open(saves.path(), Some("scid")).unwrap());
+        let quota = method::<Quota>(&OBJECT, 0x38);
+        let delete = method::<DeleteContainer>(&OBJECT, 0x50);
+        let (mut empty, mut used, mut freed) = (0, 0, 0);
+        assert_eq!(quota(this, provider, &mut empty), S_OK);
+        save_now(provider, c"Slot", c"one", &[(c"a", b"12345")]);
+        save_now(provider, c"Other", c"two", &[(c"a", b"1")]);
+        assert_eq!(quota(this, provider, &mut used), S_OK);
+
+        assert_eq!(delete(this, provider, c"Slot".as_ptr()), S_OK);
+        assert_eq!(state(&get(provider).unwrap().root), None);
+        assert_eq!(by_name(provider, None, usize::MAX), ["Other"]);
+        assert_eq!(quota(this, provider, &mut freed), S_OK);
+        assert!(empty >= freed && freed >= used, "{empty} {used} {freed}");
+        if empty as u64 == QUOTA {
+            assert_eq!((used, freed), (empty - 6, empty - 1));
+        }
+        // A container that is not there is deleted already.
+        assert_eq!(delete(this, provider, c"Slot".as_ptr()), S_OK);
+        assert_eq!(
+            delete(this, provider, c"bad name".as_ptr()),
+            INVALID_CONTAINER_NAME
+        );
+        assert_eq!(delete(this, provider, std::ptr::null()), E_INVALIDARG);
+        assert_eq!(
+            delete(this, std::ptr::null(), c"Other".as_ptr()),
+            E_INVALIDARG
+        );
+        assert_eq!(by_name(provider, None, usize::MAX), ["Other"]);
+
+        // The other blocking calls refuse what is no handle or no place.
+        assert_eq!(quota(this, provider, std::ptr::null_mut()), E_INVALIDARG);
+        assert_eq!(quota(this, std::ptr::null(), &mut used), E_INVALIDARG);
+        assert_eq!(
+            method::<SubmitNow>(&OBJECT, 0xd8)(this, std::ptr::null()),
+            E_INVALIDARG
+        );
+        close_provider(this, provider);
     }
 }
