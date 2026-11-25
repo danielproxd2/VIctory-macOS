@@ -184,16 +184,69 @@ fn page_is_readable(address: usize) -> bool {
     protection_at(address).is_some_and(|p| p & (PAGE_GUARD | PAGE_NOACCESS) == 0 && p & 0xff != 0)
 }
 
-/// Whether `clzero` may write the page `address` is in: writable memory, or
-/// a guard page, where the write raises what the instruction would have
-/// (a stack grows that way).
-fn page_takes_a_write(address: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{
-        PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_READWRITE, PAGE_WRITECOPY,
-    };
-    const WRITABLE: u32 =
-        PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
-    protection_at(address).is_some_and(|p| p & (WRITABLE | PAGE_GUARD) != 0)
+/// Whether `clzero` at `address` is tried at all: committed memory that is
+/// not `PAGE_NOACCESS`. A page that is committed but not writable is tried,
+/// because a handler ahead of ours may be waiting for exactly that write:
+/// `victory-gpu` keeps title views read-only to see the first write to each
+/// block and makes the block writable from its own vectored handler. A
+/// guard page is tried too: the write raises what the instruction would
+/// have (a stack grows that way).
+fn page_may_take_a_write(address: usize) -> bool {
+    use windows_sys::Win32::System::Memory::PAGE_NOACCESS;
+    protection_at(address).is_some_and(|p| p & PAGE_NOACCESS == 0 && p & 0xff != 0)
+}
+
+// The one write the emulation makes into title memory, in assembly so that
+// the handler knows its instructions by address: an access violation between
+// `victory_zero_line_stores` and `victory_zero_line_stored` that no handler
+// ahead of ours took is ended by resuming at `victory_zero_line_refused`
+// (see `refuse_zero_line`). A leaf that leaves the stack pointer alone, so it
+// needs no unwind data. Win64: the line in `rcx`, `xmm0` is ours to use.
+std::arch::global_asm!(
+    ".globl victory_zero_line",
+    ".globl victory_zero_line_stores",
+    ".globl victory_zero_line_stored",
+    ".globl victory_zero_line_refused",
+    "victory_zero_line:",
+    "    xorps xmm0, xmm0",
+    "victory_zero_line_stores:",
+    "    movups xmmword ptr [rcx], xmm0",
+    "    movups xmmword ptr [rcx + 16], xmm0",
+    "    movups xmmword ptr [rcx + 32], xmm0",
+    "    movups xmmword ptr [rcx + 48], xmm0",
+    "victory_zero_line_stored:",
+    "    mov eax, 1",
+    "    ret",
+    "victory_zero_line_refused:",
+    "    xor eax, eax",
+    "    ret",
+);
+
+unsafe extern "C" {
+    /// Zeroes the 64 bytes at `line`; 0 if the memory refused the write and
+    /// no handler made it writable (with [`handler`] installed; without it
+    /// such a write ends the process, as any other would).
+    fn victory_zero_line(line: *mut u8) -> u32;
+    fn victory_zero_line_stores();
+    fn victory_zero_line_stored();
+    fn victory_zero_line_refused();
+}
+
+/// Ends [`victory_zero_line`] with 0 if `info` is an access violation
+/// raised by one of its stores. Ours is the last vectored handler, so every
+/// handler that might have made the memory writable has declined by now.
+unsafe fn refuse_zero_line(info: *mut EXCEPTION_POINTERS) -> bool {
+    // SAFETY: the system passes valid exception pointers.
+    let (record, context) = unsafe { (&*(*info).ExceptionRecord, &mut *(*info).ContextRecord) };
+    let stores = victory_zero_line_stores as *const () as usize
+        ..victory_zero_line_stored as *const () as usize;
+    if record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION
+        || !stores.contains(&(context.Rip as usize))
+    {
+        return false;
+    }
+    context.Rip = victory_zero_line_refused as *const () as usize as u64;
+    true
 }
 
 /// The code bytes at `rip` and how many of them there are: up to
@@ -223,9 +276,11 @@ unsafe fn code_at(rip: usize) -> ([u8; CODE_BYTES], usize) {
 /// a spin loop around them works with mwaitx as a yield.
 ///
 /// Everything it decodes and every register it uses is the title's: an
-/// instruction it cannot read whole, or cannot do without faulting itself,
-/// is not emulated (`false`), and is then reported as the illegal
-/// instruction it is.
+/// instruction it cannot read whole is not emulated (`false`), and is then
+/// reported as the illegal instruction it is. So is a `clzero` whose line
+/// cannot be written; but its write is tried wherever memory is committed,
+/// and faults like the title's own would, so that a handler that tracks
+/// writes by keeping pages read-only (`victory-gpu`'s) sees it.
 unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
     // SAFETY: the system passes valid exception pointers.
     let (record, context) = unsafe { (&*(*info).ExceptionRecord, &mut *(*info).ContextRecord) };
@@ -238,12 +293,14 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
     let len = match code {
         [0x0f, 0x01, 0xfc, ..] => {
             let line = (context.Rax & !63) as usize;
-            if !page_takes_a_write(line) {
+            if !page_may_take_a_write(line) {
                 return false;
             }
-            // SAFETY: a line is inside one page, which is writable (or a
-            // guard page: see `page_takes_a_write`).
-            unsafe { (line as *mut u8).write_bytes(0, 64) };
+            // SAFETY: a line is inside one page, which is committed; a
+            // store it refuses ends the call (see `refuse_zero_line`).
+            if unsafe { victory_zero_line(line as *mut u8) } == 0 {
+                return false;
+            }
             3
         }
         [0x0f, 0x01, 0xfa, ..] => 3,
@@ -470,7 +527,7 @@ fn sse4a(code: &[u8], xmm: &mut [M128A; 16]) -> Option<usize> {
 
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     // SAFETY: the system passes valid exception pointers.
-    if unsafe { emulate_amd_only(info) } {
+    if unsafe { refuse_zero_line(info) || emulate_amd_only(info) } {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
     // SAFETY: as above.
@@ -1357,6 +1414,8 @@ mod tests {
     #[test]
     fn clzero_of_memory_that_cannot_be_written_is_declined() {
         use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+        // The read-only page below is tried: our handler ends the store.
+        report_crashes();
         let clzero = [0x0f, 0x01, 0xfc];
         // Nothing mapped, and an address outside the address space.
         for rax in [0, 0x48, u64::MAX, 0x8000_0000_0000_0040] {
@@ -1376,10 +1435,86 @@ mod tests {
             let second = pages.0.add(0x1000).cast();
             assert_ne!(VirtualProtect(second, 0x1000, PAGE_READONLY, &mut old), 0);
         }
+        // Nobody makes this page writable, so the store is refused.
         assert_eq!(emulate_with(&clzero, |c| c.Rax = line as u64).0, None);
         // SAFETY: the page is readable.
         let kept = unsafe { std::slice::from_raw_parts(line, 64) };
         assert!(kept.iter().all(|&b| b == 0xff));
+    }
+
+    /// The read-only pages [`open_on_write`] makes writable, and how often
+    /// it did.
+    static OPENED_ON_WRITE: std::sync::Mutex<(std::ops::Range<usize>, u32)> =
+        std::sync::Mutex::new((0..0, 0));
+
+    /// A stand-in for `victory-gpu`'s write tracking: takes the first write
+    /// to a page it keeps read-only and gives the write access back.
+    unsafe extern "system" fn open_on_write(info: *mut EXCEPTION_POINTERS) -> i32 {
+        use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+        // SAFETY: the system passes the exception being dispatched.
+        let r = unsafe { &*(*info).ExceptionRecord };
+        if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION || r.ExceptionInformation[0] != 1 {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        let mut watched = OPENED_ON_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+        if !watched.0.contains(&r.ExceptionInformation[1]) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        let mut old = 0;
+        let (at, len) = (watched.0.start, watched.0.len());
+        // SAFETY: the test's own pages; only their protection changes.
+        unsafe { VirtualProtect(at as *const _, len, PAGE_READWRITE, &mut old) };
+        watched.1 += 1;
+        -1 // EXCEPTION_CONTINUE_EXECUTION
+    }
+
+    #[test]
+    fn clzero_completes_on_a_page_another_handler_makes_writable() {
+        use windows_sys::Win32::System::Diagnostics::Debug::RemoveVectoredExceptionHandler;
+        use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+        report_crashes();
+        let pages = PageBeforeAGap::new();
+        let page = pages.0 as usize;
+        // SAFETY: our first page.
+        let protect = || unsafe {
+            pages.0.write_bytes(0xff, 0x1000);
+            let mut old = 0;
+            assert_ne!(
+                VirtualProtect(pages.0.cast(), 0x1000, PAGE_READONLY, &mut old),
+                0
+            );
+        };
+        let opened = || OPENED_ON_WRITE.lock().unwrap_or_else(|e| e.into_inner()).1;
+        // SAFETY: the page is readable throughout.
+        let bytes = |at: usize| unsafe { std::slice::from_raw_parts((page + at) as *const u8, 64) };
+
+        protect();
+        *OPENED_ON_WRITE.lock().unwrap() = (page..page + 0x1000, 0);
+        // Ahead of the crash reporter's, as victory-gpu registers its own.
+        // SAFETY: the handler only touches the pages named above.
+        let stand_in = unsafe { AddVectoredExceptionHandler(1, Some(open_on_write)) };
+        assert!(!stand_in.is_null());
+
+        // The emulation alone: its write faults, the stand-in opens the
+        // page, and the write goes through.
+        let (skipped, _) = emulate_with(&[0x0f, 0x01, 0xfc], |c| c.Rax = (page + 0x45) as u64);
+        assert_eq!((skipped, opened()), (Some(3), 1));
+        assert!(bytes(0x40).iter().all(|&b| b == 0));
+        assert!(bytes(0).iter().chain(bytes(0x80)).all(|&b| b == 0xff));
+
+        // The instruction itself, through whatever the host makes of it: a
+        // CPU that has clzero faults on the write, one that lacks it on the
+        // instruction and then, inside our handler, on the write.
+        protect();
+        // SAFETY: clzero writes only the line holding the address, ours.
+        unsafe { std::arch::asm!(".byte 0x0f, 0x01, 0xfc", in("rax") page + 0x105) };
+        assert_eq!(opened(), 2);
+        assert!(bytes(0x100).iter().all(|&b| b == 0));
+        assert!(bytes(0xc0).iter().chain(bytes(0x140)).all(|&b| b == 0xff));
+
+        // SAFETY: the handle `AddVectoredExceptionHandler` returned.
+        assert_ne!(unsafe { RemoveVectoredExceptionHandler(stand_in) }, 0);
+        *OPENED_ON_WRITE.lock().unwrap() = (0..0, 0);
     }
 
     #[test]
