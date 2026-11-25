@@ -97,6 +97,24 @@ impl Shader {
     }
 }
 
+#[cfg(all(test, windows))]
+impl Shader {
+    /// A shader whose translation is given, for tests of host pipelines
+    /// made from programs of our own (no console container to translate).
+    pub(crate) fn translated_as(
+        stage: &'static str,
+        host: victory_shader::emit::HostShader,
+        used: Vec<victory_shader::UsedResource>,
+    ) -> Shader {
+        Shader {
+            stage,
+            hash: blake3::hash(&host.dxil).to_hex()[..16].to_owned(),
+            container: Vec::new(),
+            translated: OnceLock::from(Some(Translated { host, used })),
+        }
+    }
+}
+
 /// A translated shader and the console resources its code reads.
 #[cfg(windows)]
 pub(crate) struct Translated {

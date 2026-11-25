@@ -47,6 +47,9 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Presentation>,
+    /// Whether it runs 64-bit atomics on typed resources in the descriptor
+    /// heap: it says so and the probe's program ran ([`atomics64`]).
+    atomics64: bool,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -229,6 +232,7 @@ fn create() -> windows::core::Result<Host> {
             ),
             Err(e) => tracing::debug!(error = %e, "multiply-add fusing not checked"),
         }
+        let atomics64 = atomics64(&device);
         Ok(Host {
             device,
             queue,
@@ -246,8 +250,86 @@ fn create() -> windows::core::Result<Host> {
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(Presentation::default()),
+            atomics64,
         })
     }
+}
+
+/// Whether `device` reports 64-bit atomics on typed resources and on
+/// resources from the descriptor heap (both capability bits).
+pub(crate) fn claims_atomics64(device: &ID3D12Device) -> bool {
+    let mut typed = D3D12_FEATURE_DATA_D3D12_OPTIONS9::default();
+    let mut heap = D3D12_FEATURE_DATA_D3D12_OPTIONS11::default();
+    // SAFETY: each query writes its own structure of the given size.
+    let ok = unsafe {
+        device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS9,
+                (&raw mut typed).cast(),
+                size_of_val(&typed) as u32,
+            )
+            .is_ok()
+            && device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS11,
+                    (&raw mut heap).cast(),
+                    size_of_val(&heap) as u32,
+                )
+                .is_ok()
+    };
+    ok && typed.AtomicInt64OnTypedResourceSupported.as_bool()
+        && heap.AtomicInt64OnDescriptorHeapResourceSupported.as_bool()
+}
+
+/// The name `device`'s adapter gives itself, for messages about the host.
+pub(crate) fn adapter_name(device: &ID3D12Device) -> String {
+    // SAFETY: plain DXGI queries with valid out pointers.
+    let desc = unsafe {
+        CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid()))
+            .and_then(|a| a.GetDesc1())
+    };
+    match desc {
+        Ok(desc) => {
+            let name = &desc.Description;
+            let end = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+            String::from_utf16_lossy(&name[..end])
+        }
+        Err(_) => "unknown adapter".to_owned(),
+    }
+}
+
+/// Whether `device` runs 64-bit atomics on typed resources in the
+/// descriptor heap (translated 64-bit image atomics): it reports the
+/// capability and a program with one ran on it (`crate::probe`). A host
+/// that reports it and runs nothing of such a program (Apple's D3DMetal)
+/// is taken not to have it, with one warning naming the host: pipelines
+/// with these atomics are then refused (`HostPipeline::new`) and their
+/// dispatches dropped and counted, instead of running as nothing. Asked
+/// once per device, at its creation.
+fn atomics64(device: &ID3D12Device) -> bool {
+    use crate::probe::Verdict;
+    let verdict =
+        crate::probe::verdict(claims_atomics64(device), || crate::probe::atomics64(device));
+    match &verdict {
+        Verdict::Unclaimed | Verdict::Works => {}
+        Verdict::Claimed(ran) => tracing::warn!(
+            host = %adapter_name(device),
+            texel = format_args!("{:#x}", ran.texel),
+            stored = format_args!("{:#x}", ran.stored),
+            "the host GPU reports 64-bit atomics on typed heap resources and did not run a \
+             compute program that has one: pipelines with them are refused and their \
+             dispatches dropped"
+        ),
+        Verdict::Unchecked(why) => tracing::warn!(
+            host = %adapter_name(device),
+            error = %why,
+            "64-bit atomics on typed heap resources not checked; the host reports them"
+        ),
+    }
+    let atomics = verdict.usable();
+    tracing::info!(atomics, "host 64-bit atomics on typed heap resources");
+    atomics
 }
 
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
@@ -729,36 +811,10 @@ impl Host {
     }
 
     /// Whether the host runs 64-bit atomics on typed resources in the
-    /// descriptor heap (translated 64-bit image atomics); logged once.
+    /// descriptor heap (translated 64-bit image atomics): what it reports,
+    /// checked once at the device's creation by running one ([`atomics64`]).
     pub(crate) fn heap_atomics64(&self) -> bool {
-        static ATOMICS: OnceLock<bool> = OnceLock::new();
-        *ATOMICS.get_or_init(|| {
-            let mut typed = D3D12_FEATURE_DATA_D3D12_OPTIONS9::default();
-            let mut heap = D3D12_FEATURE_DATA_D3D12_OPTIONS11::default();
-            // SAFETY: each query writes its own structure of the given size.
-            let ok = unsafe {
-                self.device
-                    .CheckFeatureSupport(
-                        D3D12_FEATURE_D3D12_OPTIONS9,
-                        (&raw mut typed).cast(),
-                        size_of_val(&typed) as u32,
-                    )
-                    .is_ok()
-                    && self
-                        .device
-                        .CheckFeatureSupport(
-                            D3D12_FEATURE_D3D12_OPTIONS11,
-                            (&raw mut heap).cast(),
-                            size_of_val(&heap) as u32,
-                        )
-                        .is_ok()
-            };
-            let atomics = ok
-                && typed.AtomicInt64OnTypedResourceSupported.as_bool()
-                && heap.AtomicInt64OnDescriptorHeapResourceSupported.as_bool();
-            tracing::info!(atomics, "host 64-bit atomics on typed heap resources");
-            atomics
-        })
+        self.atomics64
     }
 
     /// A new list, open for recording.

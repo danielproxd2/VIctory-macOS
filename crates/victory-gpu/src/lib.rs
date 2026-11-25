@@ -47,6 +47,8 @@ mod memory;
 pub mod object;
 pub mod pipeline;
 mod primitive;
+#[cfg(any(windows, test))]
+mod probe;
 pub mod query;
 pub mod queue;
 pub mod resource;
