@@ -4,6 +4,10 @@
 #   tools/macos/victory.sh config
 #   tools/macos/victory.sh run --execute <path to the game's executable>
 # WINE defaults to the Wine that tools/macos/build-crossover-wine.sh builds.
+# The Wine prefix (WINEPREFIX) defaults to a folder outside the repository:
+# %LOCALAPPDATA% lies inside the prefix, and the default cache_dir and
+# data_dir lie under it, where nothing derived from a game may sit inside
+# the source tree (docs/asset-policy.md).
 set -e
 cd "$(dirname "$0")/../.."
 ROOT="$PWD"
@@ -15,7 +19,7 @@ WINE="${WINE:-$HOME/Library/Caches/victory-macos/target/wine-cx/bin/wine}"
     exit 1
 }
 cargo build --quiet --release -p victory --target x86_64-pc-windows-gnullvm
-export WINEPREFIX="${WINEPREFIX:-$ROOT/target/wineprefix-play}"
+export WINEPREFIX="${WINEPREFIX:-$HOME/Library/Caches/victory-macos/prefix-play}"
 export WINEDEBUG="${WINEDEBUG:--all}"
 export WINEDLLOVERRIDES="mscoree,mshtml=;winedbg.exe=d;d3d12,d3d12core,dxgi=b${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
 # Rosetta tells the game about AVX and AVX2, which it may check for.

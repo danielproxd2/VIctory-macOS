@@ -6,6 +6,9 @@
 # that one is missing. A Wine with Apple's D3DMetal beside it gets the DLL
 # overrides that make it the D3D12 device, unless WINEDLLOVERRIDES already
 # says something about d3d12.
+# The Wine prefix (WINEPREFIX) defaults to a folder outside the repository:
+# the tests' temporary folders and %LOCALAPPDATA% lie inside the prefix, and
+# victory_core::ensure_outside_repo refuses them inside the source tree.
 # VICTORY_REQUIRE_GPU=1 makes the tests that need a host D3D12 device fail
 # where there is none; otherwise they pass, each printing
 # "skipped: no host D3D12 device".
@@ -67,7 +70,7 @@ trap 'exit 143' TERM
 LINK="$WRAPPER_DIR/wine"
 printf '#!/bin/sh\nexec "%s" "$@"\n' "$WINE" > "$LINK"
 chmod +x "$LINK"
-export WINEPREFIX="${WINEPREFIX:-$ROOT/target/wineprefix}"
+export WINEPREFIX="${WINEPREFIX:-$HOME/Library/Caches/victory-macos/prefix-test}"
 export WINEDEBUG="${WINEDEBUG:--all}"
 # A new prefix would wait on hidden Mono and Gecko install prompts, and the
 # tests need neither. Wine's crash dialog is turned off for the same reason.
