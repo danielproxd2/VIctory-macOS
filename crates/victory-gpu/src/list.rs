@@ -1031,6 +1031,8 @@ unsafe impl Send for Upload {}
 /// Draw state the host has no use for (root signatures: ours come with
 /// the pipeline; depth bounds, depth order and shading rate hints): any
 /// arguments, nothing returned.
+// One copy in an optimised build too: the method tables hold its address.
+#[inline(never)]
 extern "system" fn ignored_state(_: This) {}
 
 /// The title's draw state (decision 0007, step 3), kept for its draws or
@@ -1099,6 +1101,8 @@ mod state {
     }
     /// `ClearUnorderedAccessViewUint(GPU handle, CPU handle, resource,
     /// values, rectangle count, rectangles)`.
+    // One copy in an optimised build too: the method tables hold its address.
+    #[inline(never)]
     pub(super) extern "system" fn clear_unordered_uint(
         this: This,
         _gpu: u64,
@@ -1111,6 +1115,8 @@ mod state {
         clear_unordered(this, cpu, values, false, items(rects, count));
     }
     /// `ClearUnorderedAccessViewFloat`, the same with four floats.
+    // One copy in an optimised build too: the method tables hold its address.
+    #[inline(never)]
     pub(super) extern "system" fn clear_unordered_float(
         this: This,
         _gpu: u64,
