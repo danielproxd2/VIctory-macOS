@@ -1762,3 +1762,634 @@ exit 0"#
         .1;
     assert!(end.contains("tools/macos/victory.sh doctor"), "{end}");
 }
+
+/// A log as cargo and the tests write one: results of three test programs,
+/// skip lines on lines of their own and after the harness's "test ... ",
+/// one without a test's name, and reasons with parentheses of their own.
+const CANNED_LOG: &str = r#"   Compiling a v0.1.0
+     Running unittests src/lib.rs (target/debug/deps/a-0123456789abcdef)
+
+running 4 tests
+test a::one ... ok
+test a::two ... skipped: no host D3D12 device (a::two)
+ok
+test a::three ... ok
+test a::four ... ignored
+
+test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+     Running tests/b.rs (target/debug/deps/b-0123456789abcdef)
+skipped: no host D3D12 device (b::other_test)
+skipped: no console compiler (VICTORY_CONSOLE_DXC) or no PC compiler (VICTORY_PC_DXC) (diff::x)
+skipped: no console compiler (VICTORY_CONSOLE_DXC) or no PC compiler (VICTORY_PC_DXC)
+skipped: no SM 6.6 WARP device (c::d_1)
+test b::fails ... FAILED
+
+test result: FAILED. 10 passed; 2 failed; 0 ignored; 0 measured; 4 filtered out; finished in 1.00s
+
+   Doc-tests a
+
+test result: ok. 0 passed; 0 failed; 5 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p b --test b`
+"#;
+
+fn check_all_script() -> PathBuf {
+    root().join("tools/macos/check-all.sh")
+}
+
+/// What check-all.sh makes of one log: the function its table is built
+/// from, asked for by `--parse-log`.
+#[test]
+fn check_all_sums_the_results_and_groups_the_skips_of_a_log() {
+    let dir = scratch("check-all-parse");
+    let log = dir.join("canned.log");
+    fs::write(&log, CANNED_LOG).unwrap();
+    let out = Command::new(check_all_script())
+        .arg("--parse-log")
+        .arg(&log)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        "tests: 13 passed, 2 failed, 6 ignored\n\
+         2 no console compiler (VICTORY_CONSOLE_DXC) or no PC compiler (VICTORY_PC_DXC)\n\
+         2 no host D3D12 device\n\
+         1 no SM 6.6 WARP device\n"
+    );
+
+    // A step that runs no tests has no numbers, which is not zero tests.
+    fs::write(&log, "policy: 412 files checked\n").unwrap();
+    let out = Command::new(check_all_script())
+        .arg("--parse-log")
+        .arg(&log)
+        .output()
+        .unwrap();
+    assert_eq!(text(&out.stdout), "tests: none\n");
+
+    // No file to parse is a usage error.
+    let out = Command::new(check_all_script())
+        .arg("--parse-log")
+        .arg(dir.join("absent.log"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+}
+
+/// The script is for the bash macOS ships (3.2), and a failed step must
+/// not end it: no `set -e`, and nothing newer shells added.
+#[test]
+fn check_all_is_plain_bash_without_set_e() {
+    let source = fs::read_to_string(check_all_script()).unwrap();
+    assert_eq!(source.lines().next(), Some("#!/bin/bash"));
+    let mode = fs::metadata(check_all_script())
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o111, 0o111, "check-all.sh is executable");
+    let code: Vec<&str> = source
+        .lines()
+        .map(str::trim_start)
+        .filter(|l| !l.starts_with('#'))
+        .collect();
+    let options: Vec<&&str> = code
+        .iter()
+        .filter(|l| l.starts_with("set -") && !l.starts_with("set -- "))
+        .collect();
+    assert_eq!(options, [&"set -u"], "the shell options of check-all.sh");
+    for newer in [
+        "declare -A",
+        "local -n",
+        "mapfile",
+        "readarray",
+        "|&",
+        "&>>",
+        ",,}",
+        "^^}",
+        "coproc",
+        "pipefail",
+    ] {
+        assert!(
+            !code.iter().any(|l| l.contains(newer)),
+            "check-all.sh uses {newer}, which bash 3.2 lacks or which hides a step's status"
+        );
+    }
+    // macOS's own bash parses it (where that is the bash on this host).
+    let parsed = Command::new("/bin/bash")
+        .arg("-n")
+        .arg(check_all_script())
+        .output()
+        .unwrap();
+    assert!(parsed.status.success(), "{}", text(&parsed.stderr));
+}
+
+/// Every switch the sources read is one check-all.sh knows: it sets it for
+/// the Wine runs where this Mac can meet it, or names it among those it
+/// never sets. A new switch has to be put in one of the two places.
+#[test]
+fn check_all_knows_every_require_switch() {
+    let source = fs::read_to_string(check_all_script()).unwrap();
+    let set: Vec<String> = source
+        .lines()
+        .filter(|l| l.trim_start().starts_with("WINE_ENV+=("))
+        .flat_map(|l| l.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')))
+        .filter(|w| w.starts_with("VICTORY_REQUIRE_"))
+        .map(str::to_owned)
+        .collect();
+    let never = source
+        .lines()
+        .find(|l| l.contains("left_off \"never set here"))
+        .expect("check-all.sh names the switches it never sets");
+    for switch in require_switches() {
+        let is_set = set.contains(&switch);
+        let is_never = never.split([' ', '"']).any(|w| w == switch);
+        assert!(
+            is_set != is_never,
+            "{switch}: set by check-all.sh: {is_set}, among those it never sets: {is_never}"
+        );
+        // And it is in the list at the script's top.
+        assert!(
+            source.lines().any(|l| l.starts_with('#')
+                && l.split(' ')
+                    .any(|w| w == switch || w == format!("{switch}=1"))),
+            "check-all.sh's comment does not list {switch}"
+        );
+    }
+    let mut set = set;
+    set.sort();
+    assert_eq!(
+        set,
+        [
+            "VICTORY_REQUIRE_CLAMP",
+            "VICTORY_REQUIRE_DEPTH",
+            "VICTORY_REQUIRE_DXIL",
+            "VICTORY_REQUIRE_GPU",
+            "VICTORY_REQUIRE_HLSL",
+        ]
+    );
+}
+
+/// One run of check-all.sh with stand-ins for cargo, rustc and wine.
+struct CheckAll {
+    out: Output,
+    /// The home folder of the run, outside the source tree.
+    home: PathBuf,
+    /// What the stand-ins were started with: a block per start, its first
+    /// line "call <arguments>" (cargo) or "wine <arguments>", then what
+    /// of the environment the stand-in writes down.
+    calls: Vec<Vec<String>>,
+}
+
+impl CheckAll {
+    /// The row of the table for `label`: exit, passed, failed, ignored and
+    /// skipped, as printed.
+    #[track_caller]
+    fn row(&self, label: &str) -> Vec<String> {
+        let said = text(&self.out.stdout);
+        let table = said
+            .split_once("check-all: results ")
+            .unwrap_or_else(|| panic!("no table in:\n{said}"))
+            .1;
+        let found: Vec<Vec<String>> = table
+            .lines()
+            .filter_map(|line| line.strip_prefix(label))
+            .filter(|rest| rest.starts_with(' '))
+            .map(|rest| rest.split_whitespace().map(str::to_owned).collect())
+            .filter(|cells: &Vec<String>| cells.len() == 5)
+            .collect();
+        assert_eq!(found.len(), 1, "one row {label:?} in:\n{table}");
+        found.into_iter().next().unwrap()
+    }
+
+    /// The labels of the table's rows, in order.
+    fn labels(&self) -> Vec<String> {
+        let said = text(&self.out.stdout);
+        let table = said.split_once("check-all: results ").map_or("", |t| t.1);
+        table
+            .lines()
+            .skip(2)
+            .take_while(|l| !l.is_empty())
+            .map(|l| l[..l.len().min(28)].trim_end().to_owned())
+            .collect()
+    }
+
+    /// The `VICTORY_REQUIRE_*` switches the stand-in started with `start`
+    /// had set.
+    fn switches(&self, start: &str) -> Vec<Vec<String>> {
+        self.calls
+            .iter()
+            .filter(|call| call[0].starts_with(start))
+            .map(|call| {
+                call.iter()
+                    .filter_map(|l| l.strip_prefix("has "))
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The one folder the run made for its logs, and the files in it.
+    #[track_caller]
+    fn logs(&self) -> (PathBuf, Vec<String>) {
+        let base = self.home.join("Library/Caches/victory-macos/check");
+        let runs: Vec<PathBuf> = fs::read_dir(&base)
+            .unwrap_or_else(|e| panic!("{}: {e}", base.display()))
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        let mut files: Vec<String> = fs::read_dir(&runs[0])
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        files.sort();
+        (runs[0].clone(), files)
+    }
+}
+
+/// The stand-in cargo of check-all.sh's tests: it writes what it was
+/// started with and what it was required to have, and for `test` prints a
+/// result line and one skip line as a test program does.
+const CHECK_ALL_CARGO: &str = r#"{
+    echo "call $*"
+    env | sed -n 's/^\(VICTORY_REQUIRE_[A-Z0-9_]*\)=1$/has \1/p' | sort
+    printf '%s\n' "dxil ${VICTORY_DXIL-<unset>}"
+    printf '%s\n' "dxc ${VICTORY_PC_DXC-<unset>}"
+    echo "end"
+} >> "$STAND_IN_LOG"
+case "$1" in
+    test)
+        echo "test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s"
+        echo "skipped: no SM 6.6 WARP device (a::b)" >&2
+        ;;
+esac"#;
+
+/// Runs check-all.sh with `args`, the stand-in cargo `cargo` (a script's
+/// body), a stand-in Wine build with D3DMetal in it, and a home folder
+/// that has a DXC folder with the validator and the compiler if `dxc`.
+fn check_all(name: &str, args: &[&str], cargo: &str, dxc: bool) -> CheckAll {
+    let dir = scratch(name);
+    let home = outside(name);
+    let log = dir.join("stand-ins.log");
+    let libdir = dir.join("libdir");
+    fs::create_dir_all(&libdir).unwrap();
+    fs::create_dir_all(dir.join("wine/lib/external/D3DMetal.framework")).unwrap();
+    script(&dir.join("bin/cargo"), cargo);
+    script(
+        &dir.join("bin/rustc"),
+        &format!("echo '{}'", libdir.display()),
+    );
+    script(
+        &dir.join("wine/bin/wine"),
+        r#"{
+    printf '%s\n' "wine $*"
+    printf '%s\n' "dxil ${VICTORY_DXIL-<unset>}"
+    echo "end"
+} >> "$STAND_IN_LOG"
+echo "ok          host: Wine 11.0""#,
+    );
+    if dxc {
+        let folder = home.join("Library/Caches/victory-macos/dxc");
+        // An older folder without the validator is passed over.
+        fs::create_dir_all(folder.join("v1.0.0")).unwrap();
+        fs::create_dir_all(folder.join("v1.9.2609")).unwrap();
+        fs::write(folder.join("v1.9.2609/dxil.dll"), "").unwrap();
+        fs::write(folder.join("v1.9.2609/dxc.exe"), "").unwrap();
+    }
+    // Without one named, the launcher would read the victory.toml of
+    // whoever runs the tests.
+    let config = dir.join("victory.toml");
+    fs::write(&config, "").unwrap();
+    let mut command = Command::new(check_all_script());
+    command
+        .args(args)
+        .current_dir(&home)
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", dir.join("bin").display()),
+        )
+        .env("WINE", dir.join("wine/bin/wine"))
+        .env("HOME", &home)
+        .env("STAND_IN_LOG", &log)
+        .env("VICTORY_CONFIG", &config)
+        .env_remove("CARGO")
+        .env_remove("VICTORY_CHECK_DIR")
+        .env_remove("VICTORY_DXIL_UNIX")
+        .env_remove("VICTORY_PC_DXC_UNIX")
+        .env_remove("VICTORY_DXIL")
+        .env_remove("VICTORY_PC_DXC")
+        .env_remove("VICTORY_DATA_DIR")
+        .env_remove("WINEPREFIX")
+        .env_remove("WINEDLLOVERRIDES");
+    for switch in require_switches() {
+        command.env_remove(switch);
+    }
+    let out = command.output().unwrap();
+    let written = fs::read_to_string(&log).unwrap_or_default();
+    let mut calls = Vec::new();
+    let mut call = Vec::new();
+    for line in written.lines() {
+        if line == "end" {
+            calls.push(std::mem::take(&mut call));
+        } else {
+            call.push(line.to_owned());
+        }
+    }
+    CheckAll { out, home, calls }
+}
+
+/// `--quick` is the three steps that need neither a release build nor
+/// Wine, each with a log outside the repository, and one table.
+#[test]
+fn check_all_quick_runs_three_steps_and_prints_one_table() {
+    let run = check_all("check-all-quick", &["--quick"], CHECK_ALL_CARGO, true);
+    let said = text(&run.out.stdout);
+    assert_eq!(
+        run.out.status.code(),
+        Some(0),
+        "{said}\n{}",
+        text(&run.out.stderr)
+    );
+    assert_eq!(run.labels(), ["policy", "fmt-check", "native tests (dev)"]);
+    assert_eq!(run.row("policy"), ["0", "-", "-", "-", "-"]);
+    assert_eq!(run.row("fmt-check"), ["0", "-", "-", "-", "-"]);
+    assert_eq!(run.row("native tests (dev)"), ["0", "3", "0", "1", "1"]);
+    assert_eq!(said.matches("check-all: results ").count(), 1, "{said}");
+    assert!(said.ends_with("check-all: all 3 steps passed\n"), "{said}");
+    // The skip lines of the one step that has any, by reason.
+    assert!(
+        said.contains("skipped in native tests (dev), by reason:\n  1 x  no SM 6.6 WARP device\n"),
+        "{said}"
+    );
+    // What was started: cargo three times, with no switch set, and no Wine.
+    let started: Vec<&str> = run.calls.iter().map(|c| c[0].as_str()).collect();
+    assert_eq!(
+        started,
+        [
+            "call xtask policy",
+            "call xtask fmt-check",
+            "call test --workspace --locked --no-fail-fast",
+        ]
+    );
+    assert_eq!(run.switches("call "), vec![Vec::<String>::new(); 3]);
+    assert!(!said.contains("Wine test runs"), "{said}");
+    let (folder, files) = run.logs();
+    assert_eq!(files, ["fmt-check.log", "native-dev.log", "policy.log"]);
+    assert!(
+        said.contains(&format!("logs in {}", folder.display())),
+        "{said}"
+    );
+    let name = folder.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(
+        name.len() == 15
+            && name.chars().enumerate().all(|(at, c)| if at == 8 {
+                c == '-'
+            } else {
+                c.is_ascii_digit()
+            }),
+        "the folder is named after the time: {name}"
+    );
+}
+
+/// A step that fails does not end the run: the steps after it still run,
+/// the table says which one it was, and the script fails at the end.
+#[test]
+fn check_all_goes_on_after_a_failed_step_and_fails_at_the_end() {
+    let cargo = r#"echo "call $*" >> "$STAND_IN_LOG"
+echo "end" >> "$STAND_IN_LOG"
+case "$*" in
+    "xtask policy") echo "policy: a.bin is not allowed" >&2; exit 3 ;;
+    test*)
+        echo "test result: FAILED. 7 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"
+        echo "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"
+        exit 101
+        ;;
+esac"#;
+    let run = check_all("check-all-failing", &["--quick"], cargo, true);
+    let said = text(&run.out.stdout);
+    assert_eq!(run.out.status.code(), Some(1), "{said}");
+    assert_eq!(run.calls.len(), 3, "every step ran: {:?}", run.calls);
+    assert_eq!(run.row("policy"), ["3", "-", "-", "-", "-"]);
+    assert_eq!(run.row("fmt-check"), ["0", "-", "-", "-", "-"]);
+    assert_eq!(run.row("native tests (dev)"), ["101", "12", "2", "0", "0"]);
+    assert!(said.ends_with("check-all: 2 of 3 steps FAILED\n"), "{said}");
+    // The end of a failed step's log is shown when it fails.
+    assert!(
+        said.contains("check-all: policy: FAILED with status 3;"),
+        "{said}"
+    );
+    assert!(said.contains("  | policy: a.bin is not allowed"), "{said}");
+}
+
+/// The whole run: native in both profiles with no switch, the Wine runs
+/// in both profiles as often as asked with every switch this Mac can
+/// meet, the validator and the compiler found in the cache folder and
+/// handed on by their Wine paths, then the doctor under Wine.
+#[test]
+fn check_all_requires_what_this_mac_can_meet_in_the_wine_runs() {
+    let run = check_all("check-all-full", &["--repeat", "2"], CHECK_ALL_CARGO, true);
+    let said = text(&run.out.stdout);
+    assert_eq!(
+        run.out.status.code(),
+        Some(0),
+        "{said}\n{}",
+        text(&run.out.stderr)
+    );
+    assert_eq!(
+        run.labels(),
+        [
+            "policy",
+            "fmt-check",
+            "native tests (dev)",
+            "native tests (release)",
+            "wine tests (dev) 1/2",
+            "wine tests (dev) 2/2",
+            "wine tests (release) 1/2",
+            "wine tests (release) 2/2",
+            "doctor (wine)",
+        ]
+    );
+    assert_eq!(
+        run.row("wine tests (release) 2/2"),
+        ["0", "3", "0", "1", "1"]
+    );
+    assert_eq!(run.row("doctor (wine)"), ["0", "-", "-", "-", "-"]);
+
+    // The native runs have no switch.
+    let native = run.switches("call test --workspace --locked");
+    assert_eq!(native, vec![Vec::<String>::new(); 2]);
+    // The Wine runs: two of each profile, each with the five.
+    let wine: Vec<&Vec<String>> = run
+        .calls
+        .iter()
+        .filter(|c| c[0].starts_with("call test --target "))
+        .collect();
+    let arguments: Vec<&str> = wine.iter().map(|c| c[0].as_str()).collect();
+    let dev = "call test --target x86_64-pc-windows-gnullvm --workspace --no-fail-fast";
+    let release = format!("{dev} --release");
+    assert_eq!(arguments, [dev, dev, release.as_str(), release.as_str()]);
+    let dxc = windows(&run.home.join("Library/Caches/victory-macos/dxc/v1.9.2609"));
+    for call in wine {
+        let has: Vec<&str> = call.iter().filter_map(|l| l.strip_prefix("has ")).collect();
+        assert_eq!(
+            has,
+            [
+                "VICTORY_REQUIRE_CLAMP",
+                "VICTORY_REQUIRE_DEPTH",
+                "VICTORY_REQUIRE_DXIL",
+                "VICTORY_REQUIRE_GPU",
+                "VICTORY_REQUIRE_HLSL",
+            ]
+        );
+        assert!(call.contains(&format!("dxil {dxc}\\dxil.dll")), "{call:?}");
+        assert!(call.contains(&format!("dxc {dxc}\\dxc.exe")), "{call:?}");
+    }
+    // The doctor ran under the stand-in Wine once, with the validator.
+    let doctor: Vec<&Vec<String>> = run
+        .calls
+        .iter()
+        .filter(|c| c[0].starts_with("wine "))
+        .collect();
+    assert_eq!(doctor.len(), 1, "{:?}", run.calls);
+    assert!(
+        doctor[0][0].ends_with("victory.exe doctor"),
+        "{:?}",
+        doctor[0]
+    );
+    assert!(
+        doctor[0].contains(&format!("dxil {dxc}\\dxil.dll")),
+        "{:?}",
+        doctor[0]
+    );
+    assert!(
+        said.contains(
+            "check-all: the Wine test runs set: VICTORY_REQUIRE_GPU=1 VICTORY_REQUIRE_CLAMP=1 \
+             VICTORY_REQUIRE_DEPTH=1 VICTORY_REQUIRE_DXIL=1 VICTORY_REQUIRE_HLSL=1\n"
+        ),
+        "{said}"
+    );
+    let (_, files) = run.logs();
+    assert_eq!(
+        files,
+        [
+            "doctor.log",
+            "fmt-check.log",
+            "native-dev.log",
+            "native-release.log",
+            "policy.log",
+            "wine-dev-1.log",
+            "wine-dev-2.log",
+            "wine-release-1.log",
+            "wine-release-2.log",
+        ]
+    );
+}
+
+/// Without a DXC folder the validator and the compiler cannot be
+/// required, and the run says so in plain words, before it starts and
+/// under the table: a reader of the table must not take those tests for
+/// run.
+#[test]
+fn check_all_says_which_switches_it_left_off_without_a_dxc() {
+    let run = check_all("check-all-no-dxc", &[], CHECK_ALL_CARGO, false);
+    let said = text(&run.out.stdout);
+    assert_eq!(
+        run.out.status.code(),
+        Some(0),
+        "{said}\n{}",
+        text(&run.out.stderr)
+    );
+    let wine = run.switches("call test --target ");
+    assert_eq!(wine.len(), 2, "one run per profile: {:?}", run.calls);
+    for has in wine {
+        assert_eq!(
+            has,
+            [
+                "VICTORY_REQUIRE_CLAMP",
+                "VICTORY_REQUIRE_DEPTH",
+                "VICTORY_REQUIRE_GPU",
+            ]
+        );
+    }
+    for call in &run.calls {
+        assert!(call.contains(&"dxil <unset>".to_owned()), "{call:?}");
+    }
+    for left_off in [
+        "(and VICTORY_DXIL_UNIX is not set): VICTORY_REQUIRE_DXIL is left off",
+        "(and VICTORY_PC_DXC_UNIX is not set): VICTORY_REQUIRE_HLSL is left off",
+        "never set here, a Mac does not have or cannot promise what they name: VICTORY_REQUIRE_WARP",
+    ] {
+        assert_eq!(said.matches(left_off).count(), 2, "{left_off} in:\n{said}");
+    }
+    let under_the_table = said
+        .split_once("left off in the Wine test runs:\n")
+        .expect("said under the table")
+        .1;
+    assert!(
+        under_the_table.contains("VICTORY_REQUIRE_DXIL is left off"),
+        "{said}"
+    );
+    assert_eq!(run.labels().len(), 7, "{:?}", run.labels());
+
+    // `--no-wine` starts no Wine run and no doctor, and leaves nothing off.
+    let run = check_all("check-all-no-wine", &["--no-wine"], CHECK_ALL_CARGO, false);
+    let said = text(&run.out.stdout);
+    assert_eq!(run.out.status.code(), Some(0), "{said}");
+    assert_eq!(
+        run.labels(),
+        [
+            "policy",
+            "fmt-check",
+            "native tests (dev)",
+            "native tests (release)"
+        ]
+    );
+    assert!(!said.contains("left off"), "{said}");
+    assert!(run.calls.iter().all(|c| !c[0].starts_with("wine ")));
+}
+
+/// Logs never go into a source tree, and arguments the script does not
+/// know end it before it runs anything.
+#[test]
+fn check_all_refuses_a_log_folder_in_the_tree_and_unknown_arguments() {
+    let dir = scratch("check-all-refusals");
+    let log = dir.join("cargo.log");
+    script(
+        &dir.join("bin/cargo"),
+        r#"echo "cargo $*" >> "$STAND_IN_LOG""#,
+    );
+    let run = |args: &[&str], check_dir: Option<&Path>| {
+        let mut command = Command::new(check_all_script());
+        command
+            .args(args)
+            .env("CARGO", dir.join("bin/cargo"))
+            .env("HOME", outside("check-all-refusals"))
+            .env("STAND_IN_LOG", &log)
+            .env_remove("VICTORY_CHECK_DIR");
+        if let Some(check_dir) = check_dir {
+            command.env("VICTORY_CHECK_DIR", check_dir);
+        }
+        command.output().unwrap()
+    };
+    let inside = dir.join("logs");
+    let out = run(&["--quick"], Some(&inside));
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        text(&out.stderr).contains("it is inside a VIctory source tree"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(!inside.exists());
+    for args in [
+        &["--fast"][..],
+        &["--repeat"],
+        &["--repeat", "0"],
+        &["--repeat", "two"],
+        &["--quick", "extra"],
+    ] {
+        let out = run(args, None);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert_eq!(text(&out.stdout), "", "{args:?}");
+    }
+    assert!(!log.exists(), "nothing was started");
+}
