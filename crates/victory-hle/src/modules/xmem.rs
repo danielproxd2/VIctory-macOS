@@ -304,31 +304,101 @@ fn commit_in_placeholder(base: usize, size: usize, protect: u32) -> *mut c_void 
         return null;
     }
     // Memory of the reservation, as the title sees it.
-    regions.reserved.insert(start, (end - start, flags));
+    regions.record(start, flags);
     // What the host answers a commit with: the first of its pages.
     (base & !(HOST_PAGE - 1)) as *mut c_void
 }
 
-/// The regions `XMemVirtualAlloc` reserved, by base: their size and the
-/// XMem flags the title gave, which `XMemVirtualQuery` gives back.
-// shortcut: the title frees these with the host's `VirtualFree`, which we do
-// not see, so a region is forgotten only when its range is handed out here
-// again; `XMemVirtualQuery` checks what it can (see `flags_of`).
+/// The regions `XMemVirtualAlloc` reserved, by base, with the XMem flags
+/// the title gave, which `XMemVirtualQuery` gives back.
+// The title frees these with the host's `VirtualFree`, which we do not see:
+// a record is dropped when its range is handed out here again, and a query
+// drops one whose allocation the host no longer has as it was recorded
+// (see `flags_of`).
 static REGIONS: Mutex<Regions> = Mutex::new(Regions {
     reserved: BTreeMap::new(),
     placeholders: BTreeMap::new(),
 });
 
-/// By base: size and flags.
 struct Regions {
-    /// Memory that can be committed where it is.
-    reserved: BTreeMap<usize, (usize, u64)>,
-    /// Reservations of 64 KiB pages: host placeholders.
+    /// Memory that can be committed where it is, by base.
+    reserved: BTreeMap<usize, Region>,
+    /// Reservations of 64 KiB pages (host placeholders), by base: the size
+    /// the title gave and its flags.
     placeholders: BTreeMap<usize, (usize, u64)>,
+}
+
+/// A host allocation as it was when recorded.
+#[derive(Clone, Copy)]
+struct Region {
+    /// Where the host's allocation ends (it rounds sizes up to its pages).
+    end: usize,
+    /// The protection the host says it was allocated with.
+    protect: u32,
+    flags: u64,
 }
 
 fn regions() -> MutexGuard<'static, Regions> {
     REGIONS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Where the allocation of `process` that starts at `base` ends, and the
+/// protection it was made with; `None` if no allocation starts there.
+fn host_allocation(process: HANDLE, base: usize) -> Option<(usize, u32)> {
+    let starts_here = |region: &MEMORY_BASIC_INFORMATION| region.AllocationBase as usize == base;
+    let first = host_region(process, base).filter(starts_here)?;
+    let mut end = base;
+    // One region per run of pages in one state: one or two of a new
+    // allocation, which is what this is asked of.
+    while let Some(region) = host_region(process, end).filter(starts_here) {
+        match (region.BaseAddress as usize).checked_add(region.RegionSize) {
+            Some(next) if next > end => end = next,
+            _ => break,
+        }
+    }
+    Some((end, first.AllocationProtect))
+}
+
+/// Whether the allocation of `process` that `host` is a region of is still
+/// the one recorded as `region` at `base`: private memory made with the
+/// same protection that ends where it ended. Two more questions to the
+/// host, however many regions the allocation has by now.
+fn still_allocated(
+    process: HANDLE,
+    host: &MEMORY_BASIC_INFORMATION,
+    base: usize,
+    region: &Region,
+) -> bool {
+    let ours =
+        |at: usize| host_region(process, at).is_some_and(|r| r.AllocationBase as usize == base);
+    host.Type == MEM_PRIVATE
+        && host.AllocationProtect == region.protect
+        && region.end > base
+        && ours(region.end - 1)
+        && !ours(region.end)
+}
+
+impl Regions {
+    /// Records the host allocation that starts at `at` as memory with
+    /// these flags.
+    fn record(&mut self, at: usize, flags: u64) {
+        // SAFETY: a pseudo handle needs no closing.
+        let process = unsafe { GetCurrentProcess() };
+        match host_allocation(process, at) {
+            Some((end, protect)) => {
+                let region = Region {
+                    end,
+                    protect,
+                    flags,
+                };
+                self.reserved.insert(at, region);
+            }
+            // Nothing to check a later query against: no record.
+            None => {
+                self.reserved.remove(&at);
+            }
+        }
+    }
 }
 
 /// Records the flags of the region the host just reserved at `at`.
@@ -340,33 +410,56 @@ fn remember(at: usize, size: usize, flags: u64, placeholder: bool) {
     } = &mut *regions;
     // The host gave this range out, so whatever was recorded in it is gone.
     let end = at.saturating_add(size);
-    for map in [&mut *reserved, &mut *placeholders] {
-        let stale: Vec<usize> = map
-            .range(..end)
-            .rev()
-            .take_while(|(base, (size, _))| base.saturating_add(*size) > at)
-            .map(|(base, _)| *base)
-            .collect();
-        for base in stale {
-            map.remove(&base);
-        }
+    // Neither map's records overlap, so those that reach into the range are
+    // the last ones that start below its end.
+    let stale: Vec<usize> = reserved
+        .range(..end)
+        .rev()
+        .take_while(|(_, region)| region.end > at)
+        .map(|(base, _)| *base)
+        .collect();
+    for base in stale {
+        reserved.remove(&base);
     }
-    let map = if placeholder { placeholders } else { reserved };
-    map.insert(at, (size, flags));
+    let stale: Vec<usize> = placeholders
+        .range(..end)
+        .rev()
+        .take_while(|(base, (size, _))| base.saturating_add(*size) > at)
+        .map(|(base, _)| *base)
+        .collect();
+    for base in stale {
+        placeholders.remove(&base);
+    }
+    if placeholder {
+        placeholders.insert(at, (size, flags));
+    } else {
+        regions.record(at, flags);
+    }
 }
 
 fn forget(at: usize) {
     regions().reserved.remove(&at);
 }
 
-/// The flags the region holding `address` was reserved with, if it is one
-/// of ours and still what we reserved: private memory (a view of physical
-/// pages mapped into it is not) of the allocation that starts at our base.
-fn flags_of(address: usize, host: &MEMORY_BASIC_INFORMATION) -> Option<u64> {
+/// The flags the region `host` (of `process`) was reserved with, if it is
+/// one of ours and still what we reserved: private memory (a view of
+/// physical pages mapped into it is not) of an allocation that starts at
+/// our base, ends where ours ended and was made with our protection. A
+/// record whose allocation is no longer that one (the title released it
+/// with the host's `VirtualFree` and the host gave the base out again) is
+/// dropped here.
+// shortcut: an allocation the host made since at the same base, of the same
+// size and protection, cannot be told from ours and reads our flags; the
+// host's `VirtualFree` would have to pass through here to end that.
+fn flags_of(process: HANDLE, host: &MEMORY_BASIC_INFORMATION) -> Option<u64> {
     let base = host.AllocationBase as usize;
-    let regions = regions();
-    let (size, flags) = regions.reserved.get(&base)?;
-    (host.Type == MEM_PRIVATE && address.checked_sub(base)? < *size).then_some(*flags)
+    let mut regions = regions();
+    let region = *regions.reserved.get(&base)?;
+    if !still_allocated(process, host, base, &region) {
+        regions.reserved.remove(&base);
+        return None;
+    }
+    Some(region.flags)
 }
 
 /// `MEMORY_BASIC_INFORMATION` (the console's first 0x30 bytes are the
@@ -404,7 +497,7 @@ pub extern "system" fn XMemVirtualQuery(
         }
         let info = &mut *out;
         info.flags = if info.host.State == MEM_COMMIT {
-            flags_of(address as usize, &info.host).unwrap_or(GRAPHICS)
+            flags_of(process, &info.host).unwrap_or(GRAPHICS)
         } else {
             0
         };
@@ -1852,6 +1945,104 @@ mod tests {
         } else {
             assert!(again.is_null(), "a fixed base is that base or nothing");
         }
+    }
+
+    /// Reserves two 64 KiB pages with `XMemVirtualAlloc`, frees them with
+    /// the host's `VirtualFree` (which this module does not see) and has
+    /// the host allocate `size` bytes (eight pages at most) at the same
+    /// address: that address. Other tests reserve meanwhile and may take
+    /// the address, so it tries again with another.
+    fn reallocated_by_the_host(flags: u64, size: usize, protect: u32) -> *mut c_void {
+        let mut errors = Vec::new();
+        for _ in 0..64 {
+            // SAFETY: plain reservations and their release. The first
+            // finds room for the longest allocation asked for.
+            let again = unsafe {
+                let room = VirtualAlloc(std::ptr::null(), 8 * PAGE, MEM_RESERVE, PAGE_NOACCESS);
+                assert!(!room.is_null());
+                assert_ne!(VirtualFree(room, 0, MEM_RELEASE), 0);
+                let kind = MEM_RESERVE | MEM_COMMIT;
+                let p = XMemVirtualAlloc(room, 2 * PAGE, kind, flags, PAGE_READWRITE);
+                if p.is_null() {
+                    errors.push(std::io::Error::last_os_error());
+                    continue;
+                }
+                assert_eq!(p, room);
+                assert_eq!(query(p).flags, flags);
+                assert_ne!(VirtualFree(p, 0, MEM_RELEASE), 0);
+                VirtualAlloc(p, size, kind, protect)
+            };
+            if again.is_null() {
+                errors.push(std::io::Error::last_os_error());
+                continue;
+            }
+            return again;
+        }
+        panic!("64 addresses running were taken meanwhile: {errors:?}");
+    }
+
+    #[test]
+    fn a_region_the_host_released_leaves_its_flags_to_nothing_else() {
+        let flags = 1 | 6 << 12;
+        // Another allocation at the same base: longer, shorter, or of
+        // another protection. None of them is the region the flags were
+        // given for, so each answers as any memory of the host's does.
+        for (size, protect) in [
+            (4 * PAGE, PAGE_READWRITE),
+            (PAGE, PAGE_READWRITE),
+            (2 * PAGE, PAGE_READONLY),
+        ] {
+            let p = reallocated_by_the_host(flags, size, protect);
+            let info = query(p);
+            assert_eq!(info.host.State, MEM_COMMIT);
+            assert_eq!(info.flags, GRAPHICS, "{size:#x} bytes, {protect:#x}");
+            // SAFETY: the host's allocation above.
+            assert_ne!(unsafe { VirtualFree(p, 0, MEM_RELEASE) }, 0);
+        }
+        // A size that is no multiple of a page: the region is what the
+        // host reserved, to the end of its last page.
+        let size = 2 * PAGE - 0x800;
+        let kind = MEM_RESERVE | MEM_COMMIT;
+        let p = XMemVirtualAlloc(std::ptr::null_mut(), size, kind, flags, PAGE_READWRITE);
+        assert!(!p.is_null());
+        for at in [
+            p,
+            p.wrapping_byte_add(size),
+            p.wrapping_byte_add(2 * PAGE - 1),
+        ] {
+            assert_eq!(query(at).flags, flags, "{at:p}");
+        }
+        // SAFETY: our own reservation.
+        assert_ne!(unsafe { VirtualFree(p, 0, MEM_RELEASE) }, 0);
+    }
+
+    /// Pins the one case a released region's flags outlive it today: the
+    /// host allocates the same range again with the same protection, and
+    /// nothing it tells of the two allocations differs. Our shortcut, not
+    /// asserted as right: change the test with it.
+    #[test]
+    fn an_identical_host_allocation_reads_a_released_regions_flags_today() {
+        let flags = 1 | 6 << 12;
+        let p = reallocated_by_the_host(flags, 2 * PAGE, PAGE_READWRITE);
+        assert_eq!(query(p).flags, flags);
+        // SAFETY: the host's allocation.
+        assert_ne!(unsafe { VirtualFree(p, 0, MEM_RELEASE) }, 0);
+        assert_eq!(query(p).flags, 0);
+    }
+
+    /// Pins what a 32-bit default block reads back today: the flags of the
+    /// reservation we make for it, address bits and all, where every block
+    /// read plain graphics memory before regions kept their flags. Our
+    /// choice of flags, not known console behaviour: change the test with
+    /// it.
+    #[test]
+    fn a_32bit_default_block_reads_its_reservations_flags_today() {
+        let p = XMemAllocDefault(100, ALLOC_32BIT);
+        assert!(!p.is_null());
+        let info = query(p);
+        assert_eq!(info.host.State, MEM_COMMIT);
+        assert_eq!(info.flags, GRAPHICS | ADDRESS_32BIT);
+        XMemFreeDefault(p, ALLOC_32BIT);
     }
 
     /// Pins what `XMemVirtualQuery` answers today for memory that did not
