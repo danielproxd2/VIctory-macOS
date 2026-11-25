@@ -112,10 +112,9 @@ fn virtual_alloc(
         p => p,
     };
     // A reservation of 64 KiB pages takes physical pages later
-    // (`XMemMapPhysicalPages`); on the host only a placeholder can.
-    // shortcut: committing part of such a reservation later would fail
-    // (Grand Theft Auto VI's 23 calls never do); replace that part of the
-    // placeholder then.
+    // (`XMemMapPhysicalPages`); on the host only a placeholder can, and a
+    // placeholder cannot be committed: a later commit inside one replaces
+    // that part of it (`commit_in_placeholder`).
     let placeholder = kind & PAGES_64K == PAGES_64K && kind & MEM_COMMIT == 0;
     if placeholder {
         if kind & MEM_REPLACE_PLACEHOLDER != 0 {
@@ -168,10 +167,72 @@ fn virtual_alloc(
             "XMemVirtualAlloc"
         );
     }
-    if !at.is_null() && kind & MEM_RESERVE != 0 {
-        remember(at as usize, size, flags);
+    if at.is_null() {
+        if !base.is_null() && kind & MEM_COMMIT != 0 {
+            return commit_in_placeholder(base as usize, size, protect);
+        }
+    } else if kind & MEM_RESERVE != 0 {
+        remember(at as usize, size, flags, placeholder);
     }
     at
+}
+
+/// A commit at the title's address that the host refused: if the bytes lie
+/// in one of our placeholder reservations, the 64 KiB pages holding them
+/// are split off and become committed memory of their own. Null if they do
+/// not, or if something is mapped there (the host then refuses again).
+fn commit_in_placeholder(base: usize, size: usize, protect: u32) -> *mut c_void {
+    const HOST_PAGE: usize = 0x1000;
+    let null = std::ptr::null_mut();
+    let start = base & !(PAGE - 1);
+    let end = base
+        .checked_add(size)
+        .and_then(|end| end.checked_next_multiple_of(PAGE));
+    let Some(end) = end.filter(|&end| end > start) else {
+        return null;
+    };
+    let mut regions = regions();
+    let inside = regions
+        .placeholders
+        .range(..=start)
+        .next_back()
+        .filter(|(at, (size, _))| at.checked_add(*size).is_some_and(|e| end <= e))
+        .map(|(_, (_, flags))| *flags);
+    let Some(flags) = inside else {
+        return null;
+    };
+    // SAFETY: acts on a placeholder of ours only: the split fails on
+    // anything else (harmlessly too when the range is all of it), and so
+    // does the replacement.
+    let at = unsafe {
+        VirtualFree(
+            start as *mut c_void,
+            end - start,
+            MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
+        );
+        VirtualAlloc2(
+            GetCurrentProcess(),
+            start as *const c_void,
+            end - start,
+            MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+            protect,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if at.is_null() {
+        tracing::warn!(
+            address = format_args!("{base:#x}"),
+            size,
+            error = %std::io::Error::last_os_error(),
+            "committing part of a 64 KiB-page reservation failed"
+        );
+        return null;
+    }
+    // Memory of the reservation, as the title sees it.
+    regions.reserved.insert(start, (end - start, flags));
+    // What the host answers a commit with: the first of its pages.
+    (base & !(HOST_PAGE - 1)) as *mut c_void
 }
 
 /// The regions `XMemVirtualAlloc` reserved, by base: their size and the
@@ -179,31 +240,49 @@ fn virtual_alloc(
 // shortcut: the title frees these with the host's `VirtualFree`, which we do
 // not see, so a region is forgotten only when its range is handed out here
 // again; `XMemVirtualQuery` checks what it can (see `flags_of`).
-static REGIONS: Mutex<BTreeMap<usize, (usize, u64)>> = Mutex::new(BTreeMap::new());
+static REGIONS: Mutex<Regions> = Mutex::new(Regions {
+    reserved: BTreeMap::new(),
+    placeholders: BTreeMap::new(),
+});
 
-fn regions() -> MutexGuard<'static, BTreeMap<usize, (usize, u64)>> {
+/// By base: size and flags.
+struct Regions {
+    /// Memory that can be committed where it is.
+    reserved: BTreeMap<usize, (usize, u64)>,
+    /// Reservations of 64 KiB pages: host placeholders.
+    placeholders: BTreeMap<usize, (usize, u64)>,
+}
+
+fn regions() -> MutexGuard<'static, Regions> {
     REGIONS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Records the flags of the region the host just reserved at `at`.
-fn remember(at: usize, size: usize, flags: u64) {
+fn remember(at: usize, size: usize, flags: u64, placeholder: bool) {
     let mut regions = regions();
+    let Regions {
+        reserved,
+        placeholders,
+    } = &mut *regions;
     // The host gave this range out, so whatever was recorded in it is gone.
     let end = at.saturating_add(size);
-    let stale: Vec<usize> = regions
-        .range(..end)
-        .rev()
-        .take_while(|(base, (size, _))| base.saturating_add(*size) > at)
-        .map(|(base, _)| *base)
-        .collect();
-    for base in stale {
-        regions.remove(&base);
+    for map in [&mut *reserved, &mut *placeholders] {
+        let stale: Vec<usize> = map
+            .range(..end)
+            .rev()
+            .take_while(|(base, (size, _))| base.saturating_add(*size) > at)
+            .map(|(base, _)| *base)
+            .collect();
+        for base in stale {
+            map.remove(&base);
+        }
     }
-    regions.insert(at, (size, flags));
+    let map = if placeholder { placeholders } else { reserved };
+    map.insert(at, (size, flags));
 }
 
 fn forget(at: usize) {
-    regions().remove(&at);
+    regions().reserved.remove(&at);
 }
 
 /// The flags the region holding `address` was reserved with, if it is one
@@ -212,7 +291,7 @@ fn forget(at: usize) {
 fn flags_of(address: usize, host: &MEMORY_BASIC_INFORMATION) -> Option<u64> {
     let base = host.AllocationBase as usize;
     let regions = regions();
-    let (size, flags) = regions.get(&base)?;
+    let (size, flags) = regions.reserved.get(&base)?;
     (host.Type == MEM_PRIVATE && address.checked_sub(base)? < *size).then_some(*flags)
 }
 
@@ -1115,6 +1194,96 @@ mod tests {
         }
         // No size: nothing to allocate, as the host says.
         assert!(XMemAllocDefault(0, 0x15 << ALIGNMENT_SHIFT | ALLOC_32BIT).is_null());
+    }
+
+    #[test]
+    fn part_of_a_64k_page_reservation_can_be_committed() {
+        let flags = 1 | 5 << 12;
+        let a = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            5 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            flags,
+            PAGE_READWRITE,
+        );
+        assert!(!a.is_null());
+        let at = |page: usize| a.wrapping_byte_add(page * PAGE);
+        let state = |page: usize| query(at(page)).host.State;
+        let commit = |base: *mut c_void, size| {
+            XMemVirtualAlloc(base, size, MEM_COMMIT | PAGES_64K, GRAPHICS, PAGE_READWRITE)
+        };
+        // One page in the middle, as the host commits inside a reservation.
+        assert_eq!(commit(at(1), PAGE), at(1));
+        assert_eq!(
+            [0, 1, 2, 3, 4].map(state),
+            [
+                MEM_RESERVE,
+                MEM_COMMIT,
+                MEM_RESERVE,
+                MEM_RESERVE,
+                MEM_RESERVE
+            ]
+        );
+        let info = query(at(1));
+        assert_eq!(info.host.Protect, PAGE_READWRITE);
+        assert_eq!(info.flags, flags, "the reservation's memory");
+        // SAFETY: the page is committed read-write.
+        unsafe {
+            at(1).cast::<u8>().write_bytes(0x6b, PAGE);
+            assert_eq!(at(1).cast::<u8>().add(PAGE - 1).read(), 0x6b);
+        }
+        // Committed again, it is the same memory.
+        assert_eq!(commit(at(1), PAGE), at(1));
+        // SAFETY: still committed.
+        assert_eq!(unsafe { at(1).cast::<u8>().read() }, 0x6b);
+
+        // A few bytes inside a page commit the 64 KiB page they are in,
+        // and the answer is the host's: the first 4 KiB page of the bytes.
+        let inside = at(3).wrapping_byte_add(0x1800);
+        assert_eq!(commit(inside, 0x10), at(3).wrapping_byte_add(0x1000));
+        assert_eq!([2, 3, 4].map(state), [MEM_RESERVE, MEM_COMMIT, MEM_RESERVE]);
+        // SAFETY: the whole 64 KiB page is committed read-write.
+        unsafe { at(3).cast::<u8>().write_bytes(0x2e, PAGE) };
+
+        // The rest still takes physical pages, next to the committed part.
+        let pages = allocate(2);
+        assert_eq!(XMemMapPhysicalPages(at(2), 1, pages.as_ptr()), at(2));
+        assert_eq!(XMemMapPhysicalPages(at(4), 1, pages[1..].as_ptr()), at(4));
+        // SAFETY: mapped read-write.
+        unsafe { at(2).cast::<u8>().write(0x4d) };
+
+        // Refused, with nothing changed: bytes that run past the
+        // reservation, bytes with no end, no bytes, and bytes that cross
+        // what is committed or mapped already.
+        let null = std::ptr::null_mut::<c_void>();
+        assert_eq!(commit(at(0), 6 * PAGE), null);
+        assert_eq!(commit(at(0), usize::MAX), null);
+        assert_eq!(commit(at(0), usize::MAX - a as usize + 1), null);
+        assert_eq!(commit(at(0), 0), null);
+        assert_eq!(commit(at(0), 2 * PAGE), null, "across a committed part");
+        assert_eq!(commit(at(0), 3 * PAGE), null, "and a mapped one");
+        assert_eq!(
+            [0, 1, 2, 3, 4].map(state),
+            [MEM_RESERVE, MEM_COMMIT, MEM_COMMIT, MEM_COMMIT, MEM_COMMIT]
+        );
+        assert_eq!(mine(a, 5), [(at(2) as usize, PAGE), (at(4) as usize, PAGE)]);
+        // SAFETY: all three are still what they were.
+        unsafe {
+            assert_eq!(at(1).cast::<u8>().read(), 0x6b);
+            assert_eq!(at(2).cast::<u8>().read(), 0x4d);
+            assert_eq!(at(3).cast::<u8>().add(PAGE - 1).read(), 0x2e);
+        }
+        // The first page, the last of the placeholder left.
+        assert_eq!(commit(at(0), 1), at(0));
+        assert_eq!(state(0), MEM_COMMIT);
+
+        assert_eq!(XMemMapPhysicalPages(at(2), 1, std::ptr::null()), at(2));
+        assert_eq!(XMemMapPhysicalPages(at(4), 1, std::ptr::null()), at(4));
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+        // A commit at an address that is in no reservation of ours fails as
+        // the host fails it.
+        let nowhere = (usize::MAX - 2 * PAGE + 1) as *mut c_void;
+        assert_eq!(commit(nowhere, PAGE), null);
     }
 
     #[test]
