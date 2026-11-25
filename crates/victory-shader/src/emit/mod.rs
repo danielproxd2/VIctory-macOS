@@ -1941,6 +1941,27 @@ mod tests {
         assert_eq!(length("v_and_b32"), length("v_or_b32"), "pick others");
     }
 
+    /// A compute program of an `ACCC` part whose stage word asks for a
+    /// fourth thread-id component is refused as the same program of a
+    /// `DXIL` part is: there is no such component. (The `ACCC` parser
+    /// does not look at the field; reading the program's inputs does.)
+    #[test]
+    fn an_accc_program_with_a_fourth_thread_id_component_is_refused() {
+        use crate::native::tests::{fspx, fspx_resource};
+        let words = testkit::store_dword(0, 0);
+        let code = testkit::compute_with_uav(&words).code;
+        let records = [fspx_resource(3, 3, 0, 0, 4, 1)];
+        let container = |rsrc2: u32| {
+            let part = fspx(&code, rsrc2, [1, 1, 1], true, &records);
+            crate::dxbc::build(&[(FourCC::ACCC, &part)])
+        };
+        assert!(translate(&container(5 << 1 | 2 << 11)).is_ok());
+        assert_eq!(
+            translate(&container(5 << 1 | 3 << 11)).err(),
+            Some(ShaderError::Malformed("a fourth thread id component"))
+        );
+    }
+
     /// The whole path a title's shader takes, on containers assembled here:
     /// container, `DXIL` part, XDAT index, packed blob, stage record, code,
     /// signatures, and out comes a host shader that binds what the program
