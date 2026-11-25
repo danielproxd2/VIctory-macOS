@@ -9,6 +9,8 @@
 # VICTORY_REQUIRE_GPU=1 makes the tests that need a host D3D12 device fail
 # where there is none; otherwise they pass, each printing
 # "skipped: no host D3D12 device".
+# A run that is meant to prove something sets VICTORY_REQUIRE_GPU=1: without
+# it a machine with no device passes these tests without running them.
 # The stand-in title and its DLLs (tests/fixtures) are built here, once, in
 # the profile the tests are built in, and VICTORY_FIXTURE_DIR tells the tests
 # where they are: cargo cannot be started inside Wine.
