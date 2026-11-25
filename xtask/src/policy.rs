@@ -62,8 +62,8 @@ const EXCEPTIONS: &[Exception] = &[
     Exception {
         path: "crates/victory-gpu/src/depth_bytecode.rs",
         reason: "our own depth.hlsl compiled by Microsoft's compilers, which Wine cannot run; written by `cargo xtask embed-depth`, which prints this entry's numbers. Pinned now as the form without bytes: the shader was not built yet",
-        len: 407,
-        fnv: 0xfc04415facbf891a,
+        len: 49637,
+        fnv: 0x859d11526b34dc4d,
     },
 ];
 
