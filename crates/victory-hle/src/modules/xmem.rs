@@ -381,6 +381,10 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
         return 0;
     };
+    // Room for `n` page numbers cannot lie at `pages` at all.
+    if !range::array_fits(pages as usize, n, size_of::<usize>()) {
+        return 0;
+    }
     // A pagefile-backed section of `size` bytes, its pages committed when
     // first mapped or written (`commit`): Grand Theft Auto VI asks for 6.1
     // GiB at once, which a busy host often cannot commit (error 1450).
@@ -435,7 +439,9 @@ const FRAMES: usize = PAGE >> 12;
 
 /// Pages still mapped stay readable through their views until unmapped.
 pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> BOOL {
-    if pages.is_null() {
+    // The count is the title's: one that no array can have is refused before
+    // a page number is read or a page forgotten.
+    if pages.is_null() || !range::array_fits(pages as usize, n, size_of::<usize>()) {
         return 0;
     }
     let mut physical = physical();
@@ -571,12 +577,23 @@ pub extern "system" fn XMemMapPhysicalPages(
     pages: *const usize,
 ) -> *mut c_void {
     let base = address as usize;
+    // The count is the title's. One whose bytes wrap would unmap and map a
+    // range it does not name: refused before anything changes.
+    let Some(len) = range::page_span(base, n) else {
+        tracing::warn!(
+            address = format_args!("{base:#x}"),
+            n,
+            "XMemMapPhysicalPages: the range does not fit the address space"
+        );
+        return std::ptr::null_mut();
+    };
     let mut physical = physical();
-    unmap(&mut physical, base, n * PAGE);
+    unmap(&mut physical, base, len);
     if pages.is_null() {
         return address;
     }
-    // SAFETY: the title passes `n` page numbers.
+    // SAFETY: the title passes `n` page numbers (fewer bytes than the
+    // range checked above).
     let pages = unsafe { std::slice::from_raw_parts(pages, n) };
     let mut i = 0;
     while i < n {
@@ -609,7 +626,11 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     n: usize,
     pages: *const usize,
 ) -> BOOL {
-    if addresses.is_null() {
+    let entry = size_of::<usize>();
+    if addresses.is_null()
+        || !range::array_fits(addresses as usize, n, entry)
+        || !(pages.is_null() || range::array_fits(pages as usize, n, entry))
+    {
         return 0;
     }
     for i in 0..n {
@@ -637,7 +658,15 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 /// VI maps pages into a pool view, then has the GPU map them into its tiled
 /// heap. Page by page; false if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
-    let (to, from, len) = (to as usize, from as usize, len as usize);
+    // All three are the title's (through the GPU's page-mapping batches). A
+    // range that runs off the end of the address space names no memory:
+    // refused before anything is unmapped.
+    let Some((to, len)) = range::byte_span(to, len) else {
+        return false;
+    };
+    let Some((from, _)) = range::byte_span(from, if from == 0 { 0 } else { len as u64 }) else {
+        return false;
+    };
     let mut physical = physical();
     unmap(&mut physical, to, len);
     for k in (0..len).step_by(PAGE) {
@@ -765,7 +794,10 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
     if len == 0 {
         return;
     }
-    let end = base + len;
+    // Callers have checked the range; one that wraps holds no view.
+    let Some(end) = base.checked_add(len) else {
+        return;
+    };
     // Views do not overlap: the one holding `base`, then those starting
     // inside (the GPU's page mappings make one view per page).
     let first = physical
@@ -1127,6 +1159,152 @@ mod tests {
         assert_eq!(query(a).host.State, MEM_COMMIT);
         assert_eq!(XMemMapPhysicalPages(a, 1, std::ptr::null()), a);
         assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
+    /// Where the views are and how long: what a refused call must leave.
+    fn views() -> Vec<(usize, usize)> {
+        let physical = physical();
+        physical.views.iter().map(|(at, v)| (*at, v.0)).collect()
+    }
+
+    /// A reservation of `n` 64 KiB pages with `pages` mapped at its start.
+    fn mapped(n: usize, pages: &[usize]) -> *mut c_void {
+        let a = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            n * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!a.is_null());
+        assert_eq!(XMemMapPhysicalPages(a, pages.len(), pages.as_ptr()), a);
+        a
+    }
+
+    /// The smallest page count whose length in bytes wraps to 0.
+    const WRAPS: usize = usize::MAX / PAGE + 1;
+
+    // The tests below hold the lock on nothing, and other tests map views of
+    // their own meanwhile: each looks only at the views it made.
+    fn mine(a: *mut c_void, n: usize) -> Vec<(usize, usize)> {
+        let (from, to) = (a as usize, a as usize + n * PAGE);
+        let all = views();
+        all.into_iter()
+            .filter(|(at, _)| (from..to).contains(at))
+            .collect()
+    }
+
+    #[test]
+    fn mapping_an_overflowing_page_count_changes_nothing() {
+        let pages = allocate(2);
+        let a = mapped(2, &pages);
+        // SAFETY: both pages are mapped read-write.
+        unsafe { a.cast::<u8>().write(0x5c) };
+        let before = mine(a, 2);
+        assert_eq!(before, [(a as usize, 2 * PAGE)]);
+        let null = std::ptr::null_mut::<c_void>();
+        // A count whose bytes wrap to 0, to a few pages, or almost all the
+        // way round: as an unmap and with page numbers.
+        for n in [WRAPS, WRAPS + 1, WRAPS + 2, usize::MAX, usize::MAX / 2 + 1] {
+            assert_eq!(XMemMapPhysicalPages(a, n, std::ptr::null()), null, "{n:#x}");
+            assert_eq!(XMemMapPhysicalPages(a, n, pages.as_ptr()), null, "{n:#x}");
+        }
+        // Bytes that fit a count, from an address they do not fit after.
+        let top = (usize::MAX - PAGE + 1) as *mut c_void;
+        assert_eq!(XMemMapPhysicalPages(top, 2, std::ptr::null()), null);
+        assert_eq!(XMemMapPhysicalPages(top, 1, std::ptr::null()), null);
+        assert_eq!(XMemMapPhysicalPages(top, 2, pages.as_ptr()), null);
+        let many = isize::MAX as usize / size_of::<usize>() + 1;
+        // Scattered: counts no array of addresses or pages can have.
+        let addresses = [a];
+        for n in [many, usize::MAX] {
+            assert_eq!(
+                XMemMapPhysicalPagesScatter(addresses.as_ptr(), n, pages.as_ptr()),
+                0
+            );
+            assert_eq!(
+                XMemMapPhysicalPagesScatter(addresses.as_ptr(), n, std::ptr::null()),
+                0
+            );
+        }
+
+        assert_eq!(mine(a, 2), before);
+        assert_eq!(query(a).host.State, MEM_COMMIT);
+        // SAFETY: still mapped.
+        assert_eq!(unsafe { a.cast::<u8>().read() }, 0x5c);
+        assert_eq!(XMemMapPhysicalPages(a, 2, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn map_alias_near_the_top_of_the_address_space_is_refused() {
+        let pages = allocate(2);
+        let a = mapped(2, &pages);
+        let b = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            2 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!b.is_null());
+        // SAFETY: mapped read-write.
+        unsafe { a.cast::<u8>().write(0x3d) };
+        let (a64, b64, page) = (a as u64, b as u64, PAGE as u64);
+        assert!(map_alias(b64, a64, page));
+        let before = (mine(a, 2), mine(b, 2));
+        assert_eq!(before.1, [(b as usize, PAGE)]);
+
+        // A destination that ends past the last address.
+        assert!(!map_alias(u64::MAX - page, a64, 2 * page));
+        assert!(!map_alias(u64::MAX - page + 1, a64, page));
+        assert!(!map_alias(u64::MAX, a64, 1));
+        // The same as an unmap (`from` 0).
+        assert!(!map_alias(u64::MAX - page, 0, 2 * page));
+        // A length that carries a real destination past it: the view at `b`
+        // lies in the wrapped range's way and must stay.
+        assert!(!map_alias(b64, a64, u64::MAX - b64 + 1));
+        assert!(!map_alias(b64, 0, u64::MAX - b64 + 1));
+        assert!(!map_alias(b64, a64, u64::MAX));
+        // A source that ends past the last address.
+        assert!(!map_alias(b64, u64::MAX - page + 1, page));
+        assert!(!map_alias(b64 + page, u64::MAX - page, 2 * page));
+
+        assert_eq!((mine(a, 2), mine(b, 2)), before);
+        // SAFETY: `b` still shows the first page.
+        assert_eq!(unsafe { b.cast::<u8>().read() }, 0x3d);
+        assert!(map_alias(b64, 0, page));
+        assert_eq!(XMemMapPhysicalPages(a, 2, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn freeing_an_overflowing_count_is_refused() {
+        let pages = allocate(2);
+        let a = mapped(2, &pages);
+        let before = mine(a, 2);
+        let known = || {
+            let physical = physical();
+            pages.iter().all(|p| physical.pages.contains_key(p))
+        };
+        // Counts whose array of page numbers no memory can hold.
+        let many = isize::MAX as usize / size_of::<usize>() + 1;
+        for n in [many, usize::MAX / size_of::<usize>() + 1, usize::MAX] {
+            assert_eq!(XMemFreePhysicalPages(n, pages.as_ptr()), 0, "{n:#x}");
+            assert!(known(), "{n:#x}: no page was forgotten");
+        }
+        // An array that would end past the last address.
+        let top = (usize::MAX - 7) as *const usize;
+        assert_eq!(XMemFreePhysicalPages(2, top), 0);
+        assert_eq!(XMemFreePhysicalPages(1, std::ptr::null()), 0);
+        // Allocation writes its page numbers to such an array as little.
+        let mut n = 2;
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut n, top.cast_mut()), 0);
+        assert_eq!(mine(a, 2), before);
+        assert!(known());
+        assert_eq!(XMemMapPhysicalPages(a, 2, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+        assert!(!known());
     }
 
     /// `n` pages of one new allocation.

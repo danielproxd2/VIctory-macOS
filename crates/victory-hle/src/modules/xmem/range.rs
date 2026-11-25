@@ -23,6 +23,31 @@ pub(crate) fn address_range(flags: u64) -> (usize, usize) {
 /// A physical page: 64 KiB.
 pub(crate) const PAGE: usize = 64 << 10;
 
+/// The length in bytes of `n` pages at `base`, when `[base, base + n pages)`
+/// fits the address space. The count is the title's: unchecked, a large one
+/// wraps into a short range somewhere else.
+pub(crate) fn page_span(base: usize, n: usize) -> Option<usize> {
+    let len = n.checked_mul(PAGE)?;
+    base.checked_add(len)?;
+    Some(len)
+}
+
+/// `[base, base + len)` as addresses, when both ends are some.
+pub(crate) fn byte_span(base: u64, len: u64) -> Option<(usize, usize)> {
+    let (base, len) = (usize::try_from(base).ok()?, usize::try_from(len).ok()?);
+    base.checked_add(len)?;
+    Some((base, len))
+}
+
+/// Whether `n` elements of `size` bytes at `at` can be an array at all: no
+/// object is larger than `isize::MAX` bytes or wraps the address space.
+/// Says nothing about the memory being there.
+pub(crate) fn array_fits(at: usize, n: usize, size: usize) -> bool {
+    n.checked_mul(size)
+        .filter(|&bytes| bytes <= isize::MAX as usize)
+        .is_some_and(|bytes| at.checked_add(bytes).is_some())
+}
+
 /// The pages behind bytes `[offset, offset + len)` of `pages` (64 KiB
 /// each), as runs of consecutive slices of one section: each run's first
 /// slice and its length in pages. `slice_of` looks a page up; `follows`
@@ -97,6 +122,48 @@ mod tests {
             assert_eq!(address_range(ADDRESS_32BIT | field << 12), low);
         }
         assert_eq!(address_range(ADDRESS_32BIT | 3), low);
+    }
+
+    #[test]
+    fn page_spans_refuse_counts_and_ends_that_wrap() {
+        assert_eq!(page_span(0x1_0000, 0), Some(0));
+        assert_eq!(page_span(0x1_0000, 3), Some(3 * PAGE));
+        // The last page of the address space ends at its end, not past it.
+        let top = usize::MAX - PAGE + 1;
+        assert_eq!(page_span(top - PAGE, 1), Some(PAGE));
+        assert_eq!(page_span(top, 1), None);
+        assert_eq!(page_span(top, 0), Some(0));
+        // The smallest count whose bytes wrap to 0, and its neighbours.
+        let wraps = usize::MAX / PAGE + 1;
+        assert_eq!(page_span(0, wraps), None);
+        assert_eq!(page_span(0x1_0000, wraps + 2), None);
+        assert_eq!(page_span(0, wraps - 1), Some(usize::MAX - PAGE + 1));
+        assert_eq!(page_span(PAGE, wraps - 1), None);
+        assert_eq!(page_span(0x1_0000, usize::MAX), None);
+    }
+
+    #[test]
+    fn byte_spans_refuse_ends_that_wrap() {
+        assert_eq!(byte_span(0x1000, 0x2000), Some((0x1000, 0x2000)));
+        assert_eq!(byte_span(0, 0), Some((0, 0)));
+        assert_eq!(byte_span(u64::MAX, 0), Some((usize::MAX, 0)));
+        assert_eq!(byte_span(u64::MAX, 1), None);
+        assert_eq!(byte_span(u64::MAX - PAGE as u64, 2 * PAGE as u64), None);
+        assert_eq!(byte_span(1, u64::MAX), None);
+    }
+
+    #[test]
+    fn arrays_fit_only_below_the_object_size_limit() {
+        assert!(array_fits(0x1000, 0, 8));
+        assert!(array_fits(0x1000, 16, 8));
+        assert!(array_fits(0, isize::MAX as usize / 8, 8));
+        // More bytes than an object may have, or than a count can say.
+        assert!(!array_fits(0, isize::MAX as usize / 8 + 1, 8));
+        assert!(!array_fits(0x1000, usize::MAX / 8 + 1, 8));
+        assert!(!array_fits(0x1000, usize::MAX, 8));
+        // An end past the last address.
+        assert!(!array_fits(usize::MAX - 15, 3, 8));
+        assert!(array_fits(usize::MAX - 16, 2, 8));
     }
 
     /// A stand-in for a slice of a section: which section, which page of it.
