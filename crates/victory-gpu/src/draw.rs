@@ -125,8 +125,13 @@ pub(crate) fn dropped_draws() -> u64 {
 /// (`D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT`).
 pub(crate) const TARGETS: usize = 8;
 
+/// The most viewports, and the most scissor rectangles, set at once:
+/// public D3D12's limit
+/// (`D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE`).
+pub(crate) const VIEWPORTS: usize = 16;
+
 /// State calls refused for a count of the title's past what D3D12 has
-/// ([`TARGETS`]): nothing of such a call is read or reaches
+/// ([`TARGETS`], [`VIEWPORTS`]): nothing of such a call is read or reaches
 /// the host, and the state it would have set stays as it was.
 static REFUSED: AtomicU64 = AtomicU64::new(0);
 
@@ -350,7 +355,7 @@ impl State {
     }
 
     /// Render targets and depth, set on the host list at once. More
-    /// targets than D3D12 has ([`TARGETS`]) are refused: the count goes to
+    /// targets than D3D12 has ([`TARGETS`], [`VIEWPORTS`]) are refused: the count goes to
     /// the host with the views, and the targets stay as they were.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
         if handles.len() > TARGETS {

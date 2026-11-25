@@ -960,6 +960,13 @@ mod state {
         unsafe { std::slice::from_raw_parts(items, count as usize) }
     }
 
+    /// As [`items`] for a count D3D12 limits to `most`: `None`, with
+    /// nothing made of the pointer, for more. The count is the title's
+    /// and would go to the host as the number of items to read.
+    pub(super) fn at_most<'a, T>(list: *const T, count: u32, most: usize) -> Option<&'a [T]> {
+        (count as usize <= most).then(|| items(list, count))
+    }
+
     pub(super) extern "system" fn topology(this: This, topology: u32) {
         with_state(this, |list, s| s.set_topology(list, topology));
     }
@@ -968,13 +975,21 @@ mod state {
         count: u32,
         viewports: *const D3D12_VIEWPORT,
     ) {
+        let Some(viewports) = at_most(viewports, count, crate::draw::VIEWPORTS) else {
+            crate::draw::refuse_state("viewports", count as usize);
+            return;
+        };
         if let Some(list) = host_list(this) {
-            crate::draw::viewports(list, items(viewports, count));
+            crate::draw::viewports(list, viewports);
         }
     }
     pub(super) extern "system" fn scissors(this: This, count: u32, rects: *const RECT) {
+        let Some(rects) = at_most(rects, count, crate::draw::VIEWPORTS) else {
+            crate::draw::refuse_state("scissor rectangles", count as usize);
+            return;
+        };
         if let Some(list) = host_list(this) {
-            crate::draw::scissors(list, items(rects, count));
+            crate::draw::scissors(list, rects);
         }
     }
     pub(super) extern "system" fn blend_factor(this: This, factor: *const [f32; 4]) {
@@ -1687,6 +1702,61 @@ mod tests {
         state.set_targets(host, &none[..8], 0);
         assert_eq!(crate::draw::refused_state(), before + 3);
         state.set_targets(host, &none, 0);
+        assert_eq!(crate::draw::refused_state(), before + 4);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    /// Viewport and scissor counts are the title's and go to the host as
+    /// the number of items to read: more than D3D12 has (16) is a refused
+    /// call, counted and without a host call.
+    #[cfg(windows)]
+    #[test]
+    fn viewports_and_scissors_past_the_d3d12_limit_are_refused() {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
+        let rects = [RECT {
+            left: 0,
+            top: 0,
+            right: 4,
+            bottom: 4,
+        }; 17];
+        assert_eq!(state::at_most(rects.as_ptr(), 16, 16), Some(&rects[..16]));
+        assert_eq!(state::at_most(rects.as_ptr(), 0, 16), Some(&rects[..0]));
+        assert_eq!(state::at_most(rects.as_ptr(), 17, 16), None);
+        assert_eq!(state::at_most(rects.as_ptr(), u32::MAX, 16), None);
+        assert_eq!(
+            state::at_most(std::ptr::null::<RECT>(), 3, 16),
+            Some(&rects[..0])
+        );
+
+        // Through the list's methods (0xa8, 0xb0).
+        let Some(_gpu) = crate::testing::gpu() else {
+            return;
+        };
+        let (allocator, list) = new_list();
+        let viewports = [D3D12_VIEWPORT {
+            Width: 4.0,
+            Height: 4.0,
+            MaxDepth: 1.0,
+            ..Default::default()
+        }; 17];
+        type Viewports = extern "system" fn(This, u32, *const D3D12_VIEWPORT);
+        type Scissors = extern "system" fn(This, u32, *const RECT);
+        let set_viewports = crate::testing::list_slot::<Viewports>(list, 0xa8);
+        let set_scissors = crate::testing::list_slot::<Scissors>(list, 0xb0);
+        let before = crate::draw::refused_state();
+        set_viewports(list, 17, viewports.as_ptr());
+        set_viewports(list, u32::MAX, viewports.as_ptr());
+        assert_eq!(crate::draw::refused_state(), before + 2);
+        set_scissors(list, 17, rects.as_ptr());
+        set_scissors(list, u32::MAX, rects.as_ptr());
+        assert_eq!(crate::draw::refused_state(), before + 4);
+        // Sixteen of each are taken.
+        set_viewports(list, 16, viewports.as_ptr());
+        set_scissors(list, 16, rects.as_ptr());
+        set_viewports(list, 1, viewports.as_ptr());
+        set_scissors(list, 1, rects.as_ptr());
         assert_eq!(crate::draw::refused_state(), before + 4);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
