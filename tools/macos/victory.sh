@@ -13,6 +13,11 @@
 # file names a data_dir, VICTORY_DATA_DIR is set to
 # ~/Library/Application Support/victory/data, as Wine's Z: drive shows it.
 # CARGO names the cargo to build with (default: cargo on PATH).
+# VICTORY_FEATURES names cargo features to build victory.exe with. The one
+# of use is `diagnostics`: debug and trace log lines (VICTORY_LOG), the
+# reason of each dropped draw beside the frame-rate lines, and the debugging
+# switches of that feature (apps/victory/Cargo.toml). A plain build logs info
+# and above.
 # No game is configured to start by default: without arguments the launcher
 # says what to pass and fails, before it builds or starts anything. (`run`
 # without an executable is refused by victory.exe, which names it.)
@@ -129,7 +134,8 @@ WINE="${WINE:-$HOME/Library/Caches/victory-macos/target/wine-cx/bin/wine}"
 }
 # The build is the one thing done in the source tree: cargo finds the
 # workspace and its toolchain file from there.
-(cd "$ROOT" && "${CARGO:-cargo}" build --quiet --release -p victory --target x86_64-pc-windows-gnullvm)
+(cd "$ROOT" && "${CARGO:-cargo}" build --quiet --release -p victory --target x86_64-pc-windows-gnullvm \
+    ${VICTORY_FEATURES:+--features "$VICTORY_FEATURES"})
 export WINEPREFIX="${WINEPREFIX:-$HOME/Library/Caches/victory-macos/prefix-play}"
 export WINEDEBUG="${WINEDEBUG:--all}"
 export WINEDLLOVERRIDES="mscoree,mshtml=;winedbg.exe=d;d3d12,d3d12core,dxgi=b${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"

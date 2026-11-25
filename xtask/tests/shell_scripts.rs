@@ -1138,6 +1138,470 @@ fn setup_ends_on_the_check_that_needs_no_game() {
     assert_eq!(set, [""; 0], "the example sets no game_dir");
 }
 
+/// One run of first-run.sh with stand-ins.
+struct FirstRun {
+    out: Output,
+    /// What the stand-in wine was started with, a line per start: the
+    /// arguments after the program's path.
+    started: Vec<String>,
+    /// The folder the reports were to go to (`VICTORY_FIRST_RUN_DIR`).
+    reports: PathBuf,
+    /// The stand-in game's folder and executable, outside the tree.
+    title_dir: PathBuf,
+    exe: PathBuf,
+}
+
+impl FirstRun {
+    /// The one folder of this run under `reports`.
+    fn folder(&self) -> PathBuf {
+        let mut made: Vec<PathBuf> = fs::read_dir(&self.reports)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(made.len(), 1, "one folder per run: {made:?}");
+        made.remove(0)
+    }
+}
+
+/// What victory.exe prints for `run` without `--execute` on a title whose
+/// package is whole: the stand-in wine's answer, in the report's own
+/// columns (apps/victory/src/run.rs). `{DATA}` stands for the data folder.
+const BOUND_REPORT: &str = r#"echo "build          unknown (00aa)"
+echo "mapped at      0x140000000 (preferred 0x140000000)"
+printf '%s\n' 'title          0A0B0C0D, storage {DATA}\0A0B0C0D\storage (16 MB)'
+echo "console        Xbox Series X"
+echo "bound          game.exe: 5 hle, 12 host, 0 title, 2 missing"
+echo "  missing      some.dll!First"
+echo "  missing      some.dll!Second"
+echo "not executing (pass --execute to start the title)""#;
+
+/// Runs first-run.sh on a stand-in game outside the tree, with a stand-in
+/// cargo and the stand-in wine `wine`: a shell script's body that stands
+/// for Wine running victory.exe, with victory.exe's arguments as its own.
+fn first_run(name: &str, wine: &str) -> FirstRun {
+    first_run_with(name, wine, |_, _| {})
+}
+
+/// The same, after `change` has had its way with the command and the
+/// folder of the stand-ins.
+fn first_run_with(name: &str, wine: &str, change: impl Fn(&mut Command, &Path)) -> FirstRun {
+    let dir = scratch(name);
+    let log = dir.join("wine.log");
+    let user = outside(name);
+    let title_dir = user.join("the game");
+    fs::create_dir_all(&title_dir).unwrap();
+    let exe = title_dir.join("game.exe");
+    fs::write(&exe, "a stand-in, not a program").unwrap();
+    let reports = user.join("reports");
+    fs::create_dir_all(dir.join("wine/lib/external/D3DMetal.framework")).unwrap();
+    script(&dir.join("bin/cargo"), "exit 0");
+    let data = windows(&user.join("data"));
+    script(
+        &dir.join("wine/bin/wine"),
+        &format!(
+            "shift\nprintf '%s\\n' \"$*\" >> \"$STAND_IN_LOG\"\n{}",
+            wine.replace("{DATA}", &data)
+        ),
+    );
+    let config = dir.join("victory.toml");
+    fs::write(&config, "").unwrap();
+    let mut command = Command::new(root().join("tools/macos/first-run.sh"));
+    command
+        .arg(&exe)
+        .current_dir(&user)
+        .env("CARGO", dir.join("bin/cargo"))
+        .env("WINE", dir.join("wine/bin/wine"))
+        .env("HOME", dir.join("home"))
+        .env("STAND_IN_LOG", &log)
+        .env("VICTORY_CONFIG", &config)
+        .env("VICTORY_FIRST_RUN_DIR", &reports)
+        .env_remove("VICTORY_DATA_DIR")
+        .env_remove("VICTORY_FEATURES")
+        .env_remove("WINEPREFIX");
+    change(&mut command, &dir);
+    let out = command.output().unwrap();
+    let started = fs::read_to_string(&log).unwrap_or_default();
+    FirstRun {
+        out,
+        started: started.lines().map(str::to_owned).collect(),
+        reports,
+        title_dir,
+        exe,
+    }
+}
+
+/// The checks of a first real run, in order, without starting the title:
+/// the build, `inspect`, `run` without `--execute`. When all pass, the
+/// script names the exact command that starts the title in its own folder
+/// with its log kept, and where the crash log will be.
+#[test]
+fn first_run_checks_in_order_and_names_the_command_that_starts_the_title() {
+    let run = first_run(
+        "first-run-passes",
+        &format!(
+            r#"case "$1" in
+    --version) echo "victory 0.1.0" ;;
+    inspect) echo "image          game.exe" ;;
+    run) {BOUND_REPORT} ;;
+esac"#
+        ),
+    );
+    let said = text(&run.out.stdout);
+    assert_eq!(
+        run.out.status.code(),
+        Some(0),
+        "{said}{}",
+        text(&run.out.stderr)
+    );
+    assert_eq!(text(&run.out.stderr), "");
+    // In order, the executable by its full path, and never with --execute.
+    let exe = windows(&run.exe);
+    assert_eq!(
+        run.started,
+        [
+            "--version".to_owned(),
+            format!("inspect {exe}"),
+            format!("run {exe}")
+        ]
+    );
+    let at = |what: &str| {
+        said.find(what)
+            .unwrap_or_else(|| panic!("{what:?} is not in:\n{said}"))
+    };
+    assert!(at("[1/3] ok") < at("[2/3] ok") && at("[2/3] ok") < at("[3/3] ok"));
+    assert!(at("[3/3] ok") < at("Every check passed"));
+    // What the report held is passed on: the unknown build, and the two
+    // imports nothing provides, which do not stop a start.
+    assert!(said.contains("note: build unknown (00aa)."), "{said}");
+    assert!(
+        said.contains("note: 2 imports are provided by nothing"),
+        "{said}"
+    );
+    // The command: in the title's folder, the launcher by its full path,
+    // the executable by name, the log into this run's folder.
+    let folder = run.folder();
+    let launcher = root()
+        .canonicalize()
+        .unwrap()
+        .join("tools/macos/victory.sh");
+    let command = format!(
+        "  cd '{}' && '{}' run --execute 'game.exe' 2>&1 | tee '{}'\n",
+        run.title_dir.display(),
+        launcher.display(),
+        folder.join("run.log").display()
+    );
+    assert!(said.contains(&command), "{command} is not in:\n{said}");
+    assert!(
+        said.contains(&command.replace("&& '", "&& VICTORY_FEATURES=diagnostics '")),
+        "{said}"
+    );
+    // The crash log is beside the storage folder the report named, by its
+    // macOS path.
+    let crashes = run
+        .reports
+        .with_file_name("data")
+        .join("0A0B0C0D/crashes.log");
+    assert!(
+        said.contains(&format!("  {}\n", crashes.display())),
+        "{said}"
+    );
+    // What the checks printed is kept, in the folder the user named and
+    // nowhere in the game's folder.
+    let mut kept: Vec<String> = fs::read_dir(&folder)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    kept.sort();
+    assert_eq!(
+        kept,
+        [
+            "bind.log",
+            "bind.txt",
+            "inspect.log",
+            "inspect.txt",
+            "version.log",
+            "version.txt"
+        ]
+    );
+    let bound = fs::read_to_string(folder.join("bind.txt")).unwrap();
+    assert!(bound.contains("  missing      some.dll!Second"), "{bound}");
+    let beside: Vec<_> = fs::read_dir(&run.title_dir).unwrap().collect();
+    assert_eq!(
+        beside.len(),
+        1,
+        "only the executable is in the game's folder"
+    );
+}
+
+/// The first check that fails ends the script with status 1, says which
+/// one and what to do, and nothing after it is started.
+#[test]
+fn first_run_stops_at_the_first_check_that_fails() {
+    const VERSION: &str = r#"--version) echo "victory 0.1.0" ;;"#;
+    const INSPECT: &str = r#"inspect) echo "image          game.exe" ;;"#;
+    for (name, wine, started, shown) in [
+        (
+            "first-run-no-start",
+            r#"echo "wine: could not load kernel32.dll" >&2; exit 1"#.to_owned(),
+            1,
+            vec![
+                "FAILED: [1/3] VIctory does not start under Wine",
+                "| wine: could not load kernel32.dll",
+                "tools/macos/check-setup.sh",
+            ],
+        ),
+        (
+            "first-run-not-a-program",
+            format!(
+                r#"case "$1" in
+    {VERSION}
+    inspect) echo "Error: not a PE image: no MZ signature" >&2; exit 1 ;;
+esac"#
+            ),
+            2,
+            vec![
+                "FAILED: [2/3] VIctory cannot read",
+                "| Error: not a PE image: no MZ signature",
+                "the copy is whole",
+            ],
+        ),
+        (
+            "first-run-policy",
+            format!(
+                r#"case "$1" in
+    {VERSION}
+    {INSPECT}
+    run) printf '%s\n' 'Error: refusing to use Z:\repo\cache\images for game-derived data: it is inside the VIctory source tree (Z:\repo).' >&2; exit 1 ;;
+esac"#
+            ),
+            3,
+            vec![
+                "FAILED: [3/3] a folder VIctory would write to is inside the source tree",
+                "| Error: refusing to use",
+                "POLICY VIOLATION",
+            ],
+        ),
+        (
+            "first-run-config",
+            format!(
+                r#"case "$1" in
+    {VERSION}
+    {INSPECT}
+    run) printf '%s\n' 'Error: parsing Z:\x\victory.toml' >&2; exit 1 ;;
+esac"#
+            ),
+            3,
+            vec!["FAILED: [3/3] the configuration cannot be read"],
+        ),
+        (
+            "first-run-not-bound",
+            format!(
+                r#"case "$1" in
+    {VERSION}
+    {INSPECT}
+    run) echo "Error: something else" >&2; exit 1 ;;
+esac"#
+            ),
+            3,
+            vec![
+                "FAILED: [3/3] VIctory could not prepare, map and bind the executable",
+                "| Error: something else",
+                "docs/first-run.md",
+            ],
+        ),
+        // `run` without --execute reports missing DLLs and succeeds; a
+        // start would refuse, so the check does.
+        (
+            "first-run-missing-dlls",
+            format!(
+                r#"case "$1" in
+    {VERSION}
+    {INSPECT}
+    run) printf '%s\n' 'missing dlls   engine.dll not in Z:\g, and neither the host nor VIctory provides it: the package is incomplete'
+        {BOUND_REPORT} ;;
+esac"#
+            ),
+            3,
+            vec![
+                "FAILED: [3/3] DLLs of the game's own package are not beside the executable",
+                "| missing dlls   engine.dll not in",
+                "Copy every file of the package",
+            ],
+        ),
+    ] {
+        let run = first_run(name, &wine);
+        let said = text(&run.out.stderr);
+        assert_eq!(run.out.status.code(), Some(1), "{name}: {said}");
+        assert_eq!(run.started.len(), started, "{name}: {:?}", run.started);
+        for shown in shown {
+            assert!(said.contains(shown), "{name}: {shown:?} is not in:\n{said}");
+        }
+        let passed = text(&run.out.stdout);
+        assert!(!passed.contains("Every check passed"), "{name}: {passed}");
+        assert!(!passed.contains("--execute"), "{name}: {passed}");
+        assert!(
+            run.started.iter().all(|s| !s.contains("--execute")),
+            "{name}"
+        );
+    }
+
+    // No Wine, and a Wine without D3DMetal: nothing is started at all.
+    let passes = r#"echo "victory 0.1.0""#;
+    let run = first_run_with("first-run-no-wine", passes, |command, dir| {
+        command.env("WINE", dir.join("absent/bin/wine"));
+    });
+    let said = text(&run.out.stderr);
+    assert_eq!(run.out.status.code(), Some(1), "{said}");
+    assert!(said.contains("FAILED: [1/3] there is no Wine at"), "{said}");
+    assert!(said.contains("./setup.sh"), "{said}");
+    assert_eq!(run.started, [""; 0]);
+    let run = first_run_with("first-run-no-d3dmetal", passes, |_, dir| {
+        fs::remove_dir_all(dir.join("wine/lib/external")).unwrap();
+    });
+    let said = text(&run.out.stderr);
+    assert_eq!(run.out.status.code(), Some(1), "{said}");
+    assert!(
+        said.contains("FAILED: [1/3] Apple's D3DMetal is not in that Wine"),
+        "{said}"
+    );
+    assert!(said.contains("Game Porting Toolkit"), "{said}");
+    assert_eq!(run.started, [""; 0]);
+}
+
+/// What VIctory says about a game is derived from the game: the reports
+/// are never written inside a source tree, and an executable inside one is
+/// not looked at. Nothing is made and nothing is started.
+#[test]
+fn first_run_refuses_to_write_inside_the_repository() {
+    let passes = r#"echo "victory 0.1.0""#;
+    let inside = root().canonicalize().unwrap().join("target/tmp");
+    let reports = inside.join("first-run-refused-reports");
+    let _ = fs::remove_dir_all(&reports);
+    // By its full path, by a relative one, and in another copy of the
+    // sources (a folder under the marker file).
+    let copy = outside("first-run-refuse-copy");
+    fs::write(copy.join(".victory-root"), "").unwrap();
+    for (name, named, shown) in [
+        (
+            "first-run-refuse-reports",
+            reports.display().to_string(),
+            reports.clone(),
+        ),
+        (
+            "first-run-refuse-copy-reports",
+            copy.join("logs/deeper").display().to_string(),
+            copy.join("logs/deeper"),
+        ),
+    ] {
+        let run = first_run_with(name, passes, |command, _| {
+            command.env("VICTORY_FIRST_RUN_DIR", &named);
+        });
+        let said = text(&run.out.stderr);
+        assert_eq!(run.out.status.code(), Some(1), "{name}: {said}");
+        assert!(
+            said.contains(&format!(
+                "FAILED: refusing to write the reports to {}: it is inside a VIctory source tree",
+                shown.display()
+            )),
+            "{name}: {said}"
+        );
+        assert!(!shown.exists(), "{name}: {} was made", shown.display());
+        assert_eq!(run.started, [""; 0], "{name}");
+    }
+    // A relative name is taken from the user's directory, here the tree.
+    let run = first_run_with("first-run-refuse-relative", passes, |command, _| {
+        command
+            .current_dir(&inside)
+            .env("VICTORY_FIRST_RUN_DIR", "first-run-refused-reports");
+    });
+    let said = text(&run.out.stderr);
+    assert_eq!(run.out.status.code(), Some(1), "{said}");
+    assert!(said.contains("refusing to write the reports to"), "{said}");
+    assert!(!reports.exists(), "{} was made", reports.display());
+
+    // An executable inside the tree: this script, for want of a game.
+    let run = first_run_with("first-run-refuse-exe", passes, |command, _| {
+        let script = root().join("tools/macos/first-run.sh");
+        // The stand-in game's path was the first argument: replace it.
+        *command = {
+            let mut again = Command::new(&script);
+            again.arg(&script);
+            for (key, value) in command.get_envs() {
+                match value {
+                    Some(value) => again.env(key, value),
+                    None => again.env_remove(key),
+                };
+            }
+            again
+        };
+    });
+    let said = text(&run.out.stderr);
+    assert_eq!(run.out.status.code(), Some(1), "{said}");
+    assert!(
+        said.contains("FAILED: the executable is inside a VIctory source tree"),
+        "{said}"
+    );
+    assert_eq!(run.started, [""; 0]);
+    assert!(!run.reports.exists(), "no reports folder is made");
+
+    // Without an executable: how to use it, and status 2.
+    let out = Command::new(root().join("tools/macos/first-run.sh"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        text(&out.stderr)
+            .contains("usage: tools/macos/first-run.sh <path to the game's executable>")
+    );
+}
+
+/// The debugging build the first-run aid names is one the launcher makes:
+/// `VICTORY_FEATURES` reaches cargo as `--features`, and without it the
+/// build is the plain one.
+#[test]
+fn victory_sh_builds_with_the_features_it_is_told() {
+    for (name, features, expected) in [
+        ("victory-sh-features-none", None, false),
+        ("victory-sh-features-empty", Some(""), false),
+        ("victory-sh-features-diagnostics", Some("diagnostics"), true),
+    ] {
+        let dir = scratch(name);
+        let log = dir.join("cargo.log");
+        fs::create_dir_all(dir.join("wine/lib/external/D3DMetal.framework")).unwrap();
+        script(
+            &dir.join("bin/cargo"),
+            r#"echo "cargo $*" >> "$STAND_IN_LOG""#,
+        );
+        script(&dir.join("wine/bin/wine"), "exit 0");
+        let config = dir.join("victory.toml");
+        fs::write(&config, "").unwrap();
+        let mut command = Command::new(root().join("tools/macos/victory.sh"));
+        command
+            .arg("config")
+            .current_dir(outside(name))
+            .env("CARGO", dir.join("bin/cargo"))
+            .env("WINE", dir.join("wine/bin/wine"))
+            .env("HOME", dir.join("home"))
+            .env("STAND_IN_LOG", &log)
+            .env("VICTORY_CONFIG", &config)
+            .env_remove("VICTORY_FEATURES")
+            .env_remove("WINEPREFIX");
+        if let Some(features) = features {
+            command.env("VICTORY_FEATURES", features);
+        }
+        let out = command.output().unwrap();
+        assert!(out.status.success(), "{name}: {}", text(&out.stderr));
+        let built = logged(&log, "cargo ");
+        let plain = "build --quiet --release -p victory --target x86_64-pc-windows-gnullvm";
+        let expected = if expected {
+            format!("{plain} --features diagnostics")
+        } else {
+            plain.to_owned()
+        };
+        assert_eq!(built, [expected], "{name}");
+    }
+}
+
 /// The variable the launcher sets is the one the configuration reads.
 #[test]
 fn victory_sh_sets_the_variable_the_config_reads() {

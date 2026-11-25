@@ -90,5 +90,6 @@ tools/macos/check-setup.sh || die "the setup is built, and VIctory did not start
 
 print
 print -P "%F{green}Setup finished.%f"
-print "Put your own copy of the game in a folder outside this repository and start it with:"
-print "  tools/macos/victory.sh run --execute <the game's executable>"
+print "Put your own copy of the game in a folder outside this repository. Check it first; nothing of the game runs:"
+print "  tools/macos/first-run.sh <the game's executable>"
+print "It ends with the command that starts the game. docs/first-run.md says what to look at when a start fails."
