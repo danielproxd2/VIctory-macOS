@@ -76,14 +76,35 @@ pub extern "system" fn XMemVirtualAlloc(
     flags: u64,
     protect: u32,
 ) -> *mut c_void {
+    virtual_alloc(base, size, kind, flags, protect, 0)
+}
+
+/// The host places a reservation at multiples of this without being asked.
+const GRANULARITY: usize = 64 << 10;
+
+/// [`XMemVirtualAlloc`], at a multiple of `align` (a power of two, or 0 for
+/// none of ours) where the address is our choice.
+fn virtual_alloc(
+    base: *mut c_void,
+    size: usize,
+    kind: u32,
+    flags: u64,
+    protect: u32,
+    align: usize,
+) -> *mut c_void {
     let (lowest, highest) = address_range(flags);
+    let pages = if kind & (PAGES_2M | PAGES_64K_BIT) == PAGES_2M {
+        2 * MIB
+    } else {
+        0
+    };
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: lowest as *mut c_void,
         HighestEndingAddress: highest as *mut c_void,
-        Alignment: if kind & (PAGES_2M | PAGES_64K_BIT) == PAGES_2M {
-            2 * MIB
-        } else {
-            0
+        // The host takes 0 or a power of two from its granularity up.
+        Alignment: match pages.max(align) {
+            a if a > GRANULARITY => a,
+            _ => 0,
         },
     };
     let mut protect = match protect & HOST_PROTECTION {
@@ -315,12 +336,14 @@ pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
 /// The system allocator behind [`XMemAlloc`].
 pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_void {
     if attributes & ALLOC_32BIT != 0 {
-        return XMemVirtualAlloc(
+        // A reservation of its own, at the alignment the attributes ask.
+        return virtual_alloc(
             std::ptr::null_mut(),
             size,
             MEM_RESERVE | MEM_COMMIT,
             GRAPHICS | ADDRESS_32BIT,
             PAGE_READWRITE,
+            1 << (attributes >> ALIGNMENT_SHIFT & 0x1f),
         );
     }
     let Some(layout) = layout(size, attributes) else {
@@ -1058,6 +1081,40 @@ mod tests {
         let p = XMemAlloc(4096, ALLOC_32BIT);
         assert!(!p.is_null() && (p as usize) < 1 << 32);
         XMemFree(p, ALLOC_32BIT);
+    }
+
+    #[test]
+    fn aligned_32bit_default_allocations() {
+        const FREE: u32 = 0x1_0000; // MEM_FREE
+        // Alignments above what the host gives unasked: 128 KiB, 2 MiB and
+        // 16 MiB. Three blocks of each, held together: one could be aligned
+        // by chance.
+        for field in [0x11u64, 0x15, 0x18] {
+            let (align, attributes) = (1usize << field, field << ALIGNMENT_SHIFT | ALLOC_32BIT);
+            let blocks = [(); 3].map(|()| XMemAllocDefault(3 * PAGE, attributes));
+            for p in blocks {
+                assert!(!p.is_null(), "field {field:#x}");
+                assert_eq!(p as usize % align, 0, "field {field:#x}: {p:p}");
+                assert!(p as usize + 3 * PAGE <= 1 << 32, "{p:p}");
+                // SAFETY: three pages were allocated.
+                unsafe { p.cast::<u8>().write_bytes(0xab, 3 * PAGE) };
+                assert_eq!(query(p).host.State, MEM_COMMIT);
+            }
+            for p in blocks {
+                XMemFreeDefault(p, attributes);
+                assert_eq!(query(p).host.State, FREE, "{p:p}");
+            }
+        }
+        // Alignments the host gives anyway still allocate.
+        for field in [0u64, 4, 0xc, 0x10] {
+            let (align, attributes) = (1usize << field, field << ALIGNMENT_SHIFT | ALLOC_32BIT);
+            let p = XMemAllocDefault(100, attributes);
+            assert!(!p.is_null() && (p as usize) < 1 << 32, "field {field:#x}");
+            assert_eq!(p as usize % align, 0, "field {field:#x}: {p:p}");
+            XMemFreeDefault(p, attributes);
+        }
+        // No size: nothing to allocate, as the host says.
+        assert!(XMemAllocDefault(0, 0x15 << ALIGNMENT_SHIFT | ALLOC_32BIT).is_null());
     }
 
     #[test]
