@@ -20,6 +20,7 @@
 // API would trust.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use std::collections::BTreeMap;
 use std::ffi::{CStr, c_char, c_void};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -117,17 +118,40 @@ pub extern "system" fn add_ref(_: *const Object) -> u32 {
     1
 }
 
-/// A slot nobody has needed yet; logged with its area. Wrong for a slot
-/// that returns `bool` or a value.
+/// Calls of [`missing`] slots, by method table and slot.
+static MISSING: Mutex<BTreeMap<(usize, usize), u64>> = Mutex::new(BTreeMap::new());
+
+/// A slot nobody has needed yet. Logged with its area the first time it is
+/// called (a title may call it every frame) and counted every time. Wrong
+/// for a slot that returns `bool` or a value: which slots do is not
+/// established for any of them, so all answer `E_NOTIMPL`.
 pub extern "system" fn missing<const SLOT: usize>(this: *const Object) -> HRESULT {
     // SAFETY: title code calls methods on objects we handed out.
-    let area = unsafe { (*this).area };
-    tracing::warn!(
-        area,
-        slot = format_args!("{:#x}", SLOT * 8),
-        "runtime method not implemented"
-    );
+    let (table, area) = unsafe { ((*this).vtable as usize, (*this).area) };
+    let first = {
+        let mut calls = MISSING.lock().unwrap_or_else(|e| e.into_inner());
+        let count = calls.entry((table, SLOT)).or_insert(0);
+        *count = count.saturating_add(1);
+        *count == 1
+    };
+    if first {
+        tracing::warn!(
+            area,
+            slot = format_args!("{:#x}", SLOT * 8),
+            "runtime method not implemented (logged once)"
+        );
+    }
     xasync::E_NOTIMPL
+}
+
+/// How often the unimplemented method at index `slot` of `object`'s table
+/// has been called.
+pub fn missing_calls(object: &Object, slot: usize) -> u64 {
+    let calls = MISSING.lock().unwrap_or_else(|e| e.into_inner());
+    calls
+        .get(&(object.vtable as usize, slot))
+        .copied()
+        .unwrap_or(0)
 }
 
 /// Writes `value` through `out` if it is non-null.
@@ -291,6 +315,82 @@ pub(crate) fn module() -> HleModule {
 mod tests {
     use super::*;
     use crate::modules::kernel::{FreeLibrary, GetProcAddress, LoadLibraryExA};
+
+    /// Counts the events this module logs on the current thread.
+    struct Events(std::sync::Arc<AtomicU64>);
+
+    impl tracing::Subscriber for Events {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if event.metadata().target().ends_with("xgameruntime") {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// Runs `f` and counts what this module logs meanwhile on this thread.
+    fn logged_by<R>(f: impl FnOnce() -> R) -> (u64, R) {
+        let count = || std::sync::Arc::new(AtomicU64::new(0));
+        // A second subscriber, kept alive: while only one exists, tracing
+        // decides whether a callsite is of interest by the subscriber of
+        // the thread that reaches it first, and the threads of other tests
+        // have none.
+        let _other = tracing::Dispatch::new(Events(count()));
+        let logged = count();
+        let result = tracing::subscriber::with_default(Events(logged.clone()), f);
+        (logged.load(Ordering::SeqCst), result)
+    }
+
+    /// A title that calls a method we lack every frame gets one log line,
+    /// not one per call; the calls are still counted.
+    #[test]
+    fn missing_slots_log_once_and_count_every_call() {
+        static TABLE: Methods<5> = Methods([
+            missing::<0> as *const (),
+            add_ref as *const (),
+            add_ref as *const (),
+            missing::<3> as *const (),
+            missing::<4> as *const (),
+        ]);
+        static OBJECT: Object = Object::new("test area", &TABLE);
+        type Method = extern "system" fn(*const Object) -> HRESULT;
+        let (logged, results) = logged_by(|| {
+            let call = method::<Method>(&OBJECT, 0x18);
+            (0..1000).map(|_| call(&OBJECT)).collect::<Vec<_>>()
+        });
+        assert!(results.iter().all(|hr| *hr == xasync::E_NOTIMPL));
+        assert_eq!(logged, 1);
+        assert_eq!(missing_calls(&OBJECT, 3), 1000);
+        // Another slot of the same table is logged and counted for itself.
+        assert_eq!(missing_calls(&OBJECT, 4), 0);
+        let (logged, other) = logged_by(|| method::<Method>(&OBJECT, 0x20)(&OBJECT));
+        assert_eq!((logged, other), (1, xasync::E_NOTIMPL));
+        assert_eq!(
+            (missing_calls(&OBJECT, 3), missing_calls(&OBJECT, 4)),
+            (1000, 1)
+        );
+    }
+
+    /// Which unimplemented slots return `bool`, a value or nothing is not
+    /// established, so every one of them answers `E_NOTIMPL` as an HRESULT.
+    /// Pinned here; a slot whose signature becomes known gets a method.
+    #[test]
+    fn unimplemented_slots_answer_not_implemented() {
+        type Method = extern "system" fn(*const Object) -> HRESULT;
+        for slot in [0x40, 0xa0, 0xa8, 0xd8, 0xe0, 0xf0] {
+            let call = method::<Method>(&xasync::OBJECT, slot);
+            assert_eq!(call(&xasync::OBJECT), xasync::E_NOTIMPL, "{slot:#x}");
+        }
+    }
 
     #[test]
     fn title_stub_loads_the_runtime_dynamically() {
