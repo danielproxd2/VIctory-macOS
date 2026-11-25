@@ -1825,6 +1825,11 @@ mod tests {
     /// are the same bytes, and translating a program again gives the same
     /// digest. Runs on every host; where D3DMetal is the device this is
     /// what keeps one shader from running as another (docs/macos.md).
+    /// Every way a container is made is among them (all end in
+    /// `Shader::finish`, which writes the digest): the vertex, pixel,
+    /// compute and mesh programs of a console container, a compute program
+    /// of an `ACCC` part, a translation with write marks, and the geometry
+    /// shader made for a vertex shader's rectangles.
     #[test]
     fn translated_containers_have_distinct_nonzero_shader_hashes() {
         let logic = |name: &str| {
@@ -1849,6 +1854,54 @@ mod tests {
             ("v_add_f32", float("v_add_f32")),
             ("v_mul_f32", float("v_mul_f32")),
         ];
+        // A compute program in an `ACCC` part: the layout is the table's
+        // metadata record, so its operands are constants (2 and 1).
+        let accc = |name: &str| {
+            use crate::native::tests::{fspx, fspx_resource};
+            let mut words = asm::vop1("v_mov_b32", 1, asm::lit32(1.0_f32.to_bits()));
+            words.extend(asm::vop2(name, 0, asm::lit32(2.0_f32.to_bits()), 1));
+            words.extend(testkit::store_dword(0, 0));
+            let code = testkit::compute_with_uav(&words).code;
+            let records = [fspx_resource(3, 3, 0, 0, 4, 1)];
+            let part = fspx(&code, 5 << 1, [1, 1, 1], true, &records);
+            crate::dxbc::build(&[(FourCC::ACCC, &part)])
+        };
+        type Make<'a> = Box<dyn Fn() -> Vec<u8> + 'a>;
+        let mut made: Vec<(&str, Make)> = Vec::new();
+        for (name, program) in &programs {
+            made.push((name, Box::new(|| translated(program).dxil)));
+        }
+        for (name, op) in [
+            ("ACCC v_sub_f32", "v_sub_f32"),
+            ("ACCC v_subrev_f32", "v_subrev_f32"),
+        ] {
+            made.push((name, Box::new(move || translated(&accc(op)).dxil)));
+        }
+        made.push((
+            "cs_store_root_constant with write marks",
+            Box::new(|| {
+                let options = Options { view_marks: true };
+                let out = translate_with(&testkit::cs_store_root_constant(), options).unwrap();
+                assert!(out.view_marks, "a store through a buffer view is marked");
+                crate::testing::dxil(&out.dxil);
+                out.dxil
+            }),
+        ));
+        for (name, prim) in [
+            ("mesh triangle", TRIANGLE),
+            ("mesh culled", TRIANGLE | CULL),
+        ] {
+            made.push((name, Box::new(move || triangle_mesh(prim).unwrap().dxil)));
+        }
+        made.push((
+            "rectangle_gs",
+            Box::new(|| {
+                let vs = translated(&testkit::vs_fullscreen_triangle());
+                let gs = rectangle_gs(&vs.dxil).unwrap();
+                crate::testing::dxil(&gs);
+                gs
+            }),
+        ));
         let hash_of = |name: &str, dxil: &[u8]| -> [u8; 20] {
             let host = Container::parse(dxil).unwrap();
             let part = host.part(FourCC::HASH);
@@ -1858,24 +1911,24 @@ mod tests {
         };
         let mut seen: Vec<(&str, Vec<u8>, [u8; 20])> = Vec::new();
         let mut wrong = Vec::new();
-        for (name, program) in &programs {
-            let out = translated(program);
-            let hash = hash_of(name, &out.dxil);
+        for (name, make) in &made {
+            let dxil = make();
+            let hash = hash_of(name, &dxil);
             if hash[4..] == [0; 16] {
                 wrong.push(format!("{name}: an all-zero digest"));
             }
-            let again = translated(program);
-            if again.dxil != out.dxil || hash_of(name, &again.dxil) != hash {
+            let again = make();
+            if again != dxil || hash_of(name, &again) != hash {
                 wrong.push(format!("{name}: translated twice, two results"));
             }
-            for (other, dxil, other_hash) in &seen {
-                if *dxil == out.dxil {
+            for (other, other_dxil, other_hash) in &seen {
+                if *other_dxil == dxil {
                     wrong.push(format!("{name} and {other}: one container; pick others"));
                 } else if *other_hash == hash {
                     wrong.push(format!("{name} and {other}: one digest {hash:02x?}"));
                 }
             }
-            seen.push((name, out.dxil, hash));
+            seen.push((name, dxil, hash));
         }
         assert_eq!(wrong, Vec::<String>::new());
         // The case that went wrong under D3DMetal is among them: different
