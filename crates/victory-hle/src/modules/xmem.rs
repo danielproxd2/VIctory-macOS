@@ -1361,6 +1361,14 @@ mod tests {
     }
 
     #[test]
+    fn wine_detectors_agree() {
+        // Ours and the one the network tests use must name the same host:
+        // each switches a Wine-only branch.
+        let by_export = crate::host::function("ntdll.dll", "wine_get_version").is_some();
+        assert_eq!(on_wine(), by_export);
+    }
+
+    #[test]
     fn a_request_the_host_cannot_meet_fails_and_is_reported() {
         // More bytes than any section has, on any host.
         let mut requests = vec![usize::MAX / PAGE];
@@ -1422,6 +1430,47 @@ mod tests {
         };
         let report = commit_limit_message(PAGE, &error, Some(&absurd));
         assert!(report.contains("System commit: 17592186044415 MiB of"));
+    }
+
+    #[test]
+    fn a_large_section_stays_sparse() {
+        if !on_wine() {
+            // Elsewhere the section is reserved and each view committed:
+            // `physical_pages_map_alias_and_unmap` covers that path.
+            eprintln!("skipped: not Wine");
+            return;
+        }
+        let resident = || {
+            let mut counters = PROCESS_MEMORY_COUNTERS {
+                cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+                ..Default::default()
+            };
+            // SAFETY: our own process and a sized structure.
+            let ok =
+                unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
+            assert_ne!(ok, 0);
+            counters.WorkingSetSize
+        };
+        const GIB: usize = 1 << 30;
+        let n = GIB / PAGE;
+        let before = resident();
+        // Committed whole at creation there, with no commit per view.
+        let pages = allocate(n);
+        let a = mapped(n, &pages);
+        // SAFETY: the whole gibibyte is mapped read-write.
+        unsafe {
+            a.cast::<u8>().write(0x11);
+            a.cast::<u8>().add(GIB - 1).write(0x22);
+        }
+        assert_eq!(page_bytes(pages[0])[0], 0x11);
+        assert_eq!(page_bytes(pages[n - 1])[PAGE - 1], 0x22);
+        let grown = resident().saturating_sub(before);
+        // Other tests allocate meanwhile; a section that was filled when
+        // committed would show as the whole gibibyte.
+        eprintln!("a 1 GiB section, two pages written: {grown} bytes more resident");
+        assert!(grown < GIB / 4, "{grown} bytes more resident");
+        assert_eq!(XMemMapPhysicalPages(a, n, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(n, pages.as_ptr()), 1);
     }
 
     /// `n` pages of one new allocation.
