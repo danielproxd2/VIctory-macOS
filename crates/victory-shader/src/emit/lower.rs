@@ -59,8 +59,9 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
-    /// Whether it declares rasterizer-ordered views.
-    #[cfg(test)]
+    /// Whether it declares rasterizer-ordered views (read by a device
+    /// test only).
+    #[cfg(all(test, windows))]
     pub rovs: bool,
 }
 
@@ -1394,7 +1395,7 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
-            #[cfg(test)]
+            #[cfg(all(test, windows))]
             rovs: self.s.flags & flags::ROVS != 0,
             dxil: self.s.finish(),
             user_data,
