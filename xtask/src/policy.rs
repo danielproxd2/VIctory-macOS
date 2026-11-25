@@ -471,7 +471,7 @@ fn literal_run(content: &[u8], skip_comments: bool) -> (usize, usize) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::check;
 
     /// Runs git in `dir`, with an identity and without the user's hooks,
@@ -889,7 +889,7 @@ mod tests {
 
     /// Whether this process runs under Wine: its ntdll has the export
     /// only Wine's has.
-    fn under_wine() -> bool {
+    pub(crate) fn under_wine() -> bool {
         #[cfg(windows)]
         {
             use std::ffi::{c_char, c_void};
@@ -915,14 +915,14 @@ mod tests {
     /// program that a Windows search path does not hold. On any other
     /// system, and for any other failure, the check runs and says what
     /// went wrong.
-    fn no_git_under_wine(wine: bool, git: Result<(), std::io::ErrorKind>) -> bool {
+    pub(crate) fn no_git_under_wine(wine: bool, git: Result<(), std::io::ErrorKind>) -> bool {
         wine && git == Err(std::io::ErrorKind::NotFound)
     }
 
     /// What the test does where the check cannot run (`reason`): the line
     /// it prints before it passes, or, where the switch `var` is on in
     /// this run (its value is `value`; only `1` is on), what it fails with.
-    fn unmet(var: &str, value: Option<&str>, reason: &str, test: &str) -> Result<String, String> {
+    pub(crate) fn unmet(var: &str, value: Option<&str>, reason: &str, test: &str) -> Result<String, String> {
         if value.is_some_and(|v| v.trim() == "1") {
             Err(format!("{var}=1: {reason} ({test})"))
         } else {

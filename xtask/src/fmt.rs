@@ -304,6 +304,31 @@ mod tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap();
+        // Under Wine there is no git to start, as for the policy test of
+        // the repository: the same line and the same switch.
+        use crate::policy::tests::{no_git_under_wine, under_wine, unmet};
+        use std::io::Write;
+        let git = std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(drop)
+            .map_err(|e| e.kind());
+        if no_git_under_wine(under_wine(), git) {
+            let var = "VICTORY_REQUIRE_POLICY";
+            let thread = std::thread::current();
+            match unmet(
+                var,
+                std::env::var(var).ok().as_deref(),
+                "Wine starts no git: the record of the upstream commit last merged is not checked",
+                thread.name().unwrap_or("?"),
+            ) {
+                Ok(line) => {
+                    let _ = writeln!(std::io::stderr(), "{line}");
+                }
+                Err(why) => panic!("{why}"),
+            }
+            return;
+        }
         match merged_upstream(root) {
             Ok(Ok(_)) => {}
             Ok(Err(why)) => println!("skipped: {why}"),
