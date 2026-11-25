@@ -259,10 +259,283 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
 mod tests {
     use std::path::Path;
 
+    use clap::CommandFactory;
     use victory_core::Config;
 
     use super::*;
     use crate::testing::{line, report, report_of};
+
+    fn parse(args: &[&str]) -> Result<Command, clap::Error> {
+        Cli::try_parse_from(args).map(|cli| cli.command)
+    }
+
+    /// What clap refuses `args` with.
+    #[track_caller]
+    fn refused(args: &[&str]) -> clap::error::ErrorKind {
+        match parse(args) {
+            Ok(_) => panic!("{args:?} parsed"),
+            Err(e) => e.kind(),
+        }
+    }
+
+    #[test]
+    fn the_argument_tree_is_consistent() {
+        Cli::command().debug_assert();
+        // The same check for release builds, where clap's own is compiled
+        // out: every command is there under the name the docs use.
+        let command = Cli::command();
+        let names: Vec<&str> = command.get_subcommands().map(|c| c.get_name()).collect();
+        for name in [
+            "inspect",
+            "census",
+            "lib-exports",
+            "shader-info",
+            "translate",
+            "run",
+            "config",
+        ] {
+            assert!(names.contains(&name), "{name} is missing from {names:?}");
+        }
+        for sub in command.get_subcommands() {
+            assert!(sub.get_about().is_some(), "{} has no help", sub.get_name());
+        }
+    }
+
+    #[test]
+    fn every_subcommand_parses() {
+        // inspect
+        let Ok(Command::Inspect {
+            file,
+            imports: false,
+            exports: false,
+        }) = parse(&["victory", "inspect", "title.exe"])
+        else {
+            panic!("inspect")
+        };
+        assert_eq!(file, Path::new("title.exe"));
+        assert!(matches!(
+            parse(&["victory", "inspect", "title.exe", "--imports", "--exports"]),
+            Ok(Command::Inspect {
+                imports: true,
+                exports: true,
+                ..
+            })
+        ));
+
+        // census
+        let Ok(Command::Census {
+            paths,
+            strict: false,
+            missing: false,
+        }) = parse(&["victory", "census"])
+        else {
+            panic!("census")
+        };
+        assert!(paths.is_empty());
+        let Ok(Command::Census {
+            paths,
+            strict: true,
+            missing: true,
+        }) = parse(&["victory", "census", "a", "--strict", "b", "--missing"])
+        else {
+            panic!("census with flags")
+        };
+        assert_eq!(paths, [Path::new("a"), Path::new("b")]);
+
+        // lib-exports
+        let Ok(Command::LibExports { lib, list: false }) =
+            parse(&["victory", "lib-exports", "x.lib"])
+        else {
+            panic!("lib-exports")
+        };
+        assert_eq!(lib, Path::new("x.lib"));
+        assert!(matches!(
+            parse(&["victory", "lib-exports", "x.lib", "--list"]),
+            Ok(Command::LibExports { list: true, .. })
+        ));
+
+        // shader-info
+        assert!(matches!(
+            parse(&["victory", "shader-info"]),
+            Ok(Command::ShaderInfo {
+                verbose: false,
+                disasm: false,
+                ..
+            })
+        ));
+        let Ok(Command::ShaderInfo {
+            paths,
+            verbose: true,
+            disasm: true,
+        }) = parse(&["victory", "shader-info", "dir", "--verbose", "--disasm"])
+        else {
+            panic!("shader-info with flags")
+        };
+        assert_eq!(paths, [Path::new("dir")]);
+
+        // translate
+        assert!(matches!(
+            parse(&["victory", "translate"]),
+            Ok(Command::Translate {
+                validate: false,
+                pipelines: false,
+                list: false,
+                jobs: None,
+                ..
+            })
+        ));
+        let Ok(Command::Translate {
+            paths,
+            validate: true,
+            pipelines: true,
+            list: true,
+            jobs: Some(3),
+        }) = parse(&[
+            "victory",
+            "translate",
+            "dir",
+            "--validate",
+            "--pipelines",
+            "--list",
+            "--jobs",
+            "3",
+        ])
+        else {
+            panic!("translate with flags")
+        };
+        assert_eq!(paths, [Path::new("dir")]);
+
+        // run: the defaults, then every flag.
+        let Ok(Command::Run {
+            exe,
+            unimplemented: Unimplemented::Trap,
+            strict: false,
+            execute: false,
+            console: Console::SeriesX,
+            title_args,
+        }) = parse(&["victory", "run", "title.exe"])
+        else {
+            panic!("run")
+        };
+        assert_eq!(exe, Path::new("title.exe"));
+        assert!(title_args.is_empty());
+        assert!(matches!(
+            parse(&[
+                "victory",
+                "run",
+                "title.exe",
+                "--unimplemented",
+                "zero",
+                "--strict",
+                "--execute",
+                "--console",
+                "series-s",
+            ]),
+            Ok(Command::Run {
+                unimplemented: Unimplemented::Zero,
+                strict: true,
+                execute: true,
+                console: Console::SeriesS,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse(&["victory", "run", "x.exe", "--unimplemented", "trap"]),
+            Ok(Command::Run {
+                unimplemented: Unimplemented::Trap,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse(&["victory", "run", "x.exe", "--console", "series-x"]),
+            Ok(Command::Run {
+                console: Console::SeriesX,
+                ..
+            })
+        ));
+
+        // config
+        assert!(matches!(parse(&["victory", "config"]), Ok(Command::Config)));
+    }
+
+    #[test]
+    fn run_keeps_title_arguments_after_the_separator() {
+        let Ok(Command::Run {
+            exe,
+            execute,
+            strict,
+            title_args,
+            ..
+        }) = parse(&[
+            "victory",
+            "run",
+            "x.exe",
+            "--execute",
+            "--",
+            "a",
+            "--strict",
+            "b c",
+        ])
+        else {
+            panic!("run with title arguments")
+        };
+        assert_eq!(exe, Path::new("x.exe"));
+        assert!(execute);
+        // After the separator nothing is ours, whatever it looks like.
+        assert!(!strict);
+        assert_eq!(title_args, ["a", "--strict", "b c"]);
+        // Without the separator a second word is not taken for one.
+        use clap::error::ErrorKind;
+        assert_eq!(
+            refused(&["victory", "run", "x.exe", "a"]),
+            ErrorKind::UnknownArgument
+        );
+    }
+
+    #[test]
+    fn arguments_outside_the_tree_are_refused() {
+        use clap::error::ErrorKind;
+        // No command at all prints the help and fails.
+        assert_eq!(
+            refused(&["victory"]),
+            ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        );
+        assert_eq!(
+            refused(&["victory", "no-such-command"]),
+            ErrorKind::InvalidSubcommand
+        );
+        for needs_a_file in ["inspect", "lib-exports", "run"] {
+            assert_eq!(
+                refused(&["victory", needs_a_file]),
+                ErrorKind::MissingRequiredArgument,
+                "{needs_a_file}"
+            );
+        }
+        assert_eq!(
+            refused(&["victory", "inspect", "a.exe", "b.exe"]),
+            ErrorKind::UnknownArgument
+        );
+        assert_eq!(
+            refused(&["victory", "run", "x.exe", "--unimplemented", "ignore"]),
+            ErrorKind::InvalidValue
+        );
+        assert_eq!(
+            refused(&["victory", "run", "x.exe", "--console", "one"]),
+            ErrorKind::InvalidValue
+        );
+        assert_eq!(
+            refused(&["victory", "translate", "--jobs", "many"]),
+            ErrorKind::ValueValidation
+        );
+        assert_eq!(
+            refused(&["victory", "config", "extra"]),
+            ErrorKind::UnknownArgument
+        );
+        assert_eq!(
+            refused(&["victory", "census", "--list"]),
+            ErrorKind::UnknownArgument
+        );
+    }
 
     /// A command's report goes where `dispatch` is told, and its failure
     /// comes back as an error.
