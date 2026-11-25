@@ -296,7 +296,10 @@ mod with_the_stand_in_title {
         assert!(data.join("0A0B0C0D").join("temp").is_dir(), "{run:#?}");
         let policy = victory_core::ensure_outside_repo(&storage);
         assert_eq!(policy.map_err(|e| e.to_string()), Ok(()));
-        assert!(!storage.starts_with(repo_root()), "{}", storage.display());
+        // Both in the host's own spelling: a folder inside the tree would
+        // start with its root.
+        let spelled = canonical(&storage);
+        assert!(!spelled.starts_with(repo_root()), "{}", spelled.display());
 
         // The copy of the executable that is mapped lies in the cache, and
         // nothing was written beside the title.
@@ -403,6 +406,187 @@ mod with_the_stand_in_title {
             "{run:#?}"
         );
         assert!(!home.title_log().exists(), "{run:#?}");
+    }
+
+    /// The DLLs the stand-in title loads itself when they are beside it:
+    /// `title_b.dll`, the title DLLs that one needs, and nothing else.
+    const LATE_DLLS: [&str; 3] = ["title_a.dll", "title_quiet.dll", "title_b.dll"];
+    /// What `title_b_chain` returns: its own mark over what `title_a.dll`'s
+    /// `title_a_named` answered (tests/fixtures/title-a and title-b).
+    const LATE_CHAIN: u64 = 0x0B00_0000 | 0x0A00_0001;
+    /// The file of its package the stand-in reads (`G:\standin-package.txt`)
+    /// and the temporary file it copies it to (`T:\standin-temp.txt`).
+    const PACKAGE_FILE: &str = "standin-package.txt";
+    const TEMP_FILE: &str = "standin-temp.txt";
+    const PACKAGE_TEXT: &[u8] = b"a file of the stand-in title's package\r\n";
+
+    /// The stand-in's checksum (FNV-1a, 32 bits; `sum` in its main.rs).
+    fn sum(bytes: &[u8]) -> u64 {
+        let sum = bytes.iter().fold(0x811C_9DC5u32, |sum, byte| {
+            (sum ^ u32::from(*byte)).wrapping_mul(0x0100_0193)
+        });
+        sum.into()
+    }
+
+    /// The lines `<dll> <reason>` the title DLLs' `DllMain`s wrote to the
+    /// title's log, in order.
+    fn dll_notices(log: &str) -> Vec<(&str, u32)> {
+        log.lines()
+            .filter_map(|l| l.trim_end().split_once(' '))
+            .filter_map(|(dll, reason)| Some((dll, reason.parse().ok()?)))
+            .collect()
+    }
+
+    /// `path` as the host names it, links and short names resolved, which
+    /// is the form [`repo_root`] has.
+    #[track_caller]
+    fn canonical(path: &Path) -> PathBuf {
+        std::fs::canonicalize(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    }
+
+    /// A title loads a DLL it ships that nothing imports, and uses the
+    /// console's drives: its package is `G:`, its temporary files `T:`.
+    #[test]
+    fn run_execute_lets_the_title_load_a_dll_and_use_its_drives() {
+        const DLL_PROCESS_ATTACH: u32 = 1;
+        const DLL_THREAD_ATTACH: u32 = 2;
+        let home = Home::new();
+        let title = install(&home, "hle-probe-exe.exe");
+        for dll in LATE_DLLS {
+            install(&home, dll);
+        }
+        std::fs::write(home.path("title").join("MicrosoftGame.config"), MANIFEST).unwrap();
+        std::fs::write(home.path("title").join(PACKAGE_FILE), PACKAGE_TEXT).unwrap();
+        let beside_the_title = names(&home.path("title"));
+        let run = home.victory(&["run".as_ref(), "--execute".as_ref(), title.as_os_str()]);
+        assert_eq!(run.code, Some(EXIT_BASE), "{run:#?}");
+        let log = std::fs::read_to_string(home.title_log())
+            .unwrap_or_else(|e| panic!("the title left no log ({e}): {run:#?}"));
+
+        // Nothing imports the three DLLs: none is mapped before the title
+        // starts. The title's `LoadLibraryW` maps the one it names and
+        // the two that one needs, those first, and the report says who
+        // asked.
+        let mapped: Vec<(&str, usize)> = run
+            .stdout
+            .match_indices("title dll      ")
+            .map(|(at, start)| {
+                let line = run.stdout[at + start.len()..].lines().next().unwrap();
+                (line.trim_end(), at)
+            })
+            .collect();
+        let started_at = run.stdout.find("bound          hle-probe-exe.exe").unwrap();
+        let ended_at = run.stdout.find("title exited").unwrap();
+        for dll in LATE_DLLS {
+            let lines: Vec<_> = mapped
+                .iter()
+                .filter(|(line, _)| line.starts_with(&format!("{dll} at 0x")))
+                .collect();
+            let [(line, at)] = lines[..] else {
+                panic!("{dll}: {lines:?} in {run:#?}");
+            };
+            assert!(line.ends_with(" (loaded by the title)"), "{line}");
+            assert!(started_at < *at && *at < ended_at, "{dll}: {run:#?}");
+        }
+        let last = mapped.iter().max_by_key(|(_, at)| at).map(|(line, _)| line);
+        assert!(
+            last.is_some_and(|line| line.starts_with("title_b.dll at ")),
+            "what the title named comes after what it needs: {run:#?}"
+        );
+        // title_b.dll's imports from title_a.dll are bound to it: no
+        // import from a title DLL is left over. (The two DLLs carry
+        // Rust's standard library, which imports from a host DLL the
+        // host policy does not pass through; that import is reported,
+        // and nothing here calls it.)
+        let [_, _, from_title, _] = bound(&run.stdout, "title_b.dll");
+        assert!(from_title >= 1, "{run:#?}");
+        let left_over = missing(&run.stdout);
+        assert!(
+            !left_over
+                .iter()
+                .any(|m| m.to_ascii_lowercase().starts_with("title_")),
+            "{left_over:?}"
+        );
+
+        // The title's account: it got a module, the same one when it
+        // asked again, and its call went through title_b.dll into
+        // title_a.dll.
+        assert_eq!(seen(&log, "late_dll"), Some(1), "{log}");
+        assert_eq!(seen(&log, "late_again"), Some(1), "{log}");
+        assert_eq!(seen(&log, "late_chain"), Some(LATE_CHAIN), "{log}");
+        // Each DLL was told that it was loaded, once, title_a.dll before
+        // title_b.dll, which calls into it; and both heard of the two
+        // threads the title started afterwards.
+        let notices = dll_notices(&log);
+        let attached: Vec<&str> = notices
+            .iter()
+            .filter(|(_, reason)| *reason == DLL_PROCESS_ATTACH)
+            .map(|(dll, _)| *dll)
+            .collect();
+        assert_eq!(attached, ["title_a", "title_b"], "{log}");
+        for dll in ["title_a", "title_b"] {
+            let threads = notices
+                .iter()
+                .filter(|n| **n == (dll, DLL_THREAD_ATTACH))
+                .count();
+            assert!(threads >= 2, "{dll} heard of {threads} threads: {log}");
+        }
+
+        // The package: the title read the file beside its executable as
+        // `G:\standin-package.txt`.
+        let len = PACKAGE_TEXT.len() as u64;
+        assert_eq!(seen(&log, "package_found"), Some(1), "{log}");
+        assert_eq!(seen(&log, "package_bytes"), Some(len), "{log}");
+        assert_eq!(seen(&log, "package_sum"), Some(sum(PACKAGE_TEXT)), "{log}");
+        // The temporary drive: what it wrote to `T:\standin-temp.txt` it
+        // read back, and the file is in the title's temp folder under the
+        // data folder, with those bytes.
+        assert_eq!(seen(&log, "temp_written"), Some(len), "{log}");
+        assert_eq!(seen(&log, "temp_bytes"), Some(len), "{log}");
+        assert_eq!(seen(&log, "temp_sum"), Some(sum(PACKAGE_TEXT)), "{log}");
+        let temp = home.path("data").join("0A0B0C0D").join("temp");
+        assert_eq!(names(&temp), [TEMP_FILE], "{run:#?}");
+        let written = std::fs::read(temp.join(TEMP_FILE)).unwrap();
+        assert_eq!(written, PACKAGE_TEXT);
+
+        // Everything the run wrote lies outside the source tree: the
+        // temporary file, the copies of the images that were mapped, and
+        // the title's log. Both sides are the host's own spelling of the
+        // path, so a path inside would start with the root.
+        let root = repo_root();
+        let images = home.path("cache").join("images");
+        assert!(!names(&images).is_empty(), "{run:#?}");
+        for made in [temp.join(TEMP_FILE), images, home.title_log()] {
+            let policy = victory_core::ensure_outside_repo(&made);
+            assert_eq!(policy.map_err(|e| e.to_string()), Ok(()));
+            let made = canonical(&made);
+            assert!(!made.starts_with(&root), "{}", made.display());
+        }
+        // The package is read, not written: beside the title lies what
+        // was put there, and the folder victory was started in is empty.
+        assert_eq!(names(&home.path("title")), beside_the_title);
+        assert_eq!(names(&home.path("cwd")), [""; 0]);
+    }
+
+    /// Without the DLL and the package file beside it, the title is told
+    /// that neither is there, and nothing is written to its drives.
+    #[test]
+    fn run_execute_tells_the_title_what_its_folder_does_not_have() {
+        let home = Home::new();
+        let title = install(&home, "hle-probe-exe.exe");
+        let run = home.victory(&["run".as_ref(), "--execute".as_ref(), title.as_os_str()]);
+        assert_eq!(run.code, Some(EXIT_BASE), "{run:#?}");
+        let log = std::fs::read_to_string(home.title_log())
+            .unwrap_or_else(|e| panic!("the title left no log ({e}): {run:#?}"));
+        assert_eq!(seen(&log, "late_dll"), Some(0), "{log}");
+        assert_eq!(seen(&log, "late_chain"), Some(0), "{log}");
+        assert!(!run.stdout.contains("title dll "), "{run:#?}");
+        assert!(dll_notices(&log).is_empty(), "{log}");
+        assert_eq!(seen(&log, "package_found"), Some(0), "{log}");
+        assert_eq!(seen(&log, "temp_written"), Some(0), "{log}");
+        let temp = home.path("data").join("00000000").join("temp");
+        assert_eq!(names(&temp), [""; 0], "{run:#?}");
+        assert_eq!(names(&home.path("title")), ["hle-probe-exe.exe"]);
     }
 
     /// The stand-in title that is a DLL, with the DLLs it ships beside it.
