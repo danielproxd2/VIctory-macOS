@@ -633,6 +633,48 @@ mod tests {
         let checked = super::check_cpu_features().map_err(|e| e.to_string());
         assert_eq!(checked, Ok(()));
     }
+
+    /// The archive a known build needs at startup: the file has to be
+    /// there and start with the four bytes of an RPF9 header, and what is
+    /// wrong is said with the file's name. The files here are a few bytes
+    /// written by the test.
+    #[test]
+    fn the_startup_archive_is_checked_by_its_first_four_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("appdata0.rpf");
+        let check = || super::check_startup_archive(&path).map_err(|e| format!("{e:#}"));
+        let name = path.display().to_string();
+
+        let absent = check().expect_err("no file");
+        assert!(
+            absent.starts_with(&format!("Cannot read startup archive {name}.")),
+            "{absent}"
+        );
+        // Shorter than a header, with the right bytes as far as it goes.
+        for short in [&b""[..], b"9FP"] {
+            std::fs::write(&path, short).unwrap();
+            let said = check().expect_err("too short");
+            assert!(
+                said.starts_with(&format!("Cannot read startup archive {name}.")),
+                "{said}"
+            );
+        }
+        // Four bytes that are not the header: the other byte order, and
+        // another archive's.
+        for other in [&b"RPF9"[..], b"7FPR", b"9FPr\0\0\0\0"] {
+            std::fs::write(&path, other).unwrap();
+            let said = check().expect_err("not a header");
+            assert!(
+                said.starts_with(&format!("Invalid RPF9 header in {name}.")),
+                "{said}"
+            );
+        }
+        // Only the header is looked at.
+        for good in [&b"9FPR"[..], b"9FPR and whatever follows"] {
+            std::fs::write(&path, good).unwrap();
+            assert_eq!(check(), Ok(()));
+        }
+    }
 }
 
 #[cfg(test)]

@@ -258,6 +258,12 @@ mod with_the_stand_in_title {
         // What the title's entry point returned is how `victory` ends, as
         // it is for a process whose main function returns.
         assert_eq!(run.code, Some(EXIT_BASE), "{run:#?}");
+        // The stand-in is no build we know, so no startup archive is asked
+        // for beside it: it ran with none in its folder (the names below).
+        assert!(
+            line(&run.stdout, "build          ").starts_with("unknown ("),
+            "{run:#?}"
+        );
 
         // The report: what was bound, then how the title ended.
         assert_eq!(

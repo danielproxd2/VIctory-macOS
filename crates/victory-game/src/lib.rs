@@ -88,10 +88,46 @@ mod tests {
             "not hex at all",
         ] {
             assert!(identify_in(BUILDS, hex).is_none(), "{hex:?}");
-            // The shipped table knows no build yet.
+            // The shipped table knows none of these made-up hashes.
             assert!(identify(hex).is_none(), "{hex:?}");
         }
         assert!(identify_in(&[], known).is_none());
         assert!(identify(known).is_none());
+    }
+
+    /// What `victory run` relies on for each build it knows: the hash is
+    /// one `identify` can be asked with, and the startup archive is a file
+    /// looked for from the folder of the executable.
+    #[test]
+    fn shipped_builds_are_found_by_hash_and_name_their_startup_archive() {
+        for build in KNOWN_BUILDS {
+            assert_eq!(build.blake3.len(), 64, "{}", build.label);
+            assert!(
+                build.blake3.chars().all(|c| c.is_ascii_hexdigit()),
+                "{}",
+                build.label
+            );
+            assert!(!build.label.is_empty());
+            let found = identify(&build.blake3.to_ascii_uppercase());
+            assert_eq!(found.map(|b| b.label), Some(build.label));
+
+            let archive = std::path::Path::new(build.startup_archive);
+            assert!(archive.file_name().is_some(), "{}", build.label);
+            assert!(
+                archive
+                    .components()
+                    .all(|c| matches!(c, std::path::Component::Normal(_))),
+                "{}: {} must stay inside the title's folder",
+                build.label,
+                build.startup_archive
+            );
+        }
+        // One label and one hash each.
+        for (i, build) in KNOWN_BUILDS.iter().enumerate() {
+            for other in &KNOWN_BUILDS[i + 1..] {
+                assert_ne!(build.label, other.label);
+                assert!(!build.blake3.eq_ignore_ascii_case(other.blake3));
+            }
+        }
     }
 }
