@@ -449,7 +449,8 @@ impl<'a> Tracer<'a> {
     fn param_of(&self, reg: Reg) -> Option<(usize, u32)> {
         let Reg::S(code) = reg else { return None };
         self.layout.iter().enumerate().find_map(|(i, p)| {
-            let first = self.stage.user_sgpr(p.user_data);
+            // A parameter whose index is past the SGPRs is in no register.
+            let first = self.stage.user_sgpr(p.user_data)?;
             let dword = u32::from(code).checked_sub(first.into())?;
             (dword < p.sgprs).then_some((i, dword))
         })
@@ -656,7 +657,10 @@ impl<'a> Tracer<'a> {
         let high = match self.layout[param].root {
             RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap => None,
             RootType::Descriptor => {
-                let high = Reg::S(self.stage.user_sgpr(self.layout[param].user_data) + 1);
+                // `param_of` found the parameter in an SGPR, so the next
+                // code is at most 106 (VCC, never a program input).
+                let first = self.stage.user_sgpr(self.layout[param].user_data);
+                let high = Reg::S(first.ok_or("an address not from a root parameter")? + 1);
                 let input = self.p.inputs.iter().find(|i| i.0 == high);
                 Some(input.ok_or("a root descriptor without its high half")?.1)
             }
@@ -1758,6 +1762,32 @@ pub(crate) mod tests {
             user_data,
             slot: 0,
         }
+    }
+
+    /// A root parameter whose user-data index is past the SGPRs is in no
+    /// register. For a mesh program, index 250 plus the stage's 8 system
+    /// SGPRs overflowed a byte: a panic with overflow checks, and without
+    /// them the parameter was taken to arrive in s2 (found by random-input
+    /// testing).
+    #[test]
+    fn a_root_parameter_past_the_scalar_registers_is_in_no_register() {
+        // s_mov_b32 s20, s2; s_mov_b32 s21, s13; s_endpgm: s2 and s13 are read.
+        let words = [0xBE94_0302u32, 0xBE95_030D, S_ENDPGM];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let params = |user_data: u8| {
+            let layout = [param(Constants, user_data, 4)];
+            track(&p, &layout, HwStage::Ms, lanes(&p).as_ref()).map(|r| {
+                let mut dwords: Vec<u32> = r.params.iter().map(|p| p.2).collect();
+                dwords.sort_unstable();
+                dwords
+            })
+        };
+        // Index 5 is s13 in a mesh program: dword 0 of the parameter.
+        assert_eq!(params(5), Ok(vec![0]));
+        assert_eq!(params(250), Ok(vec![]));
+        assert_eq!(params(255), Ok(vec![]));
+        assert_eq!(params(98), Ok(vec![]));
     }
 
     fn at(param: usize, offset: u32) -> Address {

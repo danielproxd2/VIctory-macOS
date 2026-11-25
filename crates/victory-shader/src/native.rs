@@ -139,12 +139,16 @@ pub enum HwStage {
 
 impl HwStage {
     /// The SGPR holding user-data dword `index`: merged stages (and mesh
-    /// shaders, which run as one) have 8 system SGPRs first.
-    pub fn user_sgpr(self, index: u8) -> u8 {
-        match self {
-            HwStage::Ls | HwStage::Hs | HwStage::Es | HwStage::Gs | HwStage::Ms => index + 8,
-            HwStage::Vs | HwStage::Ps | HwStage::Cs => index,
-        }
+    /// shaders, which run as one) have 8 system SGPRs first. `None` where
+    /// that is no SGPR (GFX10 has s0 to s105): a root parameter's index is
+    /// a byte of the title's container, and one past the registers names
+    /// no register.
+    pub fn user_sgpr(self, index: u8) -> Option<u8> {
+        let first = match self {
+            HwStage::Ls | HwStage::Hs | HwStage::Es | HwStage::Gs | HwStage::Ms => 8,
+            HwStage::Vs | HwStage::Ps | HwStage::Cs => 0,
+        };
+        index.checked_add(first).filter(|&s| s < crate::ir::VCC)
     }
 }
 
@@ -970,6 +974,31 @@ mod tests {
         assert_eq!(program(5, 0).patched_code(), outside);
         assert_eq!(program(u32::MAX, 1).patched_code(), outside);
         assert_eq!(program(0x4000_0000, 1).patched_code(), outside);
+    }
+
+    /// A user-data index past the SGPRs names no register. In a merged
+    /// stage the index plus the 8 system SGPRs overflowed a byte: a panic
+    /// with overflow checks, and without them s2 for index 250 (found by
+    /// random-input testing).
+    #[test]
+    fn a_user_data_index_past_the_scalar_registers_names_no_register() {
+        assert_eq!(HwStage::Cs.user_sgpr(5), Some(5));
+        assert_eq!(HwStage::Ms.user_sgpr(5), Some(13));
+        assert_eq!(HwStage::Vs.user_sgpr(105), Some(105));
+        assert_eq!(HwStage::Vs.user_sgpr(106), None);
+        assert_eq!(HwStage::Ms.user_sgpr(97), Some(105));
+        assert_eq!(HwStage::Ms.user_sgpr(98), None);
+        for stage in [
+            HwStage::Ls,
+            HwStage::Hs,
+            HwStage::Es,
+            HwStage::Gs,
+            HwStage::Ms,
+        ] {
+            assert_eq!(stage.user_sgpr(250), None, "{stage:?}");
+            assert_eq!(stage.user_sgpr(255), None, "{stage:?}");
+        }
+        assert_eq!(HwStage::Ps.user_sgpr(255), None);
     }
 
     #[test]
