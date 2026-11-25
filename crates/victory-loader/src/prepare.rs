@@ -633,8 +633,9 @@ mod tests {
         assert!(prepare(&no_callbacks.bytes).is_ok());
     }
 
-    /// A callbacks field that is 0 in the file but has a base relocation is
-    /// a pointer once the loader has rebased the image.
+    /// Found by `mutated_images_prepare_or_fail_cleanly`: a callbacks field
+    /// that is 0 in the file but has a base relocation is a pointer once
+    /// the loader has rebased the image.
     #[test]
     fn a_relocated_null_callbacks_field_is_disarmed() {
         let with = |kind: u8| {
@@ -847,5 +848,73 @@ mod tests {
         // Another build gets another name.
         let other = title().timestamp(1).build().unwrap().bytes;
         assert_ne!(prepare(&other).unwrap().file_name(), a.file_name());
+    }
+
+    /// Seeded mutations of images with imports, TLS callbacks and base
+    /// relocations: prepare() either refuses the image or returns a copy
+    /// that the OS loader can map without running or binding anything.
+    #[test]
+    fn mutated_images_prepare_or_fail_cleanly() {
+        use victory_pe::testing::{XorShift64, mutate};
+
+        let page = tls_directory_page();
+        let field = layout::TLS64_ADDRESS_OF_CALLBACKS as u16;
+        let seeds = [
+            tls_title(Some(page)).bytes,
+            title()
+                .tls_callbacks(&[0x1000])
+                .reloc_block(0x1000, &[(reloc::DIR64, 8), (reloc::HIGHLOW, 0x10)])
+                .reloc_block(page, &[(reloc::DIR64, 0), (reloc::DIR64, field)])
+                .build()
+                .unwrap()
+                .bytes,
+            title().build().unwrap().bytes,
+        ];
+        for seed in &seeds {
+            prepare(seed).unwrap();
+        }
+
+        let mut rng = XorShift64::new(0x5EED_0002);
+        let (mut prepared_count, mut refused) = (0u32, 0u32);
+        for i in 0..10_000 {
+            let mut original = seeds[i % seeds.len()].clone();
+            mutate(&mut original, 0x400, &mut rng);
+            if rng.below(16) == 0 {
+                original.truncate(rng.below(original.len()));
+            }
+            let prepared = match prepare(&original) {
+                Ok(prepared) => prepared,
+                Err(PrepareError::Pe(_) | PrepareError::Patch(_)) => {
+                    refused += 1;
+                    continue;
+                }
+            };
+            prepared_count += 1;
+            assert_eq!(prepared.bytes.len(), original.len(), "mutation {i}");
+            assert_eq!(prepared.original_hash, blake3::hash(&original));
+            let patched = match ImageInfo::parse(&prepared.bytes) {
+                Ok(patched) => patched,
+                Err(e) => panic!("mutation {i}: the patched copy does not parse: {e}"),
+            };
+            assert!(patched.is_dll(), "mutation {i}");
+            assert_eq!(patched.entry_rva, 0, "mutation {i}");
+            assert!(patched.imports.is_empty(), "mutation {i}");
+            if let Some(tls) = &patched.tls {
+                assert_eq!(tls.callbacks_va, 0, "mutation {i}");
+                // No relocation is left that would change the field.
+                if patched.has_relocations {
+                    let field = u64::from(tls.directory_rva) + 0x18;
+                    for r in base_relocations(&prepared.bytes, &patched).unwrap() {
+                        let on_field = r.target.is_some_and(|t| u64::from(t).abs_diff(field) < 8);
+                        assert!(
+                            r.kind == REL_BASED_ABSOLUTE || !on_field,
+                            "mutation {i}: {r:?}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(prepared_count > 0, "no mutation was prepared");
+        assert!(refused > 0, "no mutation was refused");
     }
 }
