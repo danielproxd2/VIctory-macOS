@@ -10,7 +10,8 @@
 //! Layers, lowest first: [`xbch`], [`part`] and [`fssm`] (the blob framing),
 //! [`native_blob`] (every field the parser reads), [`container`] (a whole
 //! DXBC container that [`crate::emit::translate`] takes), and the named
-//! programs ([`vs_fullscreen_triangle`], [`ps_constant`]...).
+//! programs ([`vs_fullscreen_triangle`], [`vs_half_screen_triangle`],
+//! [`ps_constant`]...).
 
 use crate::dxbc::{FourCC, u64_at};
 use crate::gfx10::asm::{
@@ -476,6 +477,39 @@ pub fn vs_fullscreen_triangle() -> Vec<u8> {
     console_container(HwStage::Vs, &words, &[], &[SV_POSITION])
 }
 
+/// A vertex program without inputs whose vertices 0, 1 and 2 are the
+/// triangle that covers the half of the screen below its diagonal:
+/// clip-space positions (-1, -1), (-1, 1) and (1, -1) at z = 0, w = 1,
+/// clockwise with y up like [`vs_fullscreen_triangle`]. A point is inside
+/// where clip x + y < 0; in a square render target that is every pixel
+/// whose column is less than its row, the pixels on the diagonal have
+/// their centres on the edge, and those above it are outside. The position
+/// is computed from the vertex id (v0): x = (id & 2) - 1,
+/// y = (id & 1) * 2 - 1.
+///
+/// Output signature: `SV_Position` (row 0). No parameters are exported.
+pub fn vs_half_screen_triangle() -> Vec<u8> {
+    let none = asm::Vop3Mods::default();
+    let pos = ExpFlags {
+        done: true,
+        ..ExpFlags::default()
+    };
+    let words = [
+        asm::vop2("v_and_b32", 1, imm(2), 0),
+        asm::vop2("v_and_b32", 2, imm(1), 0),
+        asm::vop1("v_cvt_f32_u32", 1, vgpr(1)),
+        asm::vop1("v_cvt_f32_u32", 2, vgpr(2)),
+        asm::vop3("v_fma_f32", 1, &[vgpr(1), fconst(1.0), fconst(-1.0)], none),
+        asm::vop3("v_fma_f32", 2, &[vgpr(2), fconst(2.0), fconst(-1.0)], none),
+        asm::vop1("v_mov_b32", 3, imm(0)),
+        asm::vop1("v_mov_b32", 4, fconst(1.0)),
+        asm::exp(target::POS0, 0xF, [1, 2, 3, 4], pos),
+        vec![S_ENDPGM],
+    ]
+    .concat();
+    console_container(HwStage::Vs, &words, &[], &[SV_POSITION])
+}
+
 /// The VGPR the fetch shader loads [`vs_position_buffer`]'s attribute into
 /// (channel k in this VGPR + k): the first above the system inputs (vertex
 /// id v0, primitive id v2, instance id v3).
@@ -886,6 +920,31 @@ mod tests {
             c.part(FourCC::OSG1).unwrap().data,
             signature_part(&[SV_POSITION])
         );
+    }
+
+    /// The half-screen triangle is a vertex program the translator takes,
+    /// with a position and nothing else, and it is another program than
+    /// the full-screen one: the two differ in one constant, so their
+    /// containers have one length, and what tells them apart for a host
+    /// that keys its shaders by digest is the digest alone.
+    #[test]
+    fn the_half_screen_triangle_translates_as_a_program_of_its_own() {
+        let (half, full) = (vs_half_screen_triangle(), vs_fullscreen_triangle());
+        let programs = programs_of(&half);
+        assert_eq!(programs.len(), 1);
+        assert_eq!(programs[0].stage, HwStage::Vs);
+        let parsed = Container::parse(&half).unwrap();
+        assert!(parsed.part(FourCC::ISG1).is_none());
+        assert_eq!(
+            parsed.part(FourCC::OSG1).unwrap().data,
+            signature_part(&[SV_POSITION])
+        );
+        assert_eq!(half.len(), full.len());
+        assert_ne!(half, full);
+        let host = |container: &[u8]| crate::emit::translate(container).expect("translates");
+        let (half, full) = (host(&half), host(&full));
+        assert_ne!(half.dxil, full.dxil);
+        assert_eq!(half.user_data_dwords(), 0);
     }
 
     /// The generator is a fixed sequence per seed: the first values of
