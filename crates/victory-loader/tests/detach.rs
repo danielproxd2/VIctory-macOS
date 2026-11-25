@@ -10,12 +10,14 @@
 #![cfg(windows)]
 
 use std::ffi::CString;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use victory_loader::{
-    ImportResolver, Provenance, Resolution, UnimplementedPolicy, WithTitleDlls, prepare,
+    ImportResolver, LoadedImage, Provenance, Resolution, UnimplementedPolicy, WithTitleDlls,
+    prepare,
 };
 use victory_pe::ImportSymbol;
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
@@ -38,6 +40,26 @@ const ENDED_BY_THE_LOADER: i32 = 1;
 unsafe extern "C" {
     /// The C runtime's `exit`, which is how a title ends the process.
     fn exit(code: i32) -> !;
+    /// Registers a function `exit` calls, the last registered first.
+    fn atexit(f: extern "C" fn()) -> i32;
+}
+
+/// title_a.dll, for [`attach_late`].
+static LATE: OnceLock<LoadedImage> = OnceLock::new();
+
+/// One of `exit`'s functions, registered before the loader's own and so
+/// called after it: the title's images have been told of the end, and the
+/// process is still ending. Attaches title_a.dll again, as a title does
+/// that loads a DLL from its own clean-up, and runs a thread from start to
+/// end. The DLL writes every notice it gets to the title's log.
+extern "C" fn attach_late() {
+    let dll = LATE.get().expect("set before the title ran");
+    // SAFETY: its imports are bound, and it depends on no other title DLL.
+    unsafe { dll.attach() }.unwrap();
+    std::thread::spawn(|| ()).join().unwrap();
+    let log = std::env::var_os("VICTORY_FIXTURE_LOG").unwrap();
+    let mut log = std::fs::OpenOptions::new().append(true).open(log).unwrap();
+    writeln!(log, "late_thread=ended").unwrap();
 }
 
 extern "system" fn fake_xgameruntime_initialize() -> i32 {
@@ -122,6 +144,14 @@ fn detach_child() {
         .unwrap();
     println!("missing={}", report.missing.len());
 
+    if std::env::var_os("VICTORY_DETACH_LATE").is_some() {
+        let (_, title_a) = dlls.iter().find(|(name, _)| name == "title_a.dll").unwrap();
+        LATE.set(title_a.clone()).unwrap();
+        // Before anything is attached: the loader registers its own exit
+        // function at the first attach.
+        // SAFETY: registers a function with the C runtime's exit table.
+        assert_eq!(unsafe { atexit(attach_late) }, 0);
+    }
     // SAFETY: every image's imports are bound, and the DLLs are given in
     // the order they depend on each other.
     let main = unsafe { Arc::new(image).spawn_main(dlls.clone()) }.unwrap();
@@ -151,6 +181,11 @@ struct Run {
 
 impl Run {
     fn new(stuck: bool) -> Run {
+        Run::with(if stuck { "VICTORY_FIXTURE_STUCK" } else { "" })
+    }
+
+    /// A run of the child with the variable `set` set, if it names one.
+    fn with(set: &str) -> Run {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("title.log");
         let mut child = std::process::Command::new(std::env::current_exe().unwrap());
@@ -158,8 +193,8 @@ impl Run {
             .args(["--exact", "detach_child", "--nocapture", "--test-threads=1"])
             .env("VICTORY_DETACH_CHILD_DIR", dir.path())
             .env("VICTORY_FIXTURE_LOG", &log);
-        if stuck {
-            child.env("VICTORY_FIXTURE_STUCK", "1");
+        if !set.is_empty() {
+            child.env(set, "1");
         }
         let out = child.output().unwrap();
         let ended = now_ms();
@@ -249,19 +284,15 @@ fn exit_detaches_dlls_in_reverse_then_the_exe() {
     assert!(took < DETACH_DEADLINE, "{took:?}: {run:#?}");
 }
 
-/// Once the process is ending, the title's images hear of no more threads:
-/// not of the loader's own watchdog thread, which starts then, and not of
-/// the threads that are ended. What is seen here is the order of the log;
-/// it does not tell the loader's two reasons for it apart (the images are
-/// no longer attached, and notices are off while the process ends).
+/// The title's images hear of no thread after they were told that the
+/// process ends: not of the loader's own watchdog thread, which starts
+/// then, and not of the threads that are ended. They are no longer attached
+/// by then, which is all this run shows; that notices are off altogether
+/// while the process ends takes an image attached that late to see, in
+/// `an_image_attached_while_the_process_ends_hears_of_no_threads`.
 #[test]
-fn thread_notices_after_exit_started_are_ignored() {
+fn detached_images_hear_of_no_threads_while_the_process_ends() {
     let run = Run::plain();
-    let thread_notice = |line: &str| {
-        ["title_a ", "title_b "]
-            .iter()
-            .any(|dll| line.strip_prefix(dll).is_some_and(|r| r == "2" || r == "3"))
-    };
     // The fixture does log thread notices: the executable started two
     // threads and let them end, and both DLLs heard of each.
     for line in ["title_a 2", "title_b 2", "title_a 3", "title_b 3"] {
@@ -277,6 +308,43 @@ fn thread_notices_after_exit_started_are_ignored() {
     // initialised: title_a.dll first.
     let first = run.log.iter().position(|l| thread_notice(l)).unwrap();
     assert_eq!(run.log[first], "title_a 2", "{run:#?}");
+}
+
+/// Whether a line of the title's log is a DLL's notice of a thread's start
+/// or end.
+fn thread_notice(line: &str) -> bool {
+    ["title_a ", "title_b "]
+        .iter()
+        .any(|dll| line.strip_prefix(dll).is_some_and(|r| r == "2" || r == "3"))
+}
+
+/// Once the process is ending, no thread's start or end is passed on to
+/// any title image, whatever its state: a DLL attached after the others
+/// were told of the end (it is attached, so it would hear of threads at any
+/// other time) hears nothing of a thread that starts and ends then.
+#[test]
+fn an_image_attached_while_the_process_ends_hears_of_no_threads() {
+    let run = Run::with("VICTORY_DETACH_LATE");
+    assert_eq!(run.code, Some(EXIT_CODE), "{run:#?}");
+    // Attached at the title's start and again from the exit function,
+    // after every image was told of the end.
+    let &[_, again] = &run.at("title_a 1")[..] else {
+        panic!("title_a.dll was not attached twice: {run:#?}");
+    };
+    assert!(run.once("detached=1") < again, "{run:#?}");
+    // The thread ran and ended after that, and no image was told.
+    let ended = run.once("late_thread=ended");
+    assert!(again < ended, "{run:#?}");
+    let told: Vec<_> = run.log[again..]
+        .iter()
+        .filter(|l| thread_notice(l))
+        .collect();
+    assert_eq!(told, [""; 0], "{run:#?}");
+    // While the title ran, the same DLL did hear of threads.
+    assert!(
+        run.log[..again].iter().any(|l| l == "title_a 2"),
+        "{run:#?}"
+    );
 }
 
 /// A DLL that never comes back from the notice of the process's end (it
