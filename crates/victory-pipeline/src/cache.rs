@@ -422,10 +422,61 @@ mod tests {
         );
     }
 
-    /// Slow enough that the threads overlap; the output depends on nothing
-    /// but the input.
+    /// Makes conversions of one input overlap. A conversion leaves a file
+    /// in the folder of its input and does not return before `parties`
+    /// files are there: every party is inside the converter for that input
+    /// at the same moment, whether the parties are threads or processes.
+    /// A party that waits in vain fails its conversion and tells the rest.
+    struct Meet {
+        dir: PathBuf,
+        parties: usize,
+    }
+
+    /// Far longer than a party needs to arrive, also for a process that
+    /// Wine has yet to start.
+    const MEET_TIMEOUT: Duration = Duration::from_secs(60);
+
+    impl Meet {
+        fn wait(&self, input: &[u8]) -> Result<()> {
+            static ARRIVALS: AtomicUsize = AtomicUsize::new(0);
+            let place = self.dir.join(&blake3::hash(input).to_hex()[..16]);
+            std::fs::create_dir_all(&place)?;
+            let n = ARRIVALS.fetch_add(1, Ordering::Relaxed);
+            std::fs::write(place.join(format!("{}-{n}", std::process::id())), b"")?;
+            let failed = self.dir.join("failed");
+            let deadline = std::time::Instant::now() + MEET_TIMEOUT;
+            loop {
+                let inside = std::fs::read_dir(&place)?.count();
+                if inside >= self.parties {
+                    return Ok(());
+                }
+                if failed.exists() || std::time::Instant::now() >= deadline {
+                    let _ = std::fs::write(&failed, b"");
+                    anyhow::bail!(
+                        "{} conversions of one input did not overlap ({inside} arrived)",
+                        self.parties
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    /// Its output depends on nothing but the input. With a [`Meet`], a
+    /// conversion waits for the others inside it.
     struct Slow {
         runs: AtomicUsize,
+        meet: Option<Meet>,
+    }
+
+    impl Slow {
+        fn new(meet: Option<Meet>) -> Self {
+            let runs = AtomicUsize::new(0);
+            Slow { runs, meet }
+        }
+        fn runs(&self) -> usize {
+            self.runs.load(Ordering::Relaxed)
+        }
     }
 
     impl Converter for Slow {
@@ -437,6 +488,9 @@ mod tests {
         }
         fn convert(&self, input: &[u8]) -> Result<Vec<u8>> {
             self.runs.fetch_add(1, Ordering::Relaxed);
+            if let Some(meet) = &self.meet {
+                meet.wait(input)?;
+            }
             Ok(slow_output(input))
         }
     }
@@ -451,26 +505,34 @@ mod tests {
         out
     }
 
+    /// The whole entry for `input`, with one bit of its output flipped: an
+    /// entry file of the right size that only its hash gives away.
+    fn store_damaged(cache: &Cache, input: &[u8]) {
+        let path = cache.path_for(&CacheKey::new(&Slow::new(None), input));
+        let output = slow_output(input);
+        let mut file = header(&output).to_vec();
+        file.extend_from_slice(&output);
+        *file.last_mut().unwrap() ^= 1;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, file).unwrap();
+    }
+
     #[test]
     fn threads_converting_one_key_publish_one_consistent_output() {
         let tmp = tempfile::tempdir().unwrap();
         let cache = Cache::open(tmp.path().join("cache")).unwrap();
-        let conv = Slow {
-            runs: AtomicUsize::new(0),
-        };
-        const THREADS: usize = 16;
+        const THREADS: usize = 8;
         const KEYS: usize = 24;
         let inputs: Vec<Vec<u8>> = (0..KEYS).map(|k| format!("key {k}").into_bytes()).collect();
-        for round in 0..2 {
-            let start = std::sync::Barrier::new(THREADS);
-            let failures: Vec<String> = std::thread::scope(|scope| {
+        // Every thread asks for every key; what went wrong, if anything.
+        let all_ask = |conv: &Slow| -> Vec<String> {
+            std::thread::scope(|scope| {
                 let threads: Vec<_> = (0..THREADS)
                     .map(|_| {
                         scope.spawn(|| {
-                            start.wait();
                             let mut failures = vec![];
                             for input in &inputs {
-                                match cache.get_or_convert(&conv, input) {
+                                match cache.get_or_convert(conv, input) {
                                     Ok(out) if out == slow_output(input) => {}
                                     Ok(out) => failures.push(format!("{} wrong bytes", out.len())),
                                     Err(e) => failures.push(format!("{e:#}")),
@@ -484,29 +546,51 @@ mod tests {
                     .into_iter()
                     .flat_map(|t| t.join().expect("no thread panics"))
                     .collect()
-            });
-            assert_eq!(failures, Vec::<String>::new(), "round {round}");
-            // One whole entry per key and nothing else.
-            assert_eq!(staging_files(&cache), Vec::<PathBuf>::new());
-            assert_eq!(files(&cache).len(), KEYS);
+            })
+        };
+        // One whole entry per key and nothing else.
+        let whole = |round: &str| {
+            assert_eq!(staging_files(&cache), Vec::<PathBuf>::new(), "{round}");
+            assert_eq!(files(&cache).len(), KEYS, "{round}");
             for input in &inputs {
-                let key = CacheKey::new(&conv, input);
-                assert_eq!(cache.read(&key), Some(slow_output(input)));
+                let key = CacheKey::new(&Slow::new(None), input);
+                assert_eq!(cache.read(&key), Some(slow_output(input)), "{round}");
             }
-            let runs = conv.runs.load(Ordering::Relaxed);
-            assert!(
-                (KEYS..=KEYS * THREADS).contains(&runs),
-                "{runs} conversions"
-            );
-        }
-        let after_first = conv.runs.load(Ordering::Relaxed);
+        };
+        let meeting = |round: &str| {
+            Slow::new(Some(Meet {
+                dir: tmp.path().join(round),
+                parties: THREADS,
+            }))
+        };
+
+        // Nothing is stored: no conversion of a key returns before every
+        // thread is converting that key, and then all of them publish it.
+        let conv = meeting("empty");
+        assert_eq!(all_ask(&conv), Vec::<String>::new(), "empty cache");
+        assert_eq!(conv.runs(), THREADS * KEYS, "all overlapped");
+        whole("empty cache");
+
+        // Everything is stored: nobody converts.
+        let conv = Slow::new(None);
+        assert_eq!(all_ask(&conv), Vec::<String>::new(), "full cache");
+        assert_eq!(conv.runs(), 0, "all hits");
+        whole("full cache");
+
+        // Every entry is damaged: no thread is served one, all of them
+        // convert every key again, together, and whole entries replace
+        // the damaged ones while other threads are reading them.
         for input in &inputs {
-            cache.get_or_convert(&conv, input).unwrap();
+            store_damaged(&cache, input);
         }
-        assert_eq!(conv.runs.load(Ordering::Relaxed), after_first);
+        let conv = meeting("damaged");
+        assert_eq!(all_ask(&conv), Vec::<String>::new(), "damaged cache");
+        assert_eq!(conv.runs(), THREADS * KEYS, "none served, all overlapped");
+        whole("damaged cache");
     }
 
-    const CHILD_KEYS: usize = 150;
+    const CHILDREN: usize = 3;
+    const CHILD_KEYS: usize = 40;
 
     fn child_inputs() -> Vec<Vec<u8>> {
         (0..CHILD_KEYS)
@@ -514,93 +598,83 @@ mod tests {
             .collect()
     }
 
-    /// One of the processes of `two_processes_converting_one_key_agree`;
-    /// does nothing in a normal run.
+    /// One of the processes of `processes_converting_one_key_agree`; does
+    /// nothing in a normal run.
     #[test]
     fn convert_child() {
         let Some(root) = std::env::var_os("VICTORY_CACHE_CHILD") else {
             return;
         };
         let cache = Cache::open(PathBuf::from(root)).unwrap();
-        let conv = Slow {
-            runs: AtomicUsize::new(0),
-        };
-        // Start together: the parent removes the file when all are ready.
-        println!("READY");
-        let gate = cache.root.join("gate");
-        while gate.exists() {
-            std::thread::yield_now();
-        }
+        // The folder's name is no entry folder's.
+        let conv = Slow::new(Some(Meet {
+            dir: cache.root.join("meet"),
+            parties: CHILDREN,
+        }));
         let mut bad = 0;
         for input in child_inputs() {
             match cache.get_or_convert(&conv, &input) {
                 Ok(out) if out == slow_output(&input) => {}
-                Ok(_) => bad += 1,
+                Ok(_) => {
+                    println!("ERROR wrong bytes");
+                    bad += 1;
+                }
                 Err(e) => {
                     println!("ERROR {e:#}");
                     bad += 1;
                 }
             }
         }
-        println!("DONE bad={bad} runs={}", conv.runs.load(Ordering::Relaxed));
+        println!("DONE bad={bad} runs={}", conv.runs());
     }
 
+    /// Each process is inside the converter for every key while the others
+    /// are (the conversions meet), so all of them publish every entry at
+    /// about the same time. A third of the keys start with a damaged
+    /// entry, which no process may be served.
     #[test]
-    fn two_processes_converting_one_key_agree() {
-        use std::io::BufRead;
+    fn processes_converting_one_key_agree() {
+        use std::io::Read;
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("cache");
         let cache = Cache::open(&root).unwrap();
-        let gate = root.join("gate");
-        std::fs::write(&gate, b"").unwrap();
-        let mut children: Vec<_> = (0..3)
+        for input in child_inputs().iter().step_by(3) {
+            store_damaged(&cache, input);
+        }
+        let children: Vec<_> = (0..CHILDREN)
             .map(|_| {
-                let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                std::process::Command::new(std::env::current_exe().unwrap())
                     .args(["--exact", "cache::tests::convert_child", "--nocapture"])
                     .args(["--test-threads=1"])
                     .env("VICTORY_CACHE_CHILD", &root)
                     .stdout(std::process::Stdio::piped())
                     .spawn()
-                    .unwrap();
-                let mut out = std::io::BufReader::new(child.stdout.take().unwrap());
-                let mut seen = String::new();
-                loop {
-                    let mut line = String::new();
-                    assert_ne!(out.read_line(&mut line).unwrap(), 0, "no READY: {seen}");
-                    if line.contains("READY") {
-                        break;
-                    }
-                    seen.push_str(&line);
-                }
-                (child, out)
+                    .unwrap()
             })
             .collect();
-        std::fs::remove_file(&gate).unwrap();
-        let mut runs = 0;
-        for (child, out) in &mut children {
-            let text: String = out.lines().map(|l| l.unwrap() + "\n").collect();
+        for mut child in children {
+            let mut text = String::new();
+            let mut out = child.stdout.take().unwrap();
+            out.read_to_string(&mut text).unwrap();
             assert!(child.wait().unwrap().success(), "{text}");
             let done = text
                 .lines()
                 .find_map(|l| l.split_once("DONE bad=0 runs="))
                 .unwrap_or_else(|| panic!("a child failed: {text}"));
-            let n: usize = done.1.split_whitespace().next().unwrap().parse().unwrap();
-            runs += n;
+            let runs: usize = done.1.split_whitespace().next().unwrap().parse().unwrap();
+            assert_eq!(runs, CHILD_KEYS, "this child converted every key: {text}");
         }
-        // Every key was converted by someone, and every entry is whole.
-        assert!(runs >= CHILD_KEYS, "{runs} conversions");
+        // Every entry is whole, and nothing is left of the publishing.
         assert_eq!(staging_files(&cache), Vec::<PathBuf>::new());
         assert_eq!(files(&cache).len(), CHILD_KEYS);
-        let conv = Slow {
-            runs: AtomicUsize::new(0),
-        };
+        let conv = Slow::new(None);
         for input in child_inputs() {
             assert_eq!(
                 cache.get_or_convert(&conv, &input).unwrap(),
                 slow_output(&input)
             );
         }
-        assert_eq!(conv.runs.load(Ordering::Relaxed), 0, "all hits afterwards");
+        assert_eq!(conv.runs(), 0, "all hits afterwards");
     }
 
     #[test]
