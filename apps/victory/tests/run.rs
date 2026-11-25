@@ -343,12 +343,53 @@ mod with_the_stand_in_title {
         assert!(!home.title_log().exists(), "the title ran: {run:#?}");
     }
 
-    /// The default for an import nobody has: the first call of one ends
-    /// the run, by name, on the screen and in the crash log.
+    /// The DLLs the report says the title's folder lacks: the names
+    /// before ` not in ` on the line `missing dlls`, none without the line.
+    fn absent_dlls(text: &str) -> Vec<&str> {
+        let found: Vec<&str> = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("missing dlls   "))
+            .collect();
+        match found[..] {
+            [] => Vec::new(),
+            [line] => {
+                let (names, _) = line.split_once(" not in ").expect("names, then the folder");
+                names.split(", ").collect()
+            }
+            _ => panic!("{} lines name missing DLLs in:\n{text}", found.len()),
+        }
+    }
+
+    /// With `--strict` the DLLs the stand-in would take from the host are
+    /// its own to bring, and its folder does not have them: the report
+    /// names them, and `--execute` does not start a title none of whose
+    /// calls into them could arrive.
     #[test]
-    fn run_execute_stops_at_the_first_call_of_a_missing_import() {
+    fn run_strict_execute_refuses_a_title_whose_dlls_are_missing() {
         let home = Home::new();
         let title = install(&home, "hle-probe-exe.exe");
+
+        // Without `--execute` it is said and the run goes on to its end.
+        let bound = home.victory(&["run".as_ref(), "--strict".as_ref(), title.as_os_str()]);
+        assert_eq!(bound.code, Some(0), "{bound:#?}");
+        let absent = absent_dlls(&bound.stdout);
+        assert!(!absent.is_empty(), "{bound:#?}");
+        for dll in &absent {
+            assert!(dll.to_ascii_lowercase().ends_with(".dll"), "{bound:#?}");
+            // Every import from one of them is nobody's.
+            let prefix = format!("{dll}!");
+            assert!(
+                missing(&bound.stdout)
+                    .iter()
+                    .any(|m| m.starts_with(&prefix)),
+                "{dll}: {bound:#?}"
+            );
+        }
+        assert!(
+            line(&bound.stdout, "missing dlls   ").contains("the package is incomplete"),
+            "{bound:#?}"
+        );
+
         let args: [&OsStr; 4] = [
             "run".as_ref(),
             "--strict".as_ref(),
@@ -356,6 +397,54 @@ mod with_the_stand_in_title {
             title.as_os_str(),
         ];
         let run = home.victory(&args);
+        assert_eq!(run.code, Some(1), "{run:#?}");
+        assert_eq!(absent_dlls(&run.stdout), absent, "{run:#?}");
+        let error = run
+            .stderr
+            .lines()
+            .find(|l| l.starts_with("Error: the title's own DLLs are missing: "))
+            .unwrap_or_else(|| panic!("the refusal is not there: {run:#?}"));
+        for dll in &absent {
+            assert!(error.contains(dll), "{dll}: {error}");
+        }
+        assert!(error.contains("`--unimplemented zero`"), "{error}");
+        // Nothing of the title ran, and no import was called.
+        assert!(!run.stdout.contains("bound          "), "{run:#?}");
+        assert!(!run.stdout.contains("title exited"), "{run:#?}");
+        assert!(
+            !run.stderr.contains("VIctory: unimplemented import"),
+            "{run:#?}"
+        );
+        assert!(!home.title_log().exists(), "the title ran: {run:#?}");
+    }
+
+    /// The default for an import nobody has: the first call of one ends
+    /// the run, by name, on the screen and in the crash log.
+    ///
+    /// `--strict` makes the imports nobody's. The DLLs it no longer takes
+    /// from the host have to be in the title's folder for the title to be
+    /// started at all (the test above), so each is there as a stand-in
+    /// that exports nothing: `title_quiet.dll` under that name.
+    #[test]
+    fn run_execute_stops_at_the_first_call_of_a_missing_import() {
+        let home = Home::new();
+        let title = install(&home, "hle-probe-exe.exe");
+        let bound = home.victory(&["run".as_ref(), "--strict".as_ref(), title.as_os_str()]);
+        assert_eq!(bound.code, Some(0), "{bound:#?}");
+        let absent = absent_dlls(&bound.stdout);
+        assert!(!absent.is_empty(), "{bound:#?}");
+        for dll in &absent {
+            std::fs::copy(fixture("title_quiet.dll"), home.path("title").join(dll)).unwrap();
+        }
+
+        let args: [&OsStr; 4] = [
+            "run".as_ref(),
+            "--strict".as_ref(),
+            "--execute".as_ref(),
+            title.as_os_str(),
+        ];
+        let run = home.victory(&args);
+        assert_eq!(absent_dlls(&run.stdout), [""; 0], "{run:#?}");
         assert!(run.code != Some(0), "{run:#?}");
         assert!(!run.stdout.contains("title exited"), "{run:#?}");
         let said = run
