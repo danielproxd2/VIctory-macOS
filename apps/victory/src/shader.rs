@@ -602,6 +602,37 @@ mod tests {
         assert!(listing.contains("s_endpgm"), "{listing}");
     }
 
+    /// A file that starts as a shader pack and ends inside its header is
+    /// named with what is wrong with it, after the summary, and is not
+    /// searched for containers; `--effects` lists databases only, and says
+    /// nothing of a file that holds none.
+    #[test]
+    fn a_shader_pack_that_does_not_parse_is_named_with_the_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cut = shaderpack::MAGIC.to_vec();
+        // A container after the magic: found if the file were searched.
+        cut.extend(vertex_container());
+        cut.truncate(0x50);
+        let pack = write(dir.path(), "cut.pack", &cut);
+        let why = shaderpack::Pack::parse(&cut).map(drop).unwrap_err();
+
+        let text = report_of(|out| run(vec![dir.path().into()], true, false, false, out));
+        assert_eq!(
+            line(&text, "containers found"),
+            "containers found       0 (in 0 files)"
+        );
+        assert_eq!(
+            text.lines().last(),
+            Some(format!("{}: {why}", pack.display()).as_str()),
+            "{text}"
+        );
+        assert!(!text.contains("(none found"), "{text}");
+
+        let effects = report_of(|out| run(vec![dir.path().into()], true, false, true, out));
+        assert!(!effects.contains("effect "), "{effects}");
+        assert!(!effects.contains(&pack.display().to_string()), "{effects}");
+    }
+
     #[test]
     fn a_corrupt_packed_record_is_counted() {
         let dir = tempfile::tempdir().unwrap();
