@@ -7164,18 +7164,20 @@ mod tests {
 
         let io = io::raise(&p, &native).unwrap();
 
-        let emitted = lower(&Parts {
-            native: &native,
-            p: &p,
-            st: &st,
-            io: &io,
-            res: &res,
-            inputs: vec![],
-            outputs: vec![],
-            prims: vec![],
-            mesh_stride: 0,
-        })
-        .unwrap();
+        let emitted = validated(
+            lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            })
+            .unwrap(),
+        );
 
         let container = crate::Container::parse(&emitted.dxil).unwrap();
 
