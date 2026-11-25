@@ -499,12 +499,16 @@ impl Decoder {
     }
 
     /// Decodes one frame (`frame.data`, `frame.bits`) and appends
-    /// `FRAME_SAMPLES` interleaved samples per channel to `out`.
+    /// `FRAME_SAMPLES` interleaved samples per channel to `out`, silence
+    /// when the frame is refused.
     pub fn decode(&mut self, data: &[u8], bits: usize, out: &mut Vec<i16>) -> Result<(), Error> {
+        // The frame ends where the caller says or where its bytes do,
+        // whichever is first: past them every bit reads as zero, and a
+        // stereo tile header of zeros repeats until the end.
         let mut b = Bits {
             data,
             pos: 0,
-            end: bits,
+            end: bits.min(data.len().saturating_mul(8)),
         };
         let len = b.read(LENGTH_BITS) as usize;
         let result = self.frame(&mut b, len);
@@ -1401,6 +1405,27 @@ mod tests {
                 "{what}"
             );
             assert_eq!(pcm, vec![0i16; FRAME_SAMPLES], "{what}");
+        }
+    }
+
+    /// A bit count past the end of the buffer does not make the decoder
+    /// read on through zeros it made up: a stereo tile header of zeros says
+    /// "no channel has this subframe" for as long as it is allowed to read,
+    /// and with a count like `usize::MAX` that never ended.
+    #[test]
+    fn a_bit_count_past_the_buffer_ends_at_the_buffer() {
+        for (data, bits) in [
+            (vec![], usize::MAX),
+            (vec![0u8; 8], usize::MAX),
+            (vec![0u8; 8], 1 << 40),
+        ] {
+            let mut decoder = Decoder::new(2, 48_000);
+            let mut pcm = vec![];
+            assert_eq!(
+                decoder.decode(&data, bits, &mut pcm),
+                Err(Error("tile header"))
+            );
+            assert_eq!(pcm, vec![0i16; FRAME_SAMPLES * 2]);
         }
     }
 
