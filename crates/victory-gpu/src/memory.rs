@@ -629,12 +629,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         let Some((_gpu, host)) = crate::testing::gpu() else {
             return;
         };
-        let Some(views) = heap() else {
-            crate::test_support::skipped(
-                "no shared view heap (memory::lists_share_a_table_and_copies_keep_their_views)",
-            );
-            return;
-        };
+        let views = heap().expect("the shared view heap: the test holds the device");
         let Some((root, pso)) = pipeline("memory::lists_share_a_table_and_copies_keep_their_views")
         else {
             return;

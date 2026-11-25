@@ -627,47 +627,25 @@ mod tests {
     /// stored and the library is serialised.
     #[test]
     fn pipelines_load_on_many_threads_at_once() {
-        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-        use windows::core::s;
         const N: usize = 48;
+        const TEST: &str = "pipeline::library::pipelines_load_on_many_threads_at_once";
         let Some((_gpu, host)) = crate::testing::gpu() else {
             return;
         };
         let device: ID3D12Device1 = host.device.cast().expect("a device with libraries");
+        // Each compiled by the system's compiler. Where that is Wine's and
+        // cannot build them the test did not run: its "skipped" line, or a
+        // failure with `VICTORY_REQUIRE_HLSL=1`; Microsoft's failing fails
+        // it (`crate::testing::compiled`).
         let shader = |i: usize| {
             let source = format!(
                 "#define RS \"UAV(u0)\"\nRWByteAddressBuffer b : register(u0);\n\
                  [RootSignature(RS)] [numthreads(1, 1, 1)] void main() {{ b.Store(0, b.Load(4) * {i} + {i}); }}"
             );
-            let mut blob = None;
-            // SAFETY: the source outlives the call; the blob is read within it.
-            unsafe {
-                D3DCompile(
-                    source.as_ptr().cast(),
-                    source.len(),
-                    None,
-                    None,
-                    None,
-                    s!("main"),
-                    s!("cs_5_1"),
-                    0,
-                    0,
-                    &mut blob,
-                    None,
-                )
-                .ok()?;
-                let blob = blob?;
-                Some(
-                    std::slice::from_raw_parts(
-                        blob.GetBufferPointer().cast::<u8>(),
-                        blob.GetBufferSize(),
-                    )
-                    .to_vec(),
-                )
-            }
+            crate::testing::compiled(TEST, &source, 0)
         };
         let Some(codes) = (0..2 * N).map(shader).collect::<Option<Vec<_>>>() else {
-            return; // no shader compiler here
+            return;
         };
         // SAFETY: the code holds its root signature.
         let root: ID3D12RootSignature =

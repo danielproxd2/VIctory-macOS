@@ -1526,10 +1526,7 @@ mod tests {
         let p = crate::watch::tests::pool(2);
         let len = 2 * PAGE;
         register(p, p as u64, len as u64);
-        let Some(copy) = find(p as u64, len as u64) else {
-            unregister(p, p as u64);
-            return; // no host GPU here
-        };
+        let copy = find(p as u64, len as u64).expect("a copy: the test holds the device");
         let title = |at: usize| (p + at) as *mut u8;
         let host = |at: usize| copy.read_host((p + at) as u64 & !3, 1)[0].to_le_bytes()[at % 4];
         copy.update(p, len);
@@ -1578,10 +1575,7 @@ mod tests {
         let p = crate::watch::tests::pool(4);
         let len = 4 * PAGE;
         register(p, p as u64, len as u64);
-        let Some(copy) = find(p as u64, len as u64) else {
-            unregister(p, p as u64);
-            return; // no host GPU here
-        };
+        let copy = find(p as u64, len as u64).expect("a copy: the test holds the device");
         copy.update(p, len);
         let bytes = |s: &Shadow| {
             s.before
@@ -1648,10 +1642,8 @@ mod tests {
         let p = crate::watch::tests::pool(3);
         let len = 3 * PAGE;
         register(p, p as u64, len as u64);
-        let (Some(copy), Some(b)) = (find(p as u64, len as u64), bitmap()) else {
-            unregister(p, p as u64);
-            return; // no host GPU here
-        };
+        let copy = find(p as u64, len as u64).expect("a copy: the test holds the device");
+        let b = bitmap().expect("the bitmap: the test holds the device");
         let base = copy.marks.expect("tracked memory gets mark bits") as usize;
         assert_eq!(
             copy.mark_entry(p as u64 + PAGE as u64 + 8),

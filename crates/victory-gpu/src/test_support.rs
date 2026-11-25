@@ -99,7 +99,9 @@ fn skipped_to(out: &mut dyn Write, what: &str) {
 /// Why a test that compiles a shader of its own did not run: the system's
 /// HLSL compiler refused the source. Under Wine `D3DCompile` is
 /// vkd3d-shader's compiler, which does not build everything Microsoft's
-/// does.
+/// does. The reason is that compiler's alone: where the process is not
+/// under Wine ([`under_wine`]) a shader that does not compile fails its
+/// test, as it does upstream ([`hlsl_refusal`]).
 pub const NO_HLSL: &str = "the host HLSL compiler cannot build this test shader";
 
 /// Why a test of the argument clamp did not run: `clamp_bytecode.rs` was
@@ -204,17 +206,37 @@ fn first_time(said: &Mutex<Vec<String>>, text: &str) -> bool {
     new
 }
 
+/// What a test does whose own shader the system's HLSL compiler refused
+/// with `errors`: under Wine (`wine`), where that compiler is
+/// vkd3d-shader's, it may be skipped (`Ok`); with Microsoft's compiler the
+/// refusal is the test's failure (`Err`, what it fails with), as it is
+/// upstream, whatever the run requires.
+fn hlsl_refusal(wine: bool, test: &str, errors: &str) -> Result<(), String> {
+    if wine {
+        Ok(())
+    } else {
+        Err(format!(
+            "{test}: the system's HLSL compiler (not Wine's) refused the test's shader: {}",
+            errors.trim_end()
+        ))
+    }
+}
+
 /// For a test whose own shader the system's HLSL compiler refused with
-/// `errors`: the line `skipped: ` [`NO_HLSL`] ` (<test>)`, and after it
-/// the compiler's messages, unless this process has printed the same ones
-/// before. The test returns after it.
+/// `errors`, under Wine: the line `skipped: ` [`NO_HLSL`] ` (<test>)`, and
+/// after it the compiler's messages, unless this process has printed the
+/// same ones before. The test returns after it.
 ///
 /// # Panics
 ///
-/// With `VICTORY_REQUIRE_HLSL=1`: that fails the test, with the
-/// compiler's messages.
+/// Where the process is not under Wine: the compiler is Microsoft's, and a
+/// shader it refuses is a failed test. With `VICTORY_REQUIRE_HLSL=1`:
+/// that fails the test under Wine too. Both with the compiler's messages.
 pub fn no_hlsl(test: &str, errors: &str) {
     static SAID: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    if let Err(why) = hlsl_refusal(under_wine(), test, errors) {
+        panic!("{why}");
+    }
     let required = require_hlsl();
     let detail = (required || first_time(&SAID, errors)).then_some(errors);
     needs("VICTORY_REQUIRE_HLSL", NO_HLSL, test, required, detail);
@@ -235,6 +257,27 @@ pub fn stale_clamp(test: &str) {
         require_clamp(),
         None,
     );
+}
+
+/// Why a test that needs the software adapter did not run. Not every host
+/// has one: D3DMetal under Wine has none.
+pub const NO_WARP: &str = "no WARP adapter";
+
+/// Whether a test that needs the software adapter fails where there is
+/// none: `VICTORY_REQUIRE_WARP=1`, the switch `victory-shader`'s tests on
+/// that adapter have.
+pub fn require_warp() -> bool {
+    required(std::env::var("VICTORY_REQUIRE_WARP").ok().as_deref())
+}
+
+/// For a test that needs the software adapter on a host without one: the
+/// line `skipped: ` [`NO_WARP`] ` (<test>)`. The test returns after it.
+///
+/// # Panics
+///
+/// With `VICTORY_REQUIRE_WARP=1`: that fails the test.
+pub fn no_warp(test: &str) {
+    needs("VICTORY_REQUIRE_WARP", NO_WARP, test, require_warp(), None);
 }
 
 /// Whether a test that needs the depth conversion fails while no bytecode
@@ -414,7 +457,7 @@ mod tests {
     fn skips_are_one_uniform_line() {
         assert_eq!(skip_line(NO_DEVICE), SKIPPED);
         assert_eq!(SKIPPED, "skipped: no host D3D12 device");
-        assert_eq!(skip_line("no WARP adapter"), "skipped: no WARP adapter");
+        assert_eq!(skip_line(NO_WARP), "skipped: no WARP adapter");
     }
 
     /// `VICTORY_REQUIRE_HLSL` and `VICTORY_REQUIRE_CLAMP` are read as
@@ -508,6 +551,35 @@ mod tests {
         let message = message.downcast_ref::<String>().expect("a message");
         assert!(message.starts_with("VICTORY_REQUIRE_CLAMP=1: the prebuilt clamp bytecode"));
         assert!(message.ends_with("(t): E5017"), "{message}");
+
+        // A refusal is a skip under Wine only: Microsoft's compiler
+        // refusing a test's shader fails the test, whatever is required.
+        assert_eq!(hlsl_refusal(true, "draw::a_test", "E5005"), Ok(()));
+        assert_eq!(
+            hlsl_refusal(false, "draw::a_test", "error X3000: syntax error\n"),
+            Err(
+                "draw::a_test: the system's HLSL compiler (not Wine's) refused the test's \
+                 shader: error X3000: syntax error"
+                    .to_owned()
+            )
+        );
+        // The software adapter's line and switch.
+        let mut out = Vec::new();
+        assert_eq!(
+            unmet(
+                "VICTORY_REQUIRE_WARP",
+                NO_WARP,
+                "host::a_test",
+                false,
+                &mut out
+            ),
+            Ok(())
+        );
+        assert_eq!(out, b"skipped: no WARP adapter (host::a_test)\n");
+        assert_eq!(
+            unmet("VICTORY_REQUIRE_WARP", NO_WARP, "t", true, &mut Vec::new()),
+            Err("VICTORY_REQUIRE_WARP=1: no WARP adapter (t)".to_owned())
+        );
 
         // The compiler's messages are printed with the first skip only.
         let said = Mutex::new(Vec::new());

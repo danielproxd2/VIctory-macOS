@@ -493,15 +493,14 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// slots come and go; a copy no slot views any more has none.
     #[test]
     fn hulls_follow_the_ranges() {
-        // The copy is a host buffer where there is a device.
-        let _gpu = crate::testing::serial();
+        // The copy is a host buffer, which takes a device.
+        let Some(_gpu) = crate::testing::gpu() else {
+            return;
+        };
         let memory = vec![0u8; 0x1000];
         let at = memory.as_ptr() as u64;
         crate::shadow::register(at as usize, at, 0x1000);
-        let Some(copy) = crate::shadow::find(at, 0x1000) else {
-            crate::shadow::unregister(at as usize, at);
-            return; // no host GPU here
-        };
+        let copy = crate::shadow::find(at, 0x1000).expect("a copy: the test holds the device");
         let viewed = Viewed::default();
         let set = |slot: u32, range: Option<(u64, u64)>| {
             let mut inner = viewed.inner.lock().unwrap();
@@ -604,9 +603,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// device tests' lock; it did not run (its "skipped" line says so)
     /// where the host's compiler cannot build the shader.
     fn rounds(test: &str, src: This, dst: This, tex: This, write: impl Fn(u32, u8)) {
-        let Some(host) = crate::host::host() else {
-            return; // no host GPU here
-        };
+        let host = crate::host::host().expect("a host device: the test holds it");
         let null = std::ptr::null();
         // A shader-visible view heap of 8 slots, in memory of its own.
         let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];

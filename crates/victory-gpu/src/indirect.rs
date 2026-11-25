@@ -278,9 +278,9 @@ mod tests {
     /// Clamps `records` records of `kind`, filled by repeating `words`,
     /// `calls` times in one list: each record's first word after (zero when
     /// it runs empty). One record more follows them and must stay as
-    /// written. `None` without a host GPU.
-    fn clamped(kind: u32, words: &[u32], records: u32, calls: u32) -> Option<Vec<u32>> {
-        let host = super::host()?;
+    /// written. For a test that holds the host device.
+    fn clamped(kind: u32, words: &[u32], records: u32, calls: u32) -> Vec<u32> {
+        let host = super::host().expect("a host device: the test holds it");
         // Words in a record of `kind`.
         let per = match kind {
             0 => 4,
@@ -309,7 +309,7 @@ mod tests {
                 assert_eq!(data.add(at).read_volatile(), words[at % words.len()]);
             }
             let first = |i: usize| data.add(i * per).read_volatile();
-            Some((0..records as usize).map(first).collect())
+            (0..records as usize).map(first).collect()
         }
     }
 
@@ -324,11 +324,9 @@ mod tests {
         if !clamp_for("indirect::rejected_records_do_not_wrap_the_budget") {
             return;
         }
-        let Some(draws) = clamped(0, &[u32::MAX], 128, 1) else {
-            return; // no host GPU here
-        };
+        let draws = clamped(0, &[u32::MAX], 128, 1);
         assert_eq!(draws.iter().filter(|&&count| count != 0).count(), 2);
-        let meshes = clamped(10, &[u32::MAX], 600, 1).unwrap();
+        let meshes = clamped(10, &[u32::MAX], 600, 1);
         assert_eq!(meshes.iter().filter(|&&groups| groups != 0).count(), 16);
     }
 
@@ -343,12 +341,10 @@ mod tests {
         if !clamp_for("indirect::the_budget_goes_to_the_first_records") {
             return;
         }
-        let Some(draws) = clamped(0, &[3 << 18, 1, 0, 0], 200, 1) else {
-            return; // no host GPU here
-        };
+        let draws = clamped(0, &[3 << 18, 1, 0, 0], 200, 1);
         assert!(draws[..170].iter().all(|&count| count != 0));
         assert!(draws[170..].iter().all(|&count| count == 0));
-        let small = clamped(0, &[1], 1 << 16, 1).unwrap();
+        let small = clamped(0, &[1], 1 << 16, 1);
         assert!(small.iter().all(|&count| count == 1));
     }
 
@@ -365,9 +361,7 @@ mod tests {
         }
         let mut words = [1 << 24, 3, 0, 0].repeat(3);
         words.extend([3, 1, 0, 0].repeat(6));
-        let Some(draws) = clamped(0, &words, 8, 1) else {
-            return; // no host GPU here
-        };
+        let draws = clamped(0, &words, 8, 1);
         let ran: Vec<bool> = draws.iter().map(|&count| count != 0).collect();
         assert_eq!(ran, [true, true, false, false, false, false, false, false]);
     }
@@ -382,9 +376,7 @@ mod tests {
         if !clamp_for("indirect::a_spent_budget_stays_spent") {
             return;
         }
-        let Some(twice) = clamped(1, &[u32::MAX], 64, 2) else {
-            return; // no host GPU here
-        };
+        let twice = clamped(1, &[u32::MAX], 64, 2);
         assert!(twice.iter().all(|&count| count == 0));
     }
 }

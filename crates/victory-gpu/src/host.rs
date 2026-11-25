@@ -416,16 +416,13 @@ mod tests {
         let _host = crate::testing::serial();
         // SAFETY: plain DXGI adapter queries.
         let raw = unsafe {
-            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
-            else {
-                crate::test_support::skipped("no host DXGI factory");
-                return;
-            };
-            factory.EnumWarpAdapter::<IDXGIAdapter>()
+            CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                .and_then(|factory| factory.EnumWarpAdapter::<IDXGIAdapter>())
         };
         let Ok(raw) = raw else {
-            // Not every host has one (a software adapter is optional).
-            crate::test_support::skipped("no WARP adapter");
+            // Not every host has one (a software adapter is optional, and
+            // D3DMetal has none; nor is there one without DXGI).
+            crate::test_support::no_warp("host::warp_adapter_accepts_only_software");
             return;
         };
         // SAFETY: EnumWarpAdapter returns a DXGI adapter, which implements
@@ -473,19 +470,37 @@ mod tests {
 
     /// The pointers of one list: the interface pointers it answers with
     /// are all there, and another list's are not.
+    ///
+    /// On a device of its own on the software adapter, as upstream runs
+    /// it. A host without that adapter (D3DMetal has none) runs it on the
+    /// host device instead: what is asserted is about a list's interface
+    /// pointers, whichever device made the list. Without either device it
+    /// did not run: the "skipped" line of a missing device, or a failure
+    /// with `VICTORY_REQUIRE_GPU=1`.
     #[test]
     fn a_list_knows_every_pointer_it_answers_with() {
-        // Its own device on the software adapter, but the host's D3D12 all
-        // the same: one device test at a time.
-        let _host = crate::testing::serial();
-        // SAFETY: plain device and list creation on the software adapter.
-        unsafe {
-            let Ok(adapter) = warp_adapter() else { return };
-            let mut device: Option<ID3D12Device> = None;
-            if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_err() {
-                return;
+        // The host's D3D12 on either device: one device test at a time.
+        let serial = crate::testing::serial();
+        // SAFETY: plain device creation on the software adapter.
+        let software = unsafe {
+            warp_adapter().ok().and_then(|adapter| {
+                let mut device: Option<ID3D12Device> = None;
+                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
+                device
+            })
+        };
+        let (_serial, device) = match software {
+            Some(device) => (serial, device),
+            None => {
+                drop(serial);
+                let Some((serial, host)) = crate::testing::gpu() else {
+                    return;
+                };
+                (serial, host.device.clone())
             }
-            let device = device.unwrap();
+        };
+        // SAFETY: plain list creation on that device.
+        unsafe {
             // An open list holds its allocator: one each.
             let make = || -> ID3D12GraphicsCommandList {
                 let allocator: ID3D12CommandAllocator = device
@@ -522,7 +537,7 @@ mod tests {
         let Some((_gpu, host)) = crate::testing::gpu() else {
             return;
         };
-        let Ok(list) = host.new_list() else { return };
+        let list = host.new_list().expect("a list: the test holds the device");
         let mut wide: Vec<u16> = list_name(list.id).encode_utf16().collect();
         wide.push(0);
         let mut node = D3D12_AUTO_BREADCRUMB_NODE::default();
@@ -3101,10 +3116,8 @@ mod batch {
         let p = crate::watch::tests::pool(4);
         let len = 4 * PAGE;
         crate::shadow::register(p, p as u64, len as u64);
-        let Some(copy) = crate::shadow::find(p as u64, len as u64) else {
-            crate::shadow::unregister(p, p as u64);
-            return; // no host GPU here
-        };
+        let copy =
+            crate::shadow::find(p as u64, len as u64).expect("a copy: the test holds the device");
         let mut batch = Batch::default();
         batch.add(&copy, p, len);
         assert_eq!(batch.flush(), len, "all of it at first");

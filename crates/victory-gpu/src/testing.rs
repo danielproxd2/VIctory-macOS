@@ -28,37 +28,27 @@ pub(crate) fn serial_with_device() -> (Serial, bool) {
     crate::test_support::serial_with_device()
 }
 
-/// The root signature and pipeline of the compute shader `source` (HLSL,
-/// entry point `main`, with its root signature inside), compiled for
-/// `test` by the system's compiler as shader model 5.1 with `flags`
-/// (`D3DCOMPILE_*`).
+/// The compute shader `source` (HLSL, entry point `main`, with its root
+/// signature inside) compiled for `test` by the system's compiler as shader
+/// model 5.1 with `flags` (`D3DCOMPILE_*`): the bytecode.
 ///
-/// Where that compiler cannot build the source (Wine's is vkd3d-shader's,
-/// which lacks parts of the language, and compiles other sources without
-/// their root signature), this is `None` after the line
+/// Under Wine that compiler is vkd3d-shader's, which lacks parts of the
+/// language and compiles other sources without their root signature. Where
+/// it cannot build the source this is `None` after the line
 /// `skipped: the host HLSL compiler cannot build this test shader
 /// (<test>)` and the compiler's messages, and the test returns: it did
-/// not run. With `VICTORY_REQUIRE_HLSL=1` it fails instead
-/// ([`crate::test_support::no_hlsl`]).
+/// not run. With `VICTORY_REQUIRE_HLSL=1` it fails instead.
 ///
 /// # Panics
 ///
-/// If the host refuses the compiled shader: that is the host's fault or
-/// the test's, not the compiler's.
+/// Where the process is not under Wine and the source does not compile:
+/// the compiler is Microsoft's, and that fails the test as it does
+/// upstream ([`crate::test_support::no_hlsl`]).
 #[cfg(windows)]
-pub(crate) fn compute_shader(
-    test: &str,
-    source: &str,
-    flags: u32,
-) -> Option<(
-    windows::Win32::Graphics::Direct3D12::ID3D12RootSignature,
-    windows::Win32::Graphics::Direct3D12::ID3D12PipelineState,
-)> {
+pub(crate) fn compiled(test: &str, source: &str, flags: u32) -> Option<Vec<u8>> {
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
     use windows::Win32::Graphics::Direct3D::ID3DBlob;
-    use windows::Win32::Graphics::Direct3D12::*;
     use windows::core::{PCSTR, s};
-    let host = crate::host::host().expect("a host device: the test holds it");
     // The messages name the source by the test.
     let name = std::ffi::CString::new(test).expect("a test name without NUL");
     let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
@@ -104,6 +94,29 @@ pub(crate) fn compute_shader(
         crate::test_support::no_hlsl(test, text);
         return None;
     }
+    Some(code)
+}
+
+/// The root signature and pipeline of the compute shader `source`,
+/// compiled for `test` as [`compiled`] compiles it: `None` where that is
+/// (the test did not run, and its "skipped" line says so).
+///
+/// # Panics
+///
+/// If the host refuses the compiled shader: that is the host's fault or
+/// the test's, not the compiler's.
+#[cfg(windows)]
+pub(crate) fn compute_shader(
+    test: &str,
+    source: &str,
+    flags: u32,
+) -> Option<(
+    windows::Win32::Graphics::Direct3D12::ID3D12RootSignature,
+    windows::Win32::Graphics::Direct3D12::ID3D12PipelineState,
+)> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let host = crate::host::host().expect("a host device: the test holds it");
+    let code = compiled(test, source, flags)?;
     // SAFETY: a compiled shader with its root signature inside; the bytes
     // live through both calls.
     unsafe {
