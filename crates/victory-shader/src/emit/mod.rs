@@ -923,11 +923,13 @@ mod tests {
     /// program header, and a hash over everything after it.
     #[test]
     fn emitted_containers_carry_the_parts_each_stage_needs() {
-        // A mesh program whose every lane exports a primitive with all
-        // indices 0: enough to be a mesh shader.
+        // A mesh program whose every lane exports a vertex at the origin
+        // (all four channels of the position its signature declares) and
+        // a primitive with all indices 0: enough to be a mesh shader.
         let mesh = {
             let words = [
                 asm::vop1("v_mov_b32", 0, asm::imm(0)),
+                asm::exp(asm::target::POS0, 0xF, [0; 4], asm::ExpFlags::default()),
                 asm::exp(
                     asm::target::PRIM,
                     1,
@@ -1011,6 +1013,199 @@ mod tests {
             assert_eq!(&dxil[8..12], b"DXIL");
             assert_eq!(u32_at(dxil, 20) as usize, dxil.len() - 24);
             assert_eq!(&dxil[24..28], b"BC\xC0\xDE");
+        }
+    }
+
+    /// The containers of the two tests below: a vertex, pixel or mesh
+    /// program that moves 0 into v0 and exports it to each of `exports`
+    /// (target, channel enables), the last one `done`.
+    fn exporting(stage: HwStage, exports: &[(u8, u8)], osg1: &[testkit::Element]) -> Vec<u8> {
+        let mut words = asm::vop1("v_mov_b32", 0, asm::imm(0));
+        for (n, &(target, en)) in exports.iter().enumerate() {
+            let flags = asm::ExpFlags {
+                done: n + 1 == exports.len(),
+                vm: stage == HwStage::Ps,
+                ..asm::ExpFlags::default()
+            };
+            words.extend(asm::exp(target, en, [0; 4], flags));
+        }
+        words.push(asm::S_ENDPGM);
+        if stage != HwStage::Ms {
+            return testkit::console_container(stage, &words, &[], osg1);
+        }
+        let program = NativeProgram {
+            wave64: false,
+            vgprs: 8,
+            io: StageIo::Ms(crate::native::MeshIo {
+                outputs: vec![],
+                clip_cntl: 0,
+                threads: 32,
+                max_vertices: 24,
+                max_primitives: 16,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            ..testkit::bare_program(HwStage::Ms, &asm::bytes(&words))
+        };
+        testkit::container(&program, &[], osg1)
+    }
+
+    /// A signature row for the two tests below: `system_value` is the
+    /// `D3D_NAME`, `component` 1 for uint and 3 for float.
+    fn row(
+        name: &'static str,
+        system_value: u32,
+        component: u32,
+        register: u32,
+        mask: u8,
+    ) -> testkit::Element {
+        testkit::Element {
+            name,
+            index: 0,
+            system_value,
+            component,
+            register,
+            mask,
+        }
+    }
+
+    /// dxil.dll 1.9.2609 rejects a module that declares a system-value
+    /// output and has no store for each of its channels ("Not all elements
+    /// of output SV_Position were written."), and D3D12 does not say what
+    /// such an output holds. A console program that leaves one unwritten,
+    /// or writes part of it, is refused with an error instead of becoming
+    /// a module the validator would reject.
+    #[test]
+    fn a_system_value_output_not_written_in_full_is_refused() {
+        use asm::target::{MRT0, POS0, PRIM};
+        use testkit::{SV_POSITION, SV_TARGET};
+        const NONE: u32 = u32::MAX;
+        let cases: [(&str, Vec<u8>); 9] = [
+            (
+                "a position without w",
+                exporting(HwStage::Vs, &[(POS0, 0x7)], &[SV_POSITION]),
+            ),
+            (
+                "clip distances never exported",
+                exporting(
+                    HwStage::Vs,
+                    &[(POS0, 0xF)],
+                    &[SV_POSITION, row("SV_ClipDistance", 2, 3, 1, 0x3)],
+                ),
+            ),
+            (
+                "one of two clip distances",
+                exporting(
+                    HwStage::Vs,
+                    &[(POS0 + 1, 0x1), (POS0, 0xF)],
+                    &[SV_POSITION, row("SV_ClipDistance", 2, 3, 1, 0x3)],
+                ),
+            ),
+            (
+                "cull distances never exported",
+                exporting(
+                    HwStage::Vs,
+                    &[(POS0, 0xF)],
+                    &[SV_POSITION, row("SV_CullDistance", 3, 3, 1, 0x3)],
+                ),
+            ),
+            // No export of the translator writes these two.
+            (
+                "a render-target index",
+                exporting(
+                    HwStage::Vs,
+                    &[(POS0, 0xF)],
+                    &[SV_POSITION, row("SV_RenderTargetArrayIndex", 4, 1, 1, 0x1)],
+                ),
+            ),
+            (
+                "a viewport index",
+                exporting(
+                    HwStage::Vs,
+                    &[(POS0, 0xF)],
+                    &[SV_POSITION, row("SV_ViewportArrayIndex", 5, 1, 1, 0x1)],
+                ),
+            ),
+            (
+                "a depth never exported",
+                exporting(
+                    HwStage::Ps,
+                    &[(MRT0, 0xF)],
+                    &[SV_TARGET, row("SV_Depth", 65, 3, NONE, 0x1)],
+                ),
+            ),
+            (
+                "a coverage never exported",
+                exporting(
+                    HwStage::Ps,
+                    &[(MRT0, 0xF)],
+                    &[SV_TARGET, row("SV_Coverage", 66, 1, NONE, 0x1)],
+                ),
+            ),
+            (
+                "a mesh program without vertex exports",
+                exporting(HwStage::Ms, &[(PRIM, 0x1)], &[SV_POSITION]),
+            ),
+        ];
+        for (name, container) in cases {
+            match translate(&container) {
+                Err(ShaderError::Unsupported { what, .. }) => {
+                    assert_eq!(what, lower::UNWRITTEN_OUTPUT, "{name}")
+                }
+                Err(other) => panic!("{name}: {other:?}"),
+                Ok(_) => panic!("{name}: translated"),
+            }
+        }
+    }
+
+    /// What the refusal above leaves alone: user semantics and render
+    /// targets the program writes in part or not at all still translate,
+    /// and the validator accepts the modules (the signature says which
+    /// channels are never written).
+    #[test]
+    fn user_and_target_outputs_may_stay_unwritten() {
+        use asm::target::{MRT0, POS0, PRIM};
+        use testkit::{SV_POSITION, SV_TARGET};
+        let texcoord = row("TEXCOORD", 0, 3, 1, 0xF);
+        let target1 = testkit::Element {
+            index: 1,
+            register: 1,
+            ..SV_TARGET
+        };
+        let cases: [(&str, Vec<u8>); 4] = [
+            (
+                "a parameter never exported",
+                exporting(HwStage::Vs, &[(POS0, 0xF)], &[SV_POSITION, texcoord]),
+            ),
+            (
+                "a target without alpha",
+                exporting(HwStage::Ps, &[(MRT0, 0x7)], &[SV_TARGET]),
+            ),
+            (
+                "a second target never exported",
+                exporting(HwStage::Ps, &[(MRT0, 0xF)], &[SV_TARGET, target1]),
+            ),
+            (
+                "a mesh parameter never exported",
+                exporting(
+                    HwStage::Ms,
+                    &[(POS0, 0xF), (PRIM, 0x1)],
+                    &[SV_POSITION, texcoord],
+                ),
+            ),
+        ];
+        for (name, container) in cases {
+            let out = translated(&container);
+            let host = Container::parse(&out.dxil).unwrap();
+            // Each 32-byte row: the mask at 24, the never-writes mask
+            // after it. Some declared channel is marked never written.
+            let osg1 = host.part(FourCC::OSG1).unwrap().data;
+            let rows = u32::from_le_bytes(osg1[0..4].try_into().unwrap()) as usize;
+            let unwritten = (0..rows).any(|r| {
+                let at = 8 + 32 * r;
+                osg1[at + 24] & osg1[at + 25] != 0
+            });
+            assert!(unwritten, "{name}: no channel marked never written");
         }
     }
 

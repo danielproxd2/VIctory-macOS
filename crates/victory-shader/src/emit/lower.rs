@@ -338,6 +338,26 @@ fn half_outputs(io: &StageIo, outputs: &[SigElement]) -> HashMap<u8, (bool, Opti
         .collect()
 }
 
+/// What a program stops with that leaves part of a system-value output
+/// unwritten.
+pub(super) const UNWRITTEN_OUTPUT: Why = "a system-value output the program does not write in full";
+
+/// Whether the stores lowered for the output `e` (its `usage`, one bit per
+/// channel stored) are enough for a valid module. The DXIL validator
+/// insists that some store writes every channel of each system-value
+/// output of a vertex, pixel or mesh-vertex signature ("Not all elements
+/// of output SV_Position were written"), except `SV_Target`; user
+/// semantics and render targets may be written in part or not at all (the
+/// signature then says which channels are never written). Measured with
+/// dxil.dll 1.9.2609 for `SV_Position`, the clip and cull distances, the
+/// render-target and viewport indices, the three depths, `SV_Coverage` and
+/// `SV_StencilRef`. What the console does with a system value its program
+/// does not export is not known, so such a program is refused rather than
+/// given a value.
+fn written_enough(e: &SigElement) -> bool {
+    matches!(e.kind, 0 | 16) || e.usage == (1 << e.cols) - 1
+}
+
 fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
@@ -897,6 +917,9 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        if self.s.outputs.iter().any(|e| !written_enough(e)) {
+            return Err(unsupported(0, UNWRITTEN_OUTPUT));
+        }
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
