@@ -632,7 +632,7 @@ pub fn XAsyncBegin(
     if let Some(hr) = call.op(OP_BEGIN, block, 0, std::ptr::null_mut())
         && hr < 0
     {
-        XAsyncComplete(block, hr, 0);
+        complete(&call, block, hr, 0);
     }
     S_OK
 }
@@ -651,8 +651,11 @@ pub fn XAsyncSchedule(block: *mut AsyncBlock, delay_ms: u32) -> HRESULT {
                 None => return,
             }
         };
+        // This call, not whichever one is on the block by now: a provider
+        // that completed inside `DoWork` has ended it, and the title may
+        // have begun another on the same block since.
         if hr != E_PENDING {
-            XAsyncComplete(block, hr, 0);
+            complete(&call, block, hr, 0);
         }
     }
     if block.is_null() || call(block).is_none() {
@@ -667,21 +670,41 @@ pub fn XAsyncSchedule(block: *mut AsyncBlock, delay_ms: u32) -> HRESULT {
 }
 
 /// Records the result (the first one wins), wakes waiters and queues the
-/// completion routine on the block's completion port.
+/// completion routine on the block's completion port. A title's provider
+/// names its call by the block, which is all it has.
 pub fn XAsyncComplete(block: *mut AsyncBlock, result: HRESULT, required_size: usize) {
-    extern "system" fn complete(block: *mut c_void, _canceled: bool) {
+    if let Some(call) = call(block) {
+        complete(&call, block, result, required_size);
+    }
+}
+
+/// [`XAsyncComplete`] of `call`, which was begun on `block`. Our own
+/// completions come through here with the call they mean: one that follows
+/// a provider operation may arrive when that call is over and the title
+/// has begun a new one on the same block, which it must not touch. A call
+/// that is over is recognised without reading the block, which the title
+/// may have freed.
+fn complete(call: &Arc<Call>, block: *mut AsyncBlock, result: HRESULT, required_size: usize) {
+    extern "system" fn run_routine(block: *mut c_void, _canceled: bool) {
         let block = block.cast::<AsyncBlock>();
         // SAFETY: read before the status was published; see below.
         if let Some(routine) = unsafe { (*block).callback } {
             routine(block);
         }
     }
-    let Some(call) = call(block) else { return };
     if result == E_PENDING {
         return;
     }
     let mut done = lock(&call.done);
     if *done {
+        return;
+    }
+    // Not done, so still the block's call; checked all the same, since
+    // everything below writes to the block.
+    let current = lock(&CALLS)
+        .get(&(block as usize))
+        .is_some_and(|c| Arc::ptr_eq(c, call));
+    if !current {
         return;
     }
     // Read before publishing: once the status is set, the title may free
@@ -711,7 +734,7 @@ pub fn XAsyncComplete(block: *mut AsyncBlock, result: HRESULT, required_size: us
     call.finished.notify_all();
     drop(done);
     if routine.is_some() {
-        let task = Task::new(block.cast(), complete);
+        let task = Task::new(block.cast(), run_routine);
         match queue(handle) {
             Some(queue) if queue.submit(COMPLETION, 0, task) == S_OK => {}
             _ => task.run(true),
@@ -755,9 +778,12 @@ pub fn XAsyncCancel(block: *mut AsyncBlock) {
 /// [`XAsyncCancel`] of a call found in the table a moment ago. It may have
 /// completed on another thread since, and its provider cleaned up: then
 /// there is nothing left to cancel, and the provider is not asked.
-fn cancel(call: &Call, block: *mut AsyncBlock) {
+fn cancel(call: &Arc<Call>, block: *mut AsyncBlock) {
+    // The provider may have completed the call inside its cancel, or
+    // another thread while it was there, and the title begun a new one on
+    // the block: the `E_ABORT` is for this call only.
     if call.op(OP_CANCEL, block, 0, std::ptr::null_mut()).is_some() {
-        XAsyncComplete(block, E_ABORT, 0);
+        complete(call, block, E_ABORT, 0);
     }
 }
 
@@ -876,21 +902,28 @@ pub fn pending_with(
         Vec<u8>,
     )>;
     extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
-        // SAFETY: the runtime passes valid provider data; the context is the
-        // boxed state until cleanup frees it.
+        // SAFETY: the runtime passes valid provider data; the context is a
+        // reference to the shared state until cleanup gives it up.
         let data = unsafe { &*data };
-        let state = data.context.cast::<Data>();
+        let state = data.context.cast::<Data>().cast_const();
         match op {
-            // SAFETY: boxed in `pending_with`; nothing runs after cleanup.
-            OP_CLEANUP => drop(unsafe { Box::from_raw(state) }),
+            // SAFETY: the reference made in `pending_with`; nothing runs
+            // after cleanup.
+            OP_CLEANUP => drop(unsafe { Arc::from_raw(state) }),
             OP_BEGIN => {
-                // SAFETY: as above; cleanup waits for completion.
-                let work = unsafe { &*state }
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .0
-                    .take();
-                let (block, state) = (data.block as usize, state as usize);
+                // The worker shares the state and names its call: a cancel
+                // ends the call and cleans up while the work is still under
+                // way, and the title may begin a new call on the block
+                // before the work returns.
+                // SAFETY: as above; a second reference for the worker.
+                let state = unsafe {
+                    Arc::increment_strong_count(state);
+                    Arc::from_raw(state)
+                };
+                let work = lock(&state).0.take();
+                // `XAsyncBegin` is still in this call, so it is the block's.
+                let call = call(data.block);
+                let block = data.block as usize;
                 std::thread::spawn(move || {
                     let result = work.map_or(Err(E_ABORT), |work| work());
                     let (hr, len) = match &result {
@@ -898,16 +931,18 @@ pub fn pending_with(
                         Err(hr) => (*hr, 0),
                     };
                     if let Ok(bytes) = result {
-                        // SAFETY: the call is pending, so its state lives.
-                        let state = unsafe { &*(state as *const Data) };
-                        state.lock().unwrap_or_else(|e| e.into_inner()).1 = bytes;
+                        lock(&state).1 = bytes;
                     }
-                    XAsyncComplete(block as *mut AsyncBlock, hr, len);
+                    if let Some(call) = call {
+                        complete(&call, block as *mut AsyncBlock, hr, len);
+                        #[cfg(test)]
+                        lock(&WORKERS_RETURNED).push(call.identity);
+                    }
                 });
             }
             // SAFETY: as above; the runtime checked the buffer's size.
             OP_GET_RESULT => unsafe {
-                let state = (*state).lock().unwrap_or_else(|e| e.into_inner());
+                let state = lock(&*state);
                 data.buffer
                     .cast::<u8>()
                     .copy_from(state.1.as_ptr(), state.1.len());
@@ -916,8 +951,8 @@ pub fn pending_with(
         }
         S_OK
     }
-    let state: Box<Data> = Box::new(Mutex::new((Some(Box::new(work)), Vec::new())));
-    let context = Box::into_raw(state);
+    let state: Arc<Data> = Arc::new(Mutex::new((Some(Box::new(work)), Vec::new())));
+    let context = Arc::into_raw(state).cast_mut();
     let hr = XAsyncBegin(
         block,
         context.cast(),
@@ -927,10 +962,15 @@ pub fn pending_with(
     );
     if hr < 0 {
         // SAFETY: refused before the call existed; still ours.
-        drop(unsafe { Box::from_raw(context) });
+        drop(unsafe { Arc::from_raw(context) });
     }
     hr
 }
+
+/// The identities of the calls whose [`pending_with`] worker has returned
+/// and made its completion, for tests that must wait for one.
+#[cfg(test)]
+static WORKERS_RETURNED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 /// The result of a call begun with [`finished_with`] for `identity`, as a
 /// `T` written through `out`.
@@ -1533,6 +1573,126 @@ mod tests {
         assert_eq!(seen.ops(), ["begin", "work", "cleanup", "work done"]);
         assert_eq!(XAsyncGetStatus(&mut block, true), E_NOTIMPL);
         XTaskQueueCloseHandle(q);
+    }
+
+    /// A provider that ends its call inside `DoWork` or `Cancel`, where
+    /// the title, seeing the final status, at once begins the next call on
+    /// the same block.
+    struct Reused {
+        next: Seen,
+    }
+
+    extern "system" fn reusing(op: u32, data: *const ProviderData) -> HRESULT {
+        // SAFETY: the context is the test's `Reused`, which outlives both
+        // calls; the block is the test's.
+        let (reused, block) = unsafe { (&*(*data).context.cast::<Reused>(), (*data).block) };
+        if op == OP_DO_WORK || op == OP_CANCEL {
+            XAsyncComplete(block, E_NOTIMPL, 0);
+            // SAFETY: as above.
+            begin_noting(unsafe { &mut *block }, &reused.next);
+        }
+        S_OK
+    }
+
+    fn begin_reusing(block: &mut AsyncBlock, reused: &Reused) {
+        let context = std::ptr::from_ref(reused).cast_mut().cast();
+        let (identity, name) = (std::ptr::null(), std::ptr::null());
+        assert_eq!(
+            XAsyncBegin(block, context, identity, name, Some(reusing)),
+            S_OK
+        );
+    }
+
+    /// The next call on the block is untouched: pending, its provider not
+    /// cleaned up. Then ends it.
+    fn assert_next_call_is_pending(block: &mut AsyncBlock, next: &Seen) {
+        let status = XAsyncGetStatus(block, false);
+        let mut size = 7;
+        let sized = XAsyncGetResultSize(block, &mut size);
+        assert_eq!((status, sized, size), (E_PENDING, E_PENDING, 7));
+        assert_eq!(next.ops(), ["begin"]);
+        XAsyncComplete(block, E_INVALIDARG, 0);
+        assert_eq!(XAsyncGetStatus(block, false), E_INVALIDARG);
+        assert_eq!(next.ops(), ["begin", "cleanup"]);
+    }
+
+    /// A provider that completes inside `DoWork` and returns anything but
+    /// `E_PENDING` has its return value completed too, as the call's
+    /// result if it had none. That second completion is for the call the
+    /// work belonged to: it once went to whichever call was on the block
+    /// by then, and ended the title's next call with size 0.
+    #[test]
+    fn work_that_returns_late_does_not_complete_the_next_call() {
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(0, 0, &mut q), S_OK);
+        let reused = Reused {
+            next: Seen::default(),
+        };
+        let mut block = manual_block(q);
+        begin_reusing(&mut block, &reused);
+        assert_eq!(XAsyncSchedule(&mut block, 0), S_OK);
+        assert!(XTaskQueueDispatch(q, WORK, 0));
+        assert_next_call_is_pending(&mut block, &reused.next);
+        XTaskQueueCloseHandle(q);
+    }
+
+    /// The same for the `E_ABORT` that follows the provider's `Cancel`.
+    #[test]
+    fn a_cancel_that_returns_late_does_not_abort_the_next_call() {
+        let reused = Reused {
+            next: Seen::default(),
+        };
+        let mut block = manual_block(std::ptr::null());
+        begin_reusing(&mut block, &reused);
+        XAsyncCancel(&mut block);
+        assert_next_call_is_pending(&mut block, &reused.next);
+    }
+
+    /// And for the worker of `pending_with` (a dialog, say): the title
+    /// cancels the call, which ends it and frees the provider's context,
+    /// and begins the next one before the work returns. The worker's
+    /// result then belongs to no call.
+    #[test]
+    fn a_worker_that_returns_late_does_not_complete_the_next_call() {
+        static IDENTITY: u8 = 0;
+        let identity = (&raw const IDENTITY).cast::<c_void>();
+        let (release, go_on) = std::sync::mpsc::channel::<()>();
+        let mut block = manual_block(std::ptr::null());
+        let work = move || {
+            let _ = go_on.recv_timeout(Duration::from_secs(30));
+            Ok(vec![1, 2, 3, 4])
+        };
+        assert_eq!(pending_with(&mut block, identity, work), S_OK);
+        assert_eq!(XAsyncGetStatus(&mut block, false), E_PENDING);
+        XAsyncCancel(&mut block);
+        assert_eq!(XAsyncGetStatus(&mut block, false), E_ABORT);
+
+        let next = Seen::default();
+        begin_noting(&mut block, &next);
+        release.send(()).unwrap();
+        let returned = || lock(&WORKERS_RETURNED).contains(&(identity as usize));
+        let start = std::time::Instant::now();
+        while !returned() && start.elapsed() < Duration::from_secs(30) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(returned(), "the worker made its completion");
+        assert_next_call_is_pending(&mut block, &next);
+    }
+
+    /// A `pending_with` call that runs its course hands out the worker's
+    /// bytes.
+    #[test]
+    fn a_worker_result_is_handed_out() {
+        static IDENTITY: u8 = 0;
+        let identity = (&raw const IDENTITY).cast::<c_void>();
+        let mut block = manual_block(std::ptr::null());
+        let work = || Ok(vec![9, 8, 7, 6]);
+        assert_eq!(pending_with(&mut block, identity, work), S_OK);
+        assert_eq!(XAsyncGetStatus(&mut block, true), S_OK);
+        let mut value = [0u8; 4];
+        assert_eq!(result(&mut block, identity, &mut value), S_OK);
+        assert_eq!(value, [9, 8, 7, 6]);
+        assert!(call(&mut block).is_none(), "the call ends with its result");
     }
 
     #[test]
