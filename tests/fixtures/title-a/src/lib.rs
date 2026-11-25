@@ -1,7 +1,8 @@
 //! A DLL a stand-in title ships (`title_a.dll`), written by us. It exports a
 //! function by name, a function by ordinal only and a data symbol, and its
 //! `DllMain` writes every notice it gets to the file `VICTORY_FIXTURE_LOG`
-//! names.
+//! names. With `VICTORY_FIXTURE_STUCK` set, it does not return from the
+//! notice that the process ends.
 
 use std::ffi::c_void;
 use std::io::Write;
@@ -39,8 +40,18 @@ std::arch::global_asm!(
 #[unsafe(no_mangle)]
 pub extern "system" fn DllMain(_: *mut c_void, reason: u32, _: *mut c_void) -> i32 {
     log("title_a", reason);
+    // Told to, it never comes back from the notice of the process's end,
+    // as detach code does that waits for a lock a thread held when it was
+    // ended.
+    if reason == DLL_PROCESS_DETACH && std::env::var_os("VICTORY_FIXTURE_STUCK").is_some() {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
     1
 }
+
+const DLL_PROCESS_DETACH: u32 = 0;
 
 /// Appends "<name> <reason>" to the file `VICTORY_FIXTURE_LOG` names.
 fn log(name: &str, reason: u32) {
