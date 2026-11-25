@@ -355,10 +355,13 @@ mod tests {
         let prepared = prepare(&original).unwrap();
         assert!(!prepared.info.is_dll(), "info describes the original");
         assert!(prepared.info.import_count() > 0);
-        if let Some(tls) = &prepared.info.tls
-            && tls.callbacks_va != 0
-            && prepared.info.has_relocations
-        {
+        // A Rust test binary for Windows has static TLS with callbacks (the
+        // standard library's thread-local destructors) and relocations; said
+        // first, so that the check below cannot be skipped in silence.
+        let tls = prepared.info.tls.as_ref();
+        let relocated_callbacks = tls.map(|t| (t.callbacks_va != 0, prepared.info.has_relocations));
+        assert_eq!(relocated_callbacks, Some((true, true)));
+        if let Some(tls) = tls {
             let field = tls.directory_rva + layout::TLS64_ADDRESS_OF_CALLBACKS as u32;
             let on_field = dir64_relocations(&original, &prepared.info)
                 .iter()
