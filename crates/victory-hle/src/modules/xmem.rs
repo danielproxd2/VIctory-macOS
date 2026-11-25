@@ -20,7 +20,7 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER,
-    MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
+    MEM_PRESERVE_PLACEHOLDER, MEM_PRIVATE, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
     MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
     MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, SEC_COMMIT,
     SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQueryEx,
@@ -147,7 +147,52 @@ pub extern "system" fn XMemVirtualAlloc(
             "XMemVirtualAlloc"
         );
     }
+    if !at.is_null() && kind & MEM_RESERVE != 0 {
+        remember(at as usize, size, flags);
+    }
     at
+}
+
+/// The regions `XMemVirtualAlloc` reserved, by base: their size and the
+/// XMem flags the title gave, which `XMemVirtualQuery` gives back.
+// shortcut: the title frees these with the host's `VirtualFree`, which we do
+// not see, so a region is forgotten only when its range is handed out here
+// again; `XMemVirtualQuery` checks what it can (see `flags_of`).
+static REGIONS: Mutex<BTreeMap<usize, (usize, u64)>> = Mutex::new(BTreeMap::new());
+
+fn regions() -> MutexGuard<'static, BTreeMap<usize, (usize, u64)>> {
+    REGIONS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Records the flags of the region the host just reserved at `at`.
+fn remember(at: usize, size: usize, flags: u64) {
+    let mut regions = regions();
+    // The host gave this range out, so whatever was recorded in it is gone.
+    let end = at.saturating_add(size);
+    let stale: Vec<usize> = regions
+        .range(..end)
+        .rev()
+        .take_while(|(base, (size, _))| base.saturating_add(*size) > at)
+        .map(|(base, _)| *base)
+        .collect();
+    for base in stale {
+        regions.remove(&base);
+    }
+    regions.insert(at, (size, flags));
+}
+
+fn forget(at: usize) {
+    regions().remove(&at);
+}
+
+/// The flags the region holding `address` was reserved with, if it is one
+/// of ours and still what we reserved: private memory (a view of physical
+/// pages mapped into it is not) of the allocation that starts at our base.
+fn flags_of(address: usize, host: &MEMORY_BASIC_INFORMATION) -> Option<u64> {
+    let base = host.AllocationBase as usize;
+    let regions = regions();
+    let (size, flags) = regions.get(&base)?;
+    (host.Type == MEM_PRIVATE && address.checked_sub(base)? < *size).then_some(*flags)
 }
 
 /// `MEMORY_BASIC_INFORMATION` (the console's first 0x30 bytes are the
@@ -160,10 +205,13 @@ pub struct BasicInformation {
     tag: [u8; 4],
 }
 
-// shortcut: every committed page reports graphics memory and no tag, since
-// all of it is GPU-reachable here (Grand Theft Auto VI's BVH builder, the
-// only caller, wants graphics memory); remember the flags of
-// `XMemVirtualAlloc` regions if a title tells CPU-only memory apart.
+/// Committed memory of a region `XMemVirtualAlloc` reserved reports the
+/// flags that call was given.
+// shortcut: every other committed page (the host's heaps, mapped physical
+// pages, memory of `VirtualAlloc`) reports graphics memory, since all of it
+// is GPU-reachable here (Grand Theft Auto VI's BVH builder wants graphics
+// memory), and no page has a tag; what the console answers for such memory
+// is not known here.
 pub extern "system" fn XMemVirtualQuery(
     process: HANDLE,
     address: *const c_void,
@@ -182,7 +230,7 @@ pub extern "system" fn XMemVirtualQuery(
         }
         let info = &mut *out;
         info.flags = if info.host.State == MEM_COMMIT {
-            GRAPHICS
+            flags_of(address as usize, &info.host).unwrap_or(GRAPHICS)
         } else {
             0
         };
@@ -307,7 +355,9 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
-            VirtualFree(address, 0, MEM_RELEASE);
+            if VirtualFree(address, 0, MEM_RELEASE) != 0 {
+                forget(address as usize);
+            }
             return;
         }
         let user = address.cast::<u8>();
@@ -1057,6 +1107,117 @@ mod tests {
         assert!((p as usize) + (16 << 30) <= 1 << 40, "{p:p}");
         // SAFETY: our own reservation.
         assert_ne!(unsafe { VirtualFree(p, 0, MEM_RELEASE) }, 0);
+    }
+
+    #[test]
+    fn query_reports_the_flags_it_was_given() {
+        // Whatever the title said of a region is what it reads back, bit
+        // for bit: no flags, a memory type alone, an address field, bits
+        // we give no meaning.
+        let given = [0, 1, GRAPHICS, GRAPHICS | 7 << 12, 2 | 5 << 12 | 1 << 20];
+        let regions = given.map(|flags| {
+            let p = XMemVirtualAlloc(
+                std::ptr::null_mut(),
+                2 * PAGE,
+                MEM_RESERVE | MEM_COMMIT,
+                flags,
+                PAGE_READWRITE,
+            );
+            assert!(!p.is_null(), "{flags:#x}");
+            p
+        });
+        for (p, flags) in regions.into_iter().zip(given) {
+            let last = p.wrapping_byte_add(2 * PAGE - 1);
+            for at in [p, p.wrapping_byte_add(PAGE), last] {
+                let info = query(at);
+                assert_eq!(info.host.State, MEM_COMMIT);
+                assert_eq!(info.flags, flags, "{at:p}");
+                assert_eq!((info.tag_code, info.tag), (0, [0; 4]));
+            }
+        }
+        // A region reserved and committed later, at its own address.
+        let flags = 1 | 6 << 12;
+        let p = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            4 * PAGE,
+            MEM_RESERVE,
+            flags,
+            PAGE_READWRITE,
+        );
+        assert!(!p.is_null());
+        assert_eq!(query(p).flags, 0, "reserved only");
+        let second = p.wrapping_byte_add(PAGE);
+        // The commit's own flags do not rename the region.
+        assert_eq!(
+            XMemVirtualAlloc(second, PAGE, MEM_COMMIT, GRAPHICS, PAGE_READWRITE),
+            second
+        );
+        assert_eq!(query(second).flags, flags);
+        assert_eq!(query(p).flags, 0, "still reserved only");
+        // Freed, the addresses answer for no memory; the same range handed
+        // out again answers with its new flags.
+        for q in regions.into_iter().chain([p]) {
+            // SAFETY: our own reservations.
+            assert_ne!(unsafe { VirtualFree(q, 0, MEM_RELEASE) }, 0);
+            assert_eq!(query(q).flags, 0);
+        }
+        // Other tests reserve meanwhile, so the address may be taken.
+        let again = XMemVirtualAlloc(p, 4 * PAGE, MEM_RESERVE | MEM_COMMIT, 2, PAGE_READWRITE);
+        if again == p {
+            assert_eq!(query(second).flags, 2);
+            // SAFETY: our own reservation.
+            assert_ne!(unsafe { VirtualFree(p, 0, MEM_RELEASE) }, 0);
+        } else {
+            assert!(again.is_null(), "a fixed base is that base or nothing");
+        }
+    }
+
+    /// Pins what `XMemVirtualQuery` answers today for memory that did not
+    /// come from `XMemVirtualAlloc`. This is our shortcut, not known console
+    /// behaviour: change the test with the shortcut.
+    #[test]
+    fn other_committed_memory_reports_graphics_and_no_tag_today() {
+        // The host's own allocation.
+        // SAFETY: a plain reservation of ours.
+        let host = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                PAGE,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!host.is_null());
+        // A block of the default allocator (the host's heap).
+        let block = XMemAllocDefault(100, 0);
+        assert!(!block.is_null());
+        // Physical pages mapped at the start of a reservation whose flags
+        // say something else: the view is not the reservation's memory.
+        let pages = allocate(1);
+        let reserved = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            PAGE,
+            MEM_RESERVE | PAGES_64K,
+            1,
+            PAGE_READWRITE,
+        );
+        assert!(!reserved.is_null());
+        assert_eq!(query(reserved).flags, 0, "a placeholder is not committed");
+        assert_eq!(XMemMapPhysicalPages(reserved, 1, pages.as_ptr()), reserved);
+        for at in [host, block, reserved] {
+            let info = query(at);
+            assert_eq!(info.host.State, MEM_COMMIT, "{at:p}");
+            assert_eq!(info.flags, GRAPHICS, "{at:p}");
+            assert_eq!((info.tag_code, info.tag), (0, [0; 4]), "{at:p}");
+        }
+        assert_eq!(
+            XMemMapPhysicalPages(reserved, 1, std::ptr::null()),
+            reserved
+        );
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
+        XMemFreeDefault(block, 0);
+        // SAFETY: our own reservation.
+        assert_ne!(unsafe { VirtualFree(host, 0, MEM_RELEASE) }, 0);
     }
 
     #[test]
