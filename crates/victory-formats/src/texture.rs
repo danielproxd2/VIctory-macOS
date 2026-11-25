@@ -249,6 +249,18 @@ fn spread(bits: &[u32]) -> Vec<u32> {
 
 const MAX_MIPS: u32 = 16;
 
+/// The number of mips that takes the largest side down to one texel: the
+/// most a description may ask for (D3D12's rule for `MipLevels`). An array
+/// size is not a side; a 3D texture's depth is.
+fn full_chain(dimension: Dimension, width: u32, height: u32, depth: u32) -> u32 {
+    let depth = if dimension == Dimension::Tex3d {
+        depth
+    } else {
+        1
+    };
+    32 - width.max(height).max(depth).max(1).leading_zeros()
+}
+
 /// The largest width, height and depth (or array size) accepted, in texels.
 /// GFX10's image descriptors hold at most 16384 texels per side, so no
 /// texture the GPU can use is refused. The bound also keeps every size
@@ -269,6 +281,7 @@ impl Layout {
             && (1..=MAX_EXTENT).contains(&d.height)
             && (1..=MAX_EXTENT).contains(&d.depth)
             && (1..=MAX_MIPS).contains(&d.mips)
+            && d.mips <= full_chain(d.dimension, d.width, d.height, d.depth)
             && d.element_bytes.is_power_of_two()
             && d.element_bytes <= 16
             && matches!(d.block, 1 | 4)
@@ -726,8 +739,10 @@ pub struct Format {
     pub stencil: bool,
 }
 
-/// By DXGI format number. `None` for 96-bit, 1-bit, packed 4:2:2 and video
-/// formats.
+/// By DXGI format number. `None` for 0 (unknown), 5..=8 (96-bit), 66
+/// (1-bit), 68 and 69 (packed 4:2:2), 100..=114 (video and palette
+/// formats) and everything from 121 on (unassigned numbers, more video
+/// formats and whatever came later).
 ///
 /// shortcut: those formats have no layout here; add them when a title uses
 /// one.
@@ -795,20 +810,8 @@ pub struct Texture {
 impl Texture {
     pub fn new(desc: &TextureDesc) -> Result<Texture, Error> {
         let f = format(desc.format).ok_or(Error::Invalid)?;
-        let depth3d = if desc.dimension == Dimension::Tex3d {
-            desc.depth_or_array
-        } else {
-            1
-        };
         let mips = match desc.mips {
-            0 => {
-                32 - desc
-                    .width
-                    .max(desc.height)
-                    .max(depth3d)
-                    .max(1)
-                    .leading_zeros()
-            }
+            0 => full_chain(desc.dimension, desc.width, desc.height, desc.depth_or_array),
             n => n,
         };
         let plane = |bytes| Desc {
@@ -997,12 +1000,15 @@ mod tests {
                 }
                 for (w, h) in sizes.into_iter().flat_map(|w| sizes.map(|h| (w, h))) {
                     for (bytes, block) in [(1, 1), (4, 1), (16, 1), (8, 4), (16, 4)] {
+                        let height = if dimension == Dimension::Tex1d { 1 } else { h };
+                        let depth = if dimension == Dimension::Tex1d { 1 } else { 3 };
                         let d = Desc {
                             dimension,
                             width: w,
-                            height: if dimension == Dimension::Tex1d { 1 } else { h },
-                            depth: if dimension == Dimension::Tex1d { 1 } else { 3 },
-                            mips: 7,
+                            height,
+                            depth,
+                            // The whole chain, down to one texel.
+                            mips: full_chain(dimension, w, height, depth),
                             element_bytes: bytes,
                             block,
                             samples: 1,
@@ -1058,7 +1064,11 @@ mod tests {
     /// then mip 0; mip 1 sits at x = 32 elements, 32 KiB into the tail.
     #[test]
     fn mip_tail_comes_first() {
-        let l = Layout::new(&desc(64, 64, 9, 16, Swizzle::SW_64KB_D)).unwrap();
+        let bc7 = |swizzle| Desc {
+            block: 4,
+            ..desc(256, 256, 9, 16, swizzle)
+        };
+        let l = Layout::new(&bc7(Swizzle::SW_64KB_D)).unwrap();
         assert_eq!(l.first_tail_mip, 1);
         assert_eq!(l.size, 2 * 65536);
         assert_eq!(l.mips[0].offset, 65536);
@@ -1072,7 +1082,7 @@ mod tests {
         );
         assert_eq!(l.offset(1, 0, 0, 0), Ok(32768));
         // 4 KiB blocks hold fewer tail mips: 16x16 BC7 mips stay outside.
-        let l = Layout::new(&desc(64, 64, 9, 16, Swizzle::SW_4KB_S)).unwrap();
+        let l = Layout::new(&bc7(Swizzle::SW_4KB_S)).unwrap();
         assert_eq!(l.first_tail_mip, 3);
         assert_eq!(l.mips[2].offset, 4096);
         assert_eq!(l.mips[1].offset, 8192);
@@ -1152,5 +1162,141 @@ mod tests {
             Err(Error::TooSmall)
         );
         assert_eq!(l.offset(0, 64, 0, 0), Err(Error::Invalid));
+    }
+
+    /// A chain may run down to one texel and no further (D3D12's rule for
+    /// `MipLevels`): the mips past it would all be 1x1 and the title's
+    /// count would size tables and loops for mips that do not exist.
+    #[test]
+    fn mip_counts_past_the_full_chain_are_refused() {
+        let s = Swizzle::SW_4KB_S;
+        let volume = |depth, mips| Desc {
+            dimension: Dimension::Tex3d,
+            depth,
+            ..desc(4, 4, mips, 4, s)
+        };
+        let array = |depth, mips| Desc {
+            depth,
+            ..desc(4, 4, mips, 4, s)
+        };
+        let bc = |mips| Desc {
+            block: 4,
+            ..desc(64, 64, mips, 8, s)
+        };
+        for (over, d) in [
+            (false, desc(1, 1, 1, 4, s)),
+            (true, desc(1, 1, 2, 4, s)),
+            (false, desc(64, 64, 7, 4, s)),
+            (true, desc(64, 64, 8, 4, s)),
+            (true, desc(64, 64, MAX_MIPS, 4, s)),
+            // The longer side counts.
+            (false, desc(64, 1, 7, 4, s)),
+            (false, desc(3, 5, 3, 4, s)),
+            (true, desc(3, 5, 4, 4, s)),
+            // A volume's depth is a side; an array's size is not.
+            (false, volume(16, 5)),
+            (true, volume(16, 6)),
+            (false, array(16, 3)),
+            (true, array(16, 4)),
+            // Block compression counts texels, not blocks.
+            (false, bc(7)),
+            (true, bc(8)),
+            (false, desc(64, 64, 7, 4, Swizzle::LINEAR)),
+            (true, desc(64, 64, 8, 4, Swizzle::LINEAR)),
+        ] {
+            let layout = Layout::new(&d);
+            if over {
+                assert_eq!(layout, Err(Error::Invalid), "{d:?}");
+            } else {
+                assert_eq!(layout.map(|l| l.mips.len() as u32), Ok(d.mips), "{d:?}");
+            }
+        }
+
+        // A whole texture inherits the rule; 0 still asks for the chain.
+        let texture = |mips, depth_or_array, dimension| {
+            Texture::new(&TextureDesc {
+                dimension,
+                width: 64,
+                height: 64,
+                depth_or_array,
+                mips,
+                format: 28,
+                samples: 1,
+                swizzle: s,
+            })
+            .map(|t| t.planes[0].layout.mips.len())
+        };
+        assert_eq!(texture(8, 1, Dimension::Tex2d), Err(Error::Invalid));
+        assert_eq!(texture(7, 1, Dimension::Tex2d), Ok(7));
+        assert_eq!(texture(0, 1, Dimension::Tex2d), Ok(7));
+        assert_eq!(texture(0, 128, Dimension::Tex2d), Ok(7));
+        assert_eq!(texture(0, 128, Dimension::Tex3d), Ok(8));
+        assert_eq!(texture(9, 128, Dimension::Tex3d), Err(Error::Invalid));
+    }
+
+    /// The table against the public DXGI format list (`dxgiformat.h`; 116
+    /// to 120 are the console's additions as DirectXTex publishes them,
+    /// `XBOX_DXGI_FORMAT_*`): bytes of an element of the first plane, texels
+    /// per element side, and whether stencil is a second plane. Every
+    /// number up to 132 is listed, the refused ones as `None`, so a format
+    /// added to the table has to be added here.
+    #[test]
+    fn the_format_table_matches_the_dxgi_definitions() {
+        type Row = (std::ops::RangeInclusive<u32>, Option<(u32, u32, bool)>);
+        let rows: [Row; 30] = [
+            (0..=0, None),                    // UNKNOWN
+            (1..=4, Some((16, 1, false))),    // R32G32B32A32
+            (5..=8, None),                    // R32G32B32: 96 bits
+            (9..=14, Some((8, 1, false))),    // R16G16B16A16
+            (15..=18, Some((8, 1, false))),   // R32G32
+            (19..=22, Some((4, 1, true))),    // D32_FLOAT_S8X24 and its views
+            (23..=26, Some((4, 1, false))),   // R10G10B10A2, R11G11B10_FLOAT
+            (27..=32, Some((4, 1, false))),   // R8G8B8A8
+            (33..=38, Some((4, 1, false))),   // R16G16
+            (39..=43, Some((4, 1, false))),   // R32, D32_FLOAT
+            (44..=47, Some((4, 1, true))),    // D24_UNORM_S8 and its views
+            (48..=52, Some((2, 1, false))),   // R8G8
+            (53..=59, Some((2, 1, false))),   // R16, D16_UNORM
+            (60..=65, Some((1, 1, false))),   // R8, A8
+            (66..=66, None),                  // R1_UNORM
+            (67..=67, Some((4, 1, false))),   // R9G9B9E5_SHAREDEXP
+            (68..=69, None),                  // R8G8_B8G8, G8R8_G8B8
+            (70..=72, Some((8, 4, false))),   // BC1
+            (73..=78, Some((16, 4, false))),  // BC2, BC3
+            (79..=81, Some((8, 4, false))),   // BC4
+            (82..=84, Some((16, 4, false))),  // BC5
+            (85..=86, Some((2, 1, false))),   // B5G6R5, B5G5R5A1
+            (87..=93, Some((4, 1, false))),   // B8G8R8A8, B8G8R8X8, XR_BIAS
+            (94..=99, Some((16, 4, false))),  // BC6H, BC7
+            (100..=114, None),                // AYUV to A8P8
+            (115..=115, Some((2, 1, false))), // B4G4R4A4
+            (116..=117, Some((4, 1, false))), // R10G10B10_7E3_A2, _6E4_A2
+            (118..=120, Some((2, 1, true))),  // D16_UNORM_S8 and its views
+            (121..=129, None),                // unassigned
+            (130..=132, None),                // P208, V208, V408
+        ];
+        let mut next = 0;
+        for (range, expected) in rows {
+            assert_eq!(*range.start(), next, "the rows leave no gap");
+            next = range.end() + 1;
+            for dxgi in range {
+                let got = format(dxgi).map(|f| (f.bytes, f.block, f.stencil));
+                assert_eq!(got, expected, "DXGI format {dxgi}");
+            }
+        }
+        assert_eq!(next, 133);
+        // Nothing later has a layout: sampler feedback (189, 190),
+        // A4B4G4R4 (191) and numbers nobody assigned.
+        for dxgi in [133, 188, 189, 190, 191, 192, 255, 256, 0xffff, u32::MAX] {
+            assert_eq!(format(dxgi), None, "DXGI format {dxgi}");
+        }
+        // What a layout can hold: Layout::new takes every listed element.
+        for dxgi in 0..=132 {
+            if let Some(f) = format(dxgi) {
+                assert!(f.bytes.is_power_of_two() && f.bytes <= 16, "{dxgi}");
+                assert!(matches!(f.block, 1 | 4), "{dxgi}");
+                assert!(!(f.stencil && f.block != 1), "{dxgi}");
+            }
+        }
     }
 }
