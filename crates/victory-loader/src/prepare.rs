@@ -22,12 +22,33 @@ pub struct PreparedImage {
     pub bytes: Vec<u8>,
     /// BLAKE3 of the original bytes: identifies the exact build.
     pub original_hash: blake3::Hash,
+    /// See [`PreparedImage::named`]; lower case, empty if never said.
+    name: String,
 }
 
 impl PreparedImage {
-    /// File name for the patched copy, unique per original build.
+    /// Says which file of the title this image is (`title_a.dll`; ASCII
+    /// case does not count). A title can ship one DLL under two names, and
+    /// they are two modules, each with its own state: the name is part of
+    /// what [`Self::file_name`] is made from, so each gets a copy of its
+    /// own and Windows maps each on its own.
+    pub fn named(mut self, name: &str) -> Self {
+        self.name = name.to_ascii_lowercase();
+        self
+    }
+
+    /// File name for the patched copy, unique per original build and, for
+    /// an image that was [`named`](Self::named), per name.
     pub fn file_name(&self) -> String {
-        format!("victory-image-{}.dll", &self.original_hash.to_hex()[..16])
+        let hash = if self.name.is_empty() {
+            self.original_hash
+        } else {
+            let mut both = blake3::Hasher::new();
+            both.update(self.original_hash.as_bytes());
+            both.update(self.name.as_bytes());
+            both.finalize()
+        };
+        format!("victory-image-{}.dll", &hash.to_hex()[..16])
     }
 }
 
@@ -143,6 +164,7 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
         info,
         bytes,
         original_hash: blake3::hash(original),
+        name: String::new(),
     })
 }
 
@@ -1009,6 +1031,31 @@ mod tests {
         // Another build gets another name.
         let other = title().timestamp(1).build().unwrap().bytes;
         assert_ne!(prepare(&other).unwrap().file_name(), a.file_name());
+    }
+
+    /// One build shipped under two names is two files, whatever the case
+    /// of the names; an image nobody named keeps the name of its build.
+    #[test]
+    fn file_name_tells_two_names_of_one_build_apart() {
+        let original = title().build().unwrap().bytes;
+        let named = |name: &str| prepare(&original).unwrap().named(name).file_name();
+        let unnamed = prepare(&original).unwrap().file_name();
+        assert_ne!(named("one.dll"), named("two.dll"));
+        assert_ne!(named("one.dll"), unnamed);
+        assert_eq!(named("one.dll"), named("ONE.Dll"));
+        assert_eq!(named("one.dll"), named("one.dll"));
+        assert_eq!(named(""), unnamed);
+        for name in [named("one.dll"), named("two.dll"), named("..\\x:y")] {
+            assert!(name.starts_with("victory-image-") && name.ends_with(".dll"));
+            let hash = &name["victory-image-".len()..name.len() - ".dll".len()];
+            assert_eq!(hash.len(), 16, "{name}");
+            assert!(hash.bytes().all(|b| b.is_ascii_hexdigit()), "{name}");
+        }
+        // The name says nothing of the build: another build under the same
+        // name is another file.
+        let other = title().timestamp(1).build().unwrap().bytes;
+        let other = prepare(&other).unwrap().named("one.dll").file_name();
+        assert_ne!(other, named("one.dll"));
     }
 
     /// Seeded mutations of images with imports, TLS callbacks and base

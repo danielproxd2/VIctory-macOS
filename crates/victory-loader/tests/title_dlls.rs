@@ -635,3 +635,75 @@ fn forwarder_loop_is_an_error() {
         assert_eq!(step, expected, "step {i} of {steps:?}");
     }
 }
+
+/// A title can ship one DLL under two names. They are two modules, each
+/// with its own data and its own notices.
+#[test]
+fn identical_bytes_under_two_names_are_two_modules() {
+    let title = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    for name in ["one.dll", "two.dll"] {
+        std::fs::copy(fixture("title_a.dll"), title.path().join(name)).unwrap();
+    }
+    let importer = victory_pe::testing::PeBuilder::new()
+        .import("one.dll", &[named("title_a_named")])
+        .import("two.dll", &[named("title_a_named")])
+        .build()
+        .unwrap();
+    let importer = ImageInfo::parse(&importer.bytes).unwrap();
+    let dlls =
+        victory_loader::load_title_dlls(&importer, title.path(), cache.path(), &|_| true).unwrap();
+    assert_eq!(names(&dlls), ["one.dll", "two.dll"]);
+    let (one, two) = (&dlls[0].1, &dlls[1].1);
+    assert_ne!(one.base(), two.base(), "one module under two names");
+
+    // Each name resolves into its own module.
+    let resolver = victory_loader::WithTitleDlls {
+        inner: &HostOnly,
+        dlls: &dlls,
+    };
+    let address = |dll: &str| match resolver.resolve(dll, &named("title_a_named")) {
+        Resolution::Found {
+            address,
+            provenance: Provenance::Title,
+        } => address,
+        other => panic!("{dll}: {other:?}"),
+    };
+    let size = one.info().size_of_image as usize;
+    assert!((one.base()..one.base() + size).contains(&address("one.dll")));
+    assert!((two.base()..two.base() + size).contains(&address("two.dll")));
+
+    // Each is initialised once and told of its end once.
+    let folder = tempfile::tempdir().unwrap();
+    let log = folder.path().join("notices.log");
+    let one_log = fixture_log(&log);
+    for (name, dll) in &dlls {
+        let report = dll
+            .bind_imports(&resolver, UnimplementedPolicy::Trap)
+            .unwrap();
+        assert_eq!(report.missing, [], "{name}");
+        // SAFETY: bound, and it depends on no other title DLL.
+        unsafe { dll.attach() }.unwrap();
+    }
+    for (_, dll) in dlls.iter().rev() {
+        // SAFETY: attached above; nothing else uses it.
+        unsafe { dll.detach() };
+    }
+    drop(one_log);
+    let text = std::fs::read_to_string(&log).unwrap();
+    let process: Vec<_> = text
+        .lines()
+        .filter(|l| l.ends_with(" 1") || l.ends_with(" 0"))
+        .collect();
+    assert_eq!(
+        process,
+        ["title_a 1", "title_a 1", "title_a 0", "title_a 0"],
+        "{text}"
+    );
+
+    // The same name again is the copy that is already mapped.
+    let again =
+        victory_loader::load_title_dll("ONE.DLL", title.path(), cache.path(), &|_| true).unwrap();
+    assert_eq!(names(&again), ["one.dll"]);
+    assert_eq!(again[0].1.base(), one.base());
+}
