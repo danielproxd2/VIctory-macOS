@@ -477,4 +477,36 @@ mod tests {
             &OBJECT, 0xb0
         )(this, l));
     }
+
+    /// Pins the store calls left unimplemented. The public reference
+    /// gives their signatures but not what they answer without the store
+    /// service (whether a catalogue query fails or comes back empty,
+    /// whether licences of add-ons are known locally), so none is given
+    /// an answer here: the call itself fails with `E_NOTIMPL`, and so
+    /// does its result function.
+    #[test]
+    fn store_calls_without_a_documented_offline_answer_are_not_implemented() {
+        type Method = extern "system" fn(This) -> HRESULT;
+        for (slot, call) in [
+            (0x38, "XStoreQueryProductsAsync"),
+            (0x40, "XStoreQueryProductsResult"),
+            (0x58, "XStoreQueryProductForCurrentGameAsync"),
+            (0x60, "XStoreQueryProductForCurrentGameResult"),
+            (0x68, "XStoreQueryProductForPackageAsync"),
+            (0x70, "XStoreQueryProductForPackageResult"),
+            (0xc0, "XStoreCanAcquireLicenseForStoreIdAsync"),
+            (0xc8, "XStoreCanAcquireLicenseForStoreIdResult"),
+            (0xd0, "XStoreCanAcquireLicenseForPackageAsync"),
+            (0xd8, "XStoreCanAcquireLicenseForPackageResult"),
+            (0xf0, "XStoreQueryAddOnLicensesAsync"),
+            (0xf8, "XStoreQueryAddOnLicensesResultCount"),
+            (0x100, "XStoreQueryAddOnLicensesResult"),
+        ] {
+            assert_eq!(
+                method::<Method>(&OBJECT, slot)(&OBJECT),
+                xasync::E_NOTIMPL,
+                "{call} ({slot:#x})"
+            );
+        }
+    }
 }
