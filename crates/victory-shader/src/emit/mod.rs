@@ -913,11 +913,7 @@ mod tests {
         };
         assert_eq!(out.samplers, [[0; 4]; 2]);
         assert_eq!(out.static_samplers, [sampler, comparison]);
-        #[cfg(windows)]
-        if let Some(path) = super::validator::Validator::default_path() {
-            let mut v = super::validator::Validator::load(Some(&path)).unwrap();
-            v.validate(&mut out.dxil.clone()).unwrap();
-        }
+        crate::testing::dxil(&out.dxil);
     }
 
     /// A wave64 compute program that writes only EXEC's high dword
@@ -1142,22 +1138,13 @@ mod tests {
     /// each module.
     #[test]
     fn primitive_export_indices_drop_the_edge_flags() {
-        #[cfg(windows)]
-        let mut validator = super::validator::Validator::load(
-            super::validator::Validator::default_path().as_deref(),
-        )
-        .ok();
         for prim in [
             TRIANGLE,
             TRIANGLE | EDGE_FLAGS,
             TRIANGLE | EDGE_FLAGS | CULL,
         ] {
             let ms = triangle_mesh(prim).unwrap_or_else(|e| panic!("{prim:#x}: {e}"));
-            #[cfg(windows)]
-            if let Some(v) = validator.as_mut() {
-                v.validate(&mut ms.dxil.clone())
-                    .unwrap_or_else(|e| panic!("{prim:#x}: {e}"));
-            }
+            crate::testing::dxil(&ms.dxil);
         }
     }
 
@@ -1172,9 +1159,7 @@ mod tests {
             D3D12_FEATURE_D3D12_OPTIONS7, D3D12_FEATURE_DATA_D3D12_OPTIONS7,
             D3D12_MESH_SHADER_TIER_NOT_SUPPORTED, D3D12_SHADER_VISIBILITY_MESH,
         };
-        let _one = super::valu_tests::ONE_AT_A_TIME
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _one = crate::testing::one_gpu_test_at_a_time();
         let ps = constant_color();
         let mut ran = 0;
         for (label, warp) in [("hardware", false), ("warp", true)] {
@@ -1193,7 +1178,17 @@ mod tests {
                 )
             };
             if queried.is_err() || options.MeshShaderTier == D3D12_MESH_SHADER_TIER_NOT_SUPPORTED {
-                eprintln!("no mesh shaders on the {label} device; skipped");
+                // A printed skip, or a failure with the device's
+                // `VICTORY_REQUIRE_*` switch.
+                let var = if warp {
+                    "VICTORY_REQUIRE_WARP"
+                } else {
+                    "VICTORY_REQUIRE_GPU"
+                };
+                crate::testing::skip_unless_required(
+                    var,
+                    &format!("no mesh shaders on the {label} device"),
+                );
                 continue;
             }
             for (prim, culled) in [
@@ -1237,7 +1232,7 @@ mod tests {
             ran += 1;
         }
         if ran == 0 {
-            eprintln!("no device with mesh shaders; skipped");
+            crate::testing::skip("no device with mesh shaders");
         }
     }
 
@@ -1344,12 +1339,7 @@ mod tests {
         let io = io::raise(&p, &native)?;
         let out = emit(&c, &native, &p, &st, &io, &res)?;
         // dxil.dll, where there is one, checks the module.
-        #[cfg(windows)]
-        if let Ok(mut v) = super::validator::Validator::load(
-            super::validator::Validator::default_path().as_deref(),
-        ) {
-            v.validate(&mut out.dxil.clone()).unwrap();
-        }
+        crate::testing::dxil(&out.dxil);
         Ok(out)
     }
 
@@ -1656,7 +1646,12 @@ mod tests {
             dump_dxil(&dump(false, 0, false)),
             dump_dxil(&dump(true, 1, true)),
         ) else {
-            eprintln!("no dxc.exe; DXIL check skipped");
+            // A printed skip, or a failure with `VICTORY_REQUIRE_DIFF=1`
+            // (the switch of the PC compiler).
+            crate::testing::skip_unless_required(
+                "VICTORY_REQUIRE_DIFF",
+                "no dxc.exe (VICTORY_PC_DXC) to print the module with",
+            );
             return;
         };
         // The low-half write keeps the destination's high half.

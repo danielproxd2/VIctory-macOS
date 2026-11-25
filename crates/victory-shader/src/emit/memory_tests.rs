@@ -9,7 +9,7 @@
 //! pointers into memory no copy holds (zeros, marked missed) and stores and
 //! loads through a root UAV (title memory in such a program).
 
-use super::host::{Dispatch, Host, Root, View};
+use super::host::{Dispatch, Root, View};
 use super::{HostShader, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -210,10 +210,7 @@ fn program() -> HostShader {
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
     };
-    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        v.validate(&mut shader.dxil.clone())
-            .expect("DXIL validation failed");
-    }
+    validator::check(&shader.dxil);
     shader
 }
 
@@ -234,9 +231,7 @@ fn page_table(view: u32, null: u32) -> Vec<u32> {
 #[test]
 fn title_memory_is_read_and_written_at_computed_addresses() {
     let shader = program();
-    let _one = super::valu_tests::ONE_AT_A_TIME
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _one = crate::testing::one_gpu_test_at_a_time();
     let mut memory = vec![0u32; 256];
     memory[0] = 0x1111_1111;
     let pointer = TITLE + 0x100;
@@ -262,8 +257,7 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
     view_addresses[2..4].copy_from_slice(&[TITLE as u32, (TITLE >> 32) as u32]);
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
+        let Some(host) = crate::testing::host(warp) else {
             continue;
         };
         let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
@@ -477,18 +471,12 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
     };
-    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        v.validate(&mut shader.dxil.clone())
-            .expect("DXIL validation failed");
-    }
-    let _one = super::valu_tests::ONE_AT_A_TIME
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    validator::check(&shader.dxil);
+    let _one = crate::testing::one_gpu_test_at_a_time();
     let copy: Vec<u32> = (0..256).map(|k| 0x1000 + k).collect();
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
+        let Some(host) = crate::testing::host(warp) else {
             continue;
         };
         let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
@@ -618,19 +606,13 @@ fn writes_through_views_mark_their_pages() {
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
     };
-    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        v.validate(&mut shader.dxil.clone())
-            .expect("DXIL validation failed");
-    }
-    let _one = super::valu_tests::ONE_AT_A_TIME
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    validator::check(&shader.dxil);
+    let _one = crate::testing::one_gpu_test_at_a_time();
     let value = 0x1234_5678;
     let marks = vec![100, 0xFFF0, super::VIEW_MARK_NONE, 0, 200, 0];
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
+        let Some(host) = crate::testing::host(warp) else {
             continue;
         };
         let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");

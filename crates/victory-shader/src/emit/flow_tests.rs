@@ -15,8 +15,7 @@ use std::path::{Path, PathBuf};
 
 use windows::Win32::Graphics::Direct3D12::*;
 
-use super::host::{Dispatch, Draw, Host, Root, Stride, View};
-use super::valu_tests::ONE_AT_A_TIME;
+use super::host::{Dispatch, Draw, Root, Stride, View};
 use super::{HostShader, RootType, translate, validator};
 
 fn tools() -> Option<(PathBuf, PathBuf)> {
@@ -339,12 +338,16 @@ fn console_wave(container: &[u8]) -> usize {
 /// Runs the cases `pick` names on both adapters; returns the failures.
 fn run(pick: &dyn Fn(&str) -> bool) -> Vec<String> {
     let Some((console, pc)) = tools() else {
-        eprintln!("no console or PC compiler; skipped");
+        // A printed skip, or a failure with `VICTORY_REQUIRE_DIFF=1`.
+        crate::testing::skip_unless_required(
+            "VICTORY_REQUIRE_DIFF",
+            "no console compiler (VICTORY_CONSOLE_DXC) or no PC compiler (VICTORY_PC_DXC)",
+        );
         return Vec::new();
     };
     let dir = std::env::temp_dir().join(format!("victory-flow-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let _one = crate::testing::one_gpu_test_at_a_time();
     let lanes = 256;
     let data = lane_inputs(lanes);
     let views = [
@@ -357,8 +360,7 @@ fn run(pick: &dyn Fn(&str) -> bool) -> Vec<String> {
     let mut failures = Vec::new();
     let only = std::env::var("VICTORY_DIFF_ONLY").ok();
     for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
+        let Some(host) = crate::testing::host(warp) else {
             continue;
         };
         for (name, src) in CS_CASES
@@ -382,7 +384,7 @@ fn run(pick: &dyn Fn(&str) -> bool) -> Vec<String> {
                 Ok(p) => p,
                 // WARP runs no fixed wave size.
                 Err(e) if warp => {
-                    eprintln!("{name}: skipped on WARP ({e})");
+                    crate::testing::skip(&format!("{name} on WARP: {e}"));
                     continue;
                 }
                 Err(e) => panic!("{name}: {e}"),

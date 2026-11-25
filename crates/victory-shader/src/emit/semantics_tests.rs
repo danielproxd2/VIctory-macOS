@@ -18,7 +18,6 @@
 //! fixes (`model: None`) only check that the two adapters agree.
 
 use super::host::{Dispatch, Host, Root, Stride, View};
-use super::valu_tests::ONE_AT_A_TIME;
 use super::{HostShader, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -547,14 +546,22 @@ fn defective(probes: Vec<Probe>, defect: &str) -> Vec<Probe> {
 /// Runs probes on the hardware adapter and WARP; returns the failures
 /// (each with its first differing inputs).
 fn check(probes: &[Probe]) -> Vec<String> {
-    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let _one = crate::testing::one_gpu_test_at_a_time();
     let mut hosts: Vec<(&str, bool, Host)> = [("hardware", false), ("warp", true)]
         .into_iter()
-        .filter_map(|(label, warp)| Host::new(warp).ok().map(|h| (label, warp, h)))
+        .filter_map(|(label, warp)| crate::testing::host(warp).map(|h| (label, warp, h)))
         .collect();
     assert!(!hosts.is_empty(), "no SM 6.6 device");
     let report = std::env::var("VICTORY_SEMANTICS_REPORT").ok();
+    // Without the validator: a printed skip, or a failure with
+    // `VICTORY_REQUIRE_DXIL=1` (`crate::testing`).
     let mut validator = validator::Validator::load(validator::Validator::default_path().as_deref());
+    if let Err(e) = &validator {
+        crate::testing::skip_unless_required(
+            "VICTORY_REQUIRE_DXIL",
+            &format!("DXIL validation: {e}"),
+        );
+    }
     let mut failures = Vec::new();
     for p in probes {
         let what = disassembly(&p.body, p.scalar);
@@ -2869,11 +2876,11 @@ fn f16_results_round_as_the_mode_says() {
 /// the lowering's multiply-add, WARP does not.
 #[test]
 fn hosts_that_do_not_fuse_are_named() {
-    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    if let Ok(warp) = Host::new(true) {
+    let _one = crate::testing::one_gpu_test_at_a_time();
+    if let Some(warp) = crate::testing::host(true) {
         assert_eq!(warp.fuses_fmad(), Ok(false), "WARP");
     }
-    if let Ok(hardware) = Host::new(false) {
+    if let Some(hardware) = crate::testing::host(false) {
         let fuses = hardware.fuses_fmad().expect("the check runs");
         eprintln!("hardware adapter fuses FMad: {fuses}");
     }

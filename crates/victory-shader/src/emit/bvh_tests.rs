@@ -6,7 +6,7 @@
 //! the program shifts into the descriptor, or from a pointer in root
 //! constants; both are title memory (`Lower::memory`) in such a program.
 
-use super::host::{Dispatch, Host, Root, View};
+use super::host::{Dispatch, Root, View};
 use super::{HostShader, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -611,12 +611,7 @@ fn build(wide: bool, memory: bool) -> HostShader {
         heap_writes: lowered.heap_writes,
         view_marks: lowered.view_marks,
     };
-    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        v.validate(&mut shader.dxil.clone())
-            .expect("DXIL validation failed");
-    } else {
-        eprintln!("no dxil.dll; validation skipped");
-    }
+    validator::check(&shader.dxil);
     shader
 }
 
@@ -720,13 +715,10 @@ fn run_cases(wide: bool, batches: usize, memory: bool) {
     let batches: Vec<Vec<(Vec<u32>, u32, Ray)>> = (0..batches)
         .map(|_| (0..LANES).map(|_| case(&mut rng)).collect())
         .collect();
-    let _one = super::valu_tests::ONE_AT_A_TIME
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _one = crate::testing::one_gpu_test_at_a_time();
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
+        let Some(host) = crate::testing::host(warp) else {
             continue;
         };
         let (root, pso) = host

@@ -19,6 +19,12 @@
 //!   A result that is neither the hardware's nor the measured difference
 //!   fails either way, and on any other host only the hardware's passes.
 //!
+//! Every device test of the crate gets its device from [`host`] and its
+//! validation from [`dxil`] (`emit::validator::check`), upstream's tests
+//! included, so the switches cover all of them. Some of upstream's tests
+//! also fail when no device at all ran them (`assert!(ran > 0)`, the
+//! waterfall and semantics tests): that is kept as upstream wrote it.
+//!
 //! Without its switch a test that lacks what it needs passes having
 //! checked nothing, and no test here fails for that: a run that is meant
 //! to prove the device tests must set `VICTORY_REQUIRE_GPU=1` (and

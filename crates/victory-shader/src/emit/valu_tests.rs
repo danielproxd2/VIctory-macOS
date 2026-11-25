@@ -196,25 +196,6 @@ fn try_build_valu_cs_storing(body: &[u32], stores: u8) -> Result<HostShader, cra
     Ok(shader)
 }
 
-/// One GPU test at a time, as the other device-test modules name it
-/// (`super::valu_tests::ONE_AT_A_TIME.lock()`): the one lock of
-/// `crate::testing::one_gpu_test_at_a_time`, so that every device test of
-/// the crate waits for every other. (In parallel on the hardware adapter
-/// and WARP the test process sometimes died of an access violation, or
-/// hung.) Not reentrant.
-pub(super) struct OneAtATime;
-
-impl OneAtATime {
-    /// The guard of the crate's device-test lock. Never an error: the
-    /// lock's poison is cleared where it is taken. The `Result` is what a
-    /// `Mutex` gives, for the callers written against one.
-    pub(super) fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'static, ()>> {
-        Ok(crate::testing::one_gpu_test_at_a_time())
-    }
-}
-
-pub(super) static ONE_AT_A_TIME: OneAtATime = OneAtATime;
-
 /// Runs `shader` on every available SM 6.6 host (hardware GPU and WARP) for
 /// each 4-dword input set and invokes `check(backend, case_index, inputs, result_dword)`.
 /// A host that is missing is a printed skip, or a failure with
@@ -1934,7 +1915,7 @@ fn image_atomics_of_64_bits() {
         want[64 + l as usize] = a(l);
         want[96 + l as usize] = b(l);
     }
-    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let _one = crate::testing::one_gpu_test_at_a_time();
     for (label, warp) in [("hardware", false), ("warp", true)] {
         // A printed skip without the device, or a failure with its
         // `VICTORY_REQUIRE_*` switch (`crate::testing`).

@@ -6,7 +6,7 @@
 //! console): it rounds the exact product of coordinate and size to 1/256 of
 //! a texel, half up, which WARP does not. Lane permutes (`ds_bpermute_b32`).
 
-use super::host::{Dispatch, Host, Root, Stride, View};
+use super::host::{Dispatch, Root, Stride, View};
 use super::{HostShader, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -211,10 +211,7 @@ fn gathers_at_a_level_match_the_hardware() {
     }
     let input: Vec<u32> = records.iter().flatten().copied().collect();
     let shader = build(&program(true)).expect("lower");
-    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        v.validate(&mut shader.dxil.clone())
-            .expect("DXIL validation failed");
-    }
+    validator::check(&shader.dxil);
     let views = [
         View::Mipped(24, 16, 4, &texels),
         View::Buffer {
@@ -344,10 +341,7 @@ fn permutes_read_the_lane_named_and_zero_from_lanes_left_out() {
         0xBF81_0000, // s_endpgm
     ])
     .expect("lower");
-    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        v.validate(&mut shader.dxil.clone())
-            .expect("DXIL validation failed");
-    }
+    validator::check(&shader.dxil);
     let want: Vec<u32> = (0..32)
         .map(|l| match (13 * l + 5) % 32 {
             _ if l >= 24 => 0xDEAD,
@@ -363,19 +357,19 @@ fn permutes_read_the_lane_named_and_zero_from_lanes_left_out() {
         },
         View::RawUav(32),
     ];
-    let _one = super::valu_tests::ONE_AT_A_TIME
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _one = crate::testing::one_gpu_test_at_a_time();
     for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
+        let Some(host) = crate::testing::host(warp) else {
             continue;
         };
         // The program declares the console's wave of 32, which WARP refuses.
-        let Ok((root, pso)) = host.compute_pipeline(&shader) else {
-            assert!(warp, "{label}: no pipeline for a wave of 32");
-            eprintln!("{label}: no pipeline for a wave of 32; skipped");
-            continue;
+        let (root, pso) = match host.compute_pipeline(&shader) {
+            Ok(pipeline) => pipeline,
+            Err(e) => {
+                assert!(warp, "{label}: no pipeline for a wave of 32: {e}");
+                crate::testing::skip(&format!("no pipeline for a wave of 32 on WARP: {e}"));
+                continue;
+            }
         };
         let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
         let out = host
@@ -464,10 +458,7 @@ fn ordered_pixel_sections_use_rasterizer_ordered_views() {
     };
     let l = lowered(&native(1 << 16)).expect("lower");
     assert!(l.rovs);
-    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        v.validate(&mut l.dxil.clone())
-            .expect("DXIL validation failed");
-    }
+    validator::check(&l.dxil);
     // Without the ordered mode the collision id is no value the host has.
     let Err(crate::ShaderError::Unsupported { what, .. }) = lowered(&native(0)) else {
         panic!("translated a collision id outside an ordered section");

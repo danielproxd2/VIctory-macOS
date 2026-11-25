@@ -103,7 +103,7 @@ pub fn rectangle_gs(vs: &[u8]) -> Result<Vec<u8>, ShaderError> {
 mod tests {
     use super::super::bitcode::{Attr, Term};
     use super::super::container::SigElement;
-    use super::super::host::{Draw, Host};
+    use super::super::host::Draw;
     use super::super::shader::Shader;
 
     fn element(name: &str, kind: u8, interp: u8, row: u32, cols: u8) -> SigElement {
@@ -180,12 +180,8 @@ mod tests {
     fn rectangles_get_their_fourth_corner() {
         let (vs, ps) = (shader(false), shader(true));
         let gs = super::rectangle_gs(&vs).unwrap();
-        if let Ok(mut v) = super::super::validator::Validator::load(
-            super::super::validator::Validator::default_path().as_deref(),
-        ) {
-            for c in [&vs, &gs, &ps] {
-                v.validate(&mut c.clone()).unwrap();
-            }
+        for c in [&vs, &gs, &ps] {
+            crate::testing::dxil(c);
         }
         #[rustfmt::skip]
         let vertices = [
@@ -193,8 +189,11 @@ mod tests {
             -0.5, -0.5, 0.5, 1.0, -0.5, -0.5,
             0.5, -0.5, 0.5, 1.0, 0.5, -0.5,
         ];
+        let _one = crate::testing::one_gpu_test_at_a_time();
         for warp in [false, true] {
-            let Ok(host) = Host::new(warp) else { continue };
+            let Some(host) = crate::testing::host(warp) else {
+                continue;
+            };
             let root = host.root_signature_for(&[]).unwrap();
             let pso = host.pipeline_gs(&root, &vs, &gs, &ps).unwrap();
             let draw = Draw {

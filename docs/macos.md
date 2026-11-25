@@ -61,7 +61,7 @@ A shader test that lacks something it needs passes after printing one line that 
 - `VICTORY_REQUIRE_IDLE=1`: a machine with nothing else to do. One DirectStorage test (`a_page_list_filled_after_its_request_starts`) needs a thread of its own to run within 8 ms; where the host starts it later and the request therefore fails as designed, it prints `skipped: the host ran the thread that fills the page list only after ... ms`.
 - `VICTORY_REQUIRE_PC_GPU=1`: a device that gives the results of the PC hardware the device tests were measured on. Where D3DMetal is known to give another result (see "Open differences under D3DMetal"), the test that shows it checks that the device is D3DMetal and that the result is the measured one, prints `skipped: D3DMetal ...` and passes. With this switch it fails instead. On a Mac the switch therefore fails four shader tests today; it is for finding out whether a new D3DMetal has closed a difference, not for the proving run.
 
-D3DMetal is recognised by the process running under Wine and the adapter naming itself "AMD Compatibility Mode", the name D3DMetal presents; a result that differs on any other device fails.
+Every device test of `victory-shader` gets its device and its validation through `crate::testing`, upstream's tests included, so these switches cover all of them. D3DMetal is recognised by the process running under Wine and the adapter naming itself "AMD Compatibility Mode", the name D3DMetal presents; a result that differs on any other device fails.
 
 ## The DXIL validator
 

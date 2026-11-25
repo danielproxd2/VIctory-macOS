@@ -7,7 +7,7 @@
 
 use windows::Win32::Graphics::Direct3D12::D3D12_SAMPLER_DESC;
 
-use super::host::{Dispatch, Host, Root, Stride, View};
+use super::host::{Dispatch, Root, Stride, View};
 use super::{HostShader, StaticSampler, VIEW_STRIDES, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -216,12 +216,7 @@ fn build(
         heap_writes: lowered.heap_writes,
         view_marks: lowered.view_marks,
     };
-    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        v.validate(&mut shader.dxil.clone())
-            .expect("DXIL validation failed");
-    } else {
-        eprintln!("no dxil.dll; validation skipped");
-    }
+    validator::check(&shader.dxil);
     shader
 }
 
@@ -247,13 +242,10 @@ fn a_heap_buffer_read_by_element_takes_the_views_stride() {
             stride: Stride::Structured(12),
         },
     ];
-    let _one = super::valu_tests::ONE_AT_A_TIME
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _one = crate::testing::one_gpu_test_at_a_time();
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
+        let Some(host) = crate::testing::host(warp) else {
             continue;
         };
         let (root, pso) = host
@@ -320,13 +312,10 @@ fn a_heap_buffer_read_where_no_buffer_view_is_reads_zeros() {
         View::Texture(1, 1, &texel),
         View::NullBuffers,
     ];
-    let _one = super::valu_tests::ONE_AT_A_TIME
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _one = crate::testing::one_gpu_test_at_a_time();
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
+        let Some(host) = crate::testing::host(warp) else {
             continue;
         };
         let (root, pso) = host
@@ -389,13 +378,10 @@ fn a_constant_buffer_through_the_heap_reads_as_a_raw_buffer() {
             stride: Stride::Raw,
         },
     ];
-    let _one = super::valu_tests::ONE_AT_A_TIME
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _one = crate::testing::one_gpu_test_at_a_time();
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
+        let Some(host) = crate::testing::host(warp) else {
             continue;
         };
         let (root, pso) = host
@@ -464,13 +450,10 @@ fn a_half_buffer_load_reads_the_half_at_its_address() {
         },
         View::RawUav(32),
     ];
-    let _one = super::valu_tests::ONE_AT_A_TIME
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _one = crate::testing::one_gpu_test_at_a_time();
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
+        let Some(host) = crate::testing::host(warp) else {
             continue;
         };
         let (root, pso) = host
@@ -511,13 +494,10 @@ fn half_buffer_stores_leave_the_other_half_alone() {
         32,
     );
     let views = [View::RawUav(16)];
-    let _one = super::valu_tests::ONE_AT_A_TIME
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _one = crate::testing::one_gpu_test_at_a_time();
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
+        let Some(host) = crate::testing::host(warp) else {
             continue;
         };
         let (root, pso) = host
@@ -563,13 +543,10 @@ fn a_sampler_chosen_by_a_uniform_branch_samples_as_chosen() {
     let texels = [[1.0f32, 0.0, 0.0, 1.0], [2.0, 0.0, 0.0, 1.0]];
     let views = [View::Texture(2, 1, &texels), View::RawUav(1)];
     let samplers: [D3D12_SAMPLER_DESC; 0] = [];
-    let _one = super::valu_tests::ONE_AT_A_TIME
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _one = crate::testing::one_gpu_test_at_a_time();
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
+        let Some(host) = crate::testing::host(warp) else {
             continue;
         };
         let (root, pso) = host
