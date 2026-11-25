@@ -1677,13 +1677,6 @@ mod tests {
         (data, starts)
     }
 
-    fn xorshift(seed: &mut u64) -> u64 {
-        *seed ^= *seed << 13;
-        *seed ^= *seed >> 7;
-        *seed ^= *seed << 17;
-        *seed
-    }
-
     /// A frame that says no channel has coefficients in any subframe is
     /// silence, whatever the subframe layout, and stays silence through the
     /// overlap into the next frame.
@@ -1921,14 +1914,14 @@ mod tests {
 
             // Leave something in the overlap: noise after a header that
             // transmits coefficients.
-            let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+            let mut noise = Noise(0x9e37_79b9_7f4a_7c15);
             let mut left = false;
             for _ in 0..64 {
                 let frame = frame_bits(600, |f| {
                     fixed_header(f, channels, 0);
                     subframe_header(f, channels, true);
                     for _ in 0..40 {
-                        f.put(32, xorshift(&mut seed) as u32);
+                        f.put(32, noise.next() as u32);
                     }
                 });
                 pcm.clear();
@@ -1972,20 +1965,20 @@ mod tests {
     /// and adds exactly one frame of samples.
     #[test]
     fn decoder_noise_never_panics_and_keeps_the_frame_size() {
-        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut noise = Noise(0x2545_f491_4f6c_dd1d);
         let (mut accepted, mut refused) = (0, 0);
         for channels in [1usize, 2] {
             for rate in [24_000, 32_000, 44_100, 48_000] {
                 let mut decoder = Decoder::new(channels, rate);
                 let mut pcm = vec![];
                 for round in 0..200usize {
-                    let len = xorshift(&mut seed) as usize % 4097;
-                    let mut data: Vec<u8> = (0..len).map(|_| xorshift(&mut seed) as u8).collect();
+                    let len = noise.next() as usize % 4097;
+                    let mut data: Vec<u8> = (0..len).map(|_| noise.next() as u8).collect();
                     let mut bits = match round % 4 {
                         0 => len * 8,
-                        1 => xorshift(&mut seed) as usize % (len * 8 + 1),
-                        2 => len * 8 + xorshift(&mut seed) as usize % 4096,
-                        _ => xorshift(&mut seed) as usize % 0x8000,
+                        1 => noise.next() as usize % (len * 8 + 1),
+                        2 => len * 8 + noise.next() as usize % 4096,
+                        _ => noise.next() as usize % 0x8000,
                     };
                     if round % 2 == 1 {
                         // Well formed as far as the first subframe's
