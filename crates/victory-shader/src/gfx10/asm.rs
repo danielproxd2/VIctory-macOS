@@ -134,6 +134,35 @@ pub fn opcode(encoding: Encoding, name: &str) -> u16 {
     found.unwrap_or_else(|| panic!("no {encoding:?} opcode named {name}"))
 }
 
+/// Every opcode name [`opcode`] takes for `encoding`, in table order (for
+/// VOP3 its own table, then the VOPC, VOP2 and VOP1 names it also takes).
+/// For tests that pick opcodes: no name here makes an encoder panic.
+pub fn names(encoding: Encoding) -> Vec<&'static str> {
+    let tables: &[&[(u16, &'static str)]] = match encoding {
+        Encoding::Sop2 => &[t::SOP2],
+        Encoding::Sopk => &[t::SOPK],
+        Encoding::Sop1 => &[t::SOP1],
+        Encoding::Sopc => &[t::SOPC],
+        Encoding::Sopp => &[t::SOPP],
+        Encoding::Smem => &[t::SMEM],
+        Encoding::Vop2 => &[t::VOP2],
+        Encoding::Vop1 => &[t::VOP1],
+        Encoding::Vopc => &[t::VOPC],
+        Encoding::Vop3 => &[t::VOP3, t::VOPC, t::VOP2, t::VOP1],
+        Encoding::Vop3p => &[t::VOP3P],
+        Encoding::Vintrp => &[t::VINTRP],
+        Encoding::Ds => &[t::DS],
+        Encoding::Mubuf => &[t::MUBUF],
+        Encoding::Mtbuf => &[t::MTBUF],
+        Encoding::Mimg => &[t::MIMG],
+        Encoding::Exp => return vec!["exp"],
+        Encoding::Flat => &[t::FLAT],
+        Encoding::Global => &[t::GLOBAL],
+        Encoding::Scratch => &[t::SCRATCH],
+    };
+    tables.iter().flat_map(|t| t.iter().map(|e| e.1)).collect()
+}
+
 /// The name of `opcode` in `encoding`, for callers that hold a number.
 /// Panics on an opcode the tables lack.
 pub fn mnemonic(encoding: Encoding, opcode: u16) -> &'static str {
@@ -765,6 +794,23 @@ pub fn exp(target: u8, en: u8, srcs: [u8; 4], flags: ExpFlags) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every name [`names`] lists is one [`opcode`] finds (it panics on a
+    /// name it lacks), and no encoding is empty.
+    #[test]
+    fn every_listed_name_has_an_opcode() {
+        use Encoding::*;
+        for encoding in [
+            Sop2, Sopk, Sop1, Sopc, Sopp, Smem, Vop2, Vop1, Vopc, Vop3, Vop3p, Vintrp, Ds, Mubuf,
+            Mtbuf, Mimg, Exp, Flat, Global, Scratch,
+        ] {
+            let names = names(encoding);
+            assert!(!names.is_empty(), "{encoding:?}");
+            for name in names {
+                opcode(encoding, name);
+            }
+        }
+    }
     use crate::gfx10::{Cache, Dpp, Fields, Instruction, Operand, Sdwa, Valu, decode};
 
     /// The one instruction `words` encode.

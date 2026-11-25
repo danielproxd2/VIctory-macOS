@@ -9,6 +9,8 @@
 pub mod dxbc;
 pub mod dxil;
 pub mod emit;
+#[cfg(test)]
+mod fuzz_tests;
 pub mod gfx10;
 pub mod io;
 pub mod ir;
