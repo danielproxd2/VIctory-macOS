@@ -5,7 +5,15 @@
 # DLLs through the locator in crates/victory-loader/tests/common/mod.rs.
 [workspace]
 resolver = "3"
-members = ["hle-probe", "hle-probe-exe", "title-a", "title-b", "title-quiet"]
+members = [
+    "hle-probe",
+    "hle-probe-exe",
+    "title-a",
+    "title-b",
+    "title-loop-a",
+    "title-loop-b",
+    "title-quiet",
+]
 
 [workspace.package]
 version = "0.0.0"

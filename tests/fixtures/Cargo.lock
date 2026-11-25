@@ -19,5 +19,13 @@ name = "title-b"
 version = "0.0.0"
 
 [[package]]
+name = "title-loop-a"
+version = "0.0.0"
+
+[[package]]
+name = "title-loop-b"
+version = "0.0.0"
+
+[[package]]
 name = "title-quiet"
 version = "0.0.0"

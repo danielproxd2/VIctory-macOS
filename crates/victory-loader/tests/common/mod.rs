@@ -7,7 +7,8 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 /// The built fixture `file` (`hle_probe.dll`, `hle-probe-exe.exe`,
-/// `title_a.dll`, `title_b.dll` or `title_quiet.dll`).
+/// `title_a.dll`, `title_b.dll`, `title_loop_a.dll`, `title_loop_b.dll` or
+/// `title_quiet.dll`).
 ///
 /// `VICTORY_FIXTURE_DIR` names the folder that holds them, built
 /// beforehand: a cross build runs the tests under Wine, where cargo cannot

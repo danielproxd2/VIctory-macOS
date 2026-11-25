@@ -1,7 +1,8 @@
 //! A DLL a stand-in title ships (`title_b.dll`), written by us. It imports
-//! `title_a.dll`, so the two form a chain, and it forwards one of its
-//! exports to it. Its `DllMain` writes every notice it gets to the file
-//! `VICTORY_FIXTURE_LOG` names.
+//! `title_a.dll`, so the two form a chain, and it forwards exports: to
+//! `title_a.dll` by name and by ordinal, and to a DLL of the host. It
+//! delay-loads `title_quiet.dll` (see build.rs). Its `DllMain` writes every
+//! notice it gets to the file `VICTORY_FIXTURE_LOG` names.
 
 use std::ffi::c_void;
 use std::io::Write;
@@ -14,6 +15,27 @@ unsafe extern "system" {
     fn title_a_named() -> u32;
 }
 
+// Delay-loaded (see build.rs): another DLL the title ships, bound through
+// the delay-load table, whose descriptor has a slot for its module handle.
+#[cfg_attr(
+    any(target_env = "msvc", target_abi = "llvm"),
+    link(name = "title_quiet", kind = "raw-dylib")
+)]
+#[cfg_attr(
+    all(target_env = "gnu", not(target_abi = "llvm")),
+    link(name = "title_quiet_delayed", kind = "static")
+)]
+unsafe extern "system" {
+    fn title_quiet_value() -> u32;
+}
+
+/// Calls into `title_quiet.dll` through the delay-load table.
+#[unsafe(no_mangle)]
+pub extern "system" fn title_b_delayed() -> u32 {
+    // SAFETY: the import takes no arguments.
+    unsafe { title_quiet_value() }
+}
+
 /// Calls into `title_a.dll`.
 #[unsafe(no_mangle)]
 pub extern "system" fn title_b_chain() -> u32 {
@@ -24,9 +46,13 @@ pub extern "system" fn title_b_chain() -> u32 {
 // `title_b_forwarded` is `title_a.dll`'s `title_a_named`: an export that
 // names another DLL's export has no code here. A linker directive in the
 // object file says so, which MSVC's linker and lld both read.
+// `title_b_forwarded_ordinal` names `title_a.dll`'s export 7, which has no
+// name, and `title_b_forwarded_host` a function of the host's kernel32.dll.
 std::arch::global_asm!(
     ".section .drectve,\"yni\"",
     ".ascii \" /EXPORT:title_b_forwarded=title_a.title_a_named\"",
+    ".ascii \" /EXPORT:title_b_forwarded_ordinal=title_a.#7\"",
+    ".ascii \" /EXPORT:title_b_forwarded_host=kernel32.GetCurrentProcessId\"",
     ".text",
 );
 
