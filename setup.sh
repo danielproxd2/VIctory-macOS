@@ -85,11 +85,13 @@ cargo build --quiet --release -p victory --target x86_64-pc-windows-gnullvm
 [[ -f victory.toml ]] || cp victory.example.toml victory.toml
 # What proves the setup is that VIctory starts under Wine, which needs no
 # game. The configuration is shown; a fault in it is the user's to correct
-# and is not a failed setup (tools/macos/check-setup.sh).
+# and is not a failed setup (tools/macos/check-setup.sh). That check ends by
+# naming `tools/macos/victory.sh doctor`, which looks at the Mac itself.
 tools/macos/check-setup.sh || die "the setup is built, and VIctory did not start under Wine (see above). Run tools/macos/check-setup.sh to try again"
 
 print
 print -P "%F{green}Setup finished.%f"
+print "To see whether this Mac is ready for a run (it needs no game): tools/macos/victory.sh doctor"
 print "Put your own copy of the game in a folder outside this repository. Check it first; nothing of the game runs:"
 print "  tools/macos/first-run.sh <the game's executable>"
 print "It ends with the command that starts the game. docs/first-run.md says what to look at when a start fails."

@@ -1,8 +1,16 @@
 #!/bin/sh
 # Builds VIctory for Windows and runs it on macOS under CrossOver Wine with
 # Apple's D3DMetal. Arguments go to victory.exe, for example:
+#   tools/macos/victory.sh doctor
 #   tools/macos/victory.sh config
 #   tools/macos/victory.sh run --execute <path to the game's executable>
+# `doctor` needs no game and no configuration that is right: it reports, a
+# line per item, whether this Mac is ready for a run (Wine, the D3D12
+# device and what VIctory measures on it, the config file and the folders,
+# the prebuilt shaders), and ends with status 1 only for a line marked
+# PROBLEM. `config` ends with status 1 for a game_dir that is set and is not
+# there, as a victory.toml copied from an older victory.example.toml has it
+# ('D:\victory-data\game'); `doctor` names that value and goes on.
 # WINE defaults to the Wine that tools/macos/build-crossover-wine.sh builds.
 # The Wine prefix (WINEPREFIX) defaults to a folder outside the repository:
 # %LOCALAPPDATA% lies inside the prefix, and the default cache_dir lies
@@ -48,7 +56,8 @@ if [ $# -eq 0 ]; then
     {
         echo "victory.sh: no command given, and no game is started by default. Name the game's executable:"
         echo "  tools/macos/victory.sh run --execute <path to the game's executable>"
-        echo "To check the setup instead: tools/macos/victory.sh config"
+        echo "To check this Mac and the setup instead: tools/macos/victory.sh doctor"
+        echo "To see the configuration: tools/macos/victory.sh config"
     } >&2
     exit 2
 fi

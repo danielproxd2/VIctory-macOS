@@ -11,6 +11,9 @@
 # refuses (a game_dir that is set and is not there, a folder inside the
 # repository) is the user's file to correct and not a failed setup, so it is
 # reported with what to change and the status stays 0.
+# It ends by naming `tools/macos/victory.sh doctor`, the fuller check of the
+# Mac itself (the D3D12 device, the folders, the prebuilt shaders), which
+# needs no game either and is not run here.
 # WINE, CARGO, VICTORY_CONFIG and the other variables of
 # tools/macos/victory.sh mean here what they mean there.
 set -u
@@ -46,3 +49,6 @@ else
         echo "Then run tools/macos/victory.sh config again."
     } >&2
 fi
+echo
+echo "For a check of this Mac itself (the D3D12 device and what VIctory measures on it,"
+echo "the folders a run writes to, the prebuilt shaders): tools/macos/victory.sh doctor"

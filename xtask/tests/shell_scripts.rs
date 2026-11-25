@@ -1687,3 +1687,78 @@ fn victory_sh_sets_the_variable_the_config_reads() {
     let launcher = fs::read_to_string(root().join("tools/macos/victory.sh")).unwrap();
     assert!(launcher.contains(r#"export VICTORY_DATA_DIR="Z:"#));
 }
+
+/// `doctor` is handed on to victory.exe like any other command, with the
+/// launcher's environment for it, and a config file whose game_dir is
+/// still the old example's does not stop the launcher: what to make of
+/// that value is victory.exe's to say (`victory doctor` names it).
+#[test]
+fn victory_sh_hands_doctor_on_whatever_the_game_dir_is() {
+    let name = "victory-sh-doctor";
+    let dir = scratch(&format!("{name}-config"));
+    let file = dir.join("victory.toml");
+    fs::write(&file, "[paths]\ngame_dir = 'D:\\victory-data\\game'\n").unwrap();
+    let started_in = outside(name);
+    let launched = launch(
+        name,
+        &started_in,
+        &["doctor"],
+        Some(&file.display().to_string()),
+        None,
+    );
+    let out = &launched.out;
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(launched.args.len(), 2, "{:?}", launched.args);
+    assert!(
+        launched.args[0].ends_with("victory.exe"),
+        "{:?}",
+        launched.args
+    );
+    assert_eq!(launched.args[1], "doctor");
+    // It runs where it was started, with the config file it was given, the
+    // data folder outside the prefix and Rosetta's AVX2, as a run does.
+    assert_eq!(launched.cwd, started_in);
+    assert_eq!(launched.config, file.display().to_string());
+    assert_eq!(
+        launched.data_dir,
+        Some(format!(
+            "{}\\Library\\Application Support\\victory\\data",
+            launched.home
+        ))
+    );
+    assert_eq!(launched.cpu, ["1", "<unset>"]);
+    assert_eq!(launched.builds, 1);
+
+    // Whoever starts the launcher without a command is told of it.
+    let launcher = fs::read_to_string(root().join("tools/macos/victory.sh")).unwrap();
+    assert!(
+        launcher.contains(
+            r#"echo "To check this Mac and the setup instead: tools/macos/victory.sh doctor""#
+        ),
+        "the launcher's hint does not name doctor"
+    );
+}
+
+/// The setup's last step, and the setup's last words, name the doctor.
+#[test]
+fn the_setup_names_the_doctor() {
+    let out = check_setup(
+        "check-setup-names-doctor",
+        &format!(
+            r#"{STARTS}
+echo "game_dir    : (not set)"
+exit 0"#
+        ),
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let said = text(&out.stdout);
+    assert!(said.contains("tools/macos/victory.sh doctor"), "{said}");
+    // It is named, not run: the stand-in wine was not asked for it.
+    assert!(!said.contains("d3d12 device"), "{said}");
+    let setup = fs::read_to_string(root().join("setup.sh")).unwrap();
+    let end = setup
+        .split_once("Setup finished.")
+        .expect("setup.sh says when it is finished")
+        .1;
+    assert!(end.contains("tools/macos/victory.sh doctor"), "{end}");
+}
