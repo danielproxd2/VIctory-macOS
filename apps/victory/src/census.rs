@@ -1,7 +1,7 @@
 //! Which imports do titles need, and which do we cover?
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -18,7 +18,12 @@ struct DllStats {
     images: BTreeSet<PathBuf>,
 }
 
-pub fn run(paths: Vec<PathBuf>, strict: bool, list_missing: bool) -> Result<()> {
+pub fn run(
+    paths: Vec<PathBuf>,
+    strict: bool,
+    list_missing: bool,
+    out: &mut dyn Write,
+) -> Result<()> {
     let paths = crate::default_paths(paths)?;
     let resolver = HleResolver::new(if strict {
         HostPolicy::none()
@@ -77,37 +82,39 @@ pub fn run(paths: Vec<PathBuf>, strict: bool, list_missing: bool) -> Result<()> 
         }
     }
 
-    println!("{images} images scanned, {} unreadable", failed.len());
+    writeln!(out, "{images} images scanned, {} unreadable", failed.len())?;
     for (p, e) in &failed {
-        println!("  skipped {}: {e}", p.display());
+        writeln!(out, "  skipped {}: {e}", p.display())?;
     }
-    println!(
+    writeln!(
+        out,
         "\n{:<56} {:>6} {:>6} {:>6} {:>8} {:>7}",
         "dll", "funcs", "hle", "host", "missing", "images"
-    );
+    )?;
     let (mut f, mut h, mut o, mut m) = (0, 0, 0, 0);
     for (dll, s) in &dlls {
-        println!(
+        writeln!(
+            out,
             "{dll:<56} {:>6} {:>6} {:>6} {:>8} {:>7}",
             s.functions.len(),
             s.hle,
             s.host,
             s.missing,
             s.images.len()
-        );
+        )?;
         f += s.functions.len();
         h += s.hle;
         o += s.host;
         m += s.missing;
     }
-    println!("{:<56} {f:>6} {h:>6} {o:>6} {m:>8}", "TOTAL");
+    writeln!(out, "{:<56} {f:>6} {h:>6} {o:>6} {m:>8}", "TOTAL")?;
 
     if list_missing {
         let mut rows: Vec<_> = missing.into_iter().collect();
         rows.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
-        println!("\nmissing (by number of images using it)");
+        writeln!(out, "\nmissing (by number of images using it)")?;
         for ((dll, sym), users) in rows {
-            println!("  {:>4}  {dll}!{sym}", users.len());
+            writeln!(out, "  {:>4}  {dll}!{sym}", users.len())?;
         }
     }
     Ok(())
@@ -121,4 +128,69 @@ fn looks_like_pe(path: &Path) -> bool {
         .and_then(|mut f| f.read_exact(&mut magic))
         .is_ok()
         && &magic == b"MZ"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::{MISSING_DLL, MISSING_FUNCTION, line, report_of, title_image, write};
+
+    /// The numbers of a DLL's row: functions, hle, host, missing, images.
+    #[track_caller]
+    fn row(text: &str, dll: &str) -> [usize; 5] {
+        let numbers: Vec<usize> = line(text, &format!("{dll} "))
+            .split_whitespace()
+            .skip(1)
+            .map(|n| n.parse().expect("a count"))
+            .collect();
+        numbers.try_into().expect("five counts")
+    }
+
+    #[test]
+    fn census_reports_covered_and_missing_imports() {
+        let dir = tempfile::tempdir().unwrap();
+        // The same image twice (extensions do not matter), a file that
+        // only starts like an image, and one that is none.
+        write(dir.path(), "title.dll", &title_image());
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        write(&dir.path().join("sub"), "copy.bin", &title_image());
+        let broken = write(dir.path(), "broken.exe", b"MZ and nothing else");
+        write(dir.path(), "notes.txt", b"not an image");
+
+        let text = report_of(|out| run(vec![dir.path().into()], false, true, out));
+        assert_eq!(text.lines().next(), Some("2 images scanned, 1 unreadable"));
+        line(&text, &format!("  skipped {}: ", broken.display()));
+        // Ours: implemented by the runtime, on every host. DLL names are
+        // compared without case; each function counts once however many
+        // images import it.
+        assert_eq!(row(&text, "xgameruntime.dll"), [1, 1, 0, 0, 2]);
+        // Nobody's: a named function and an ordinal.
+        assert_eq!(row(&text, MISSING_DLL), [2, 0, 0, 2, 2]);
+        // Delay-load imports count like the others.
+        assert_eq!(row(&text, "victory-test-delayed.dll"), [1, 0, 0, 1, 2]);
+
+        // --missing lists what nobody covers, with the images using it.
+        let (_, missing) = text
+            .split_once("\nmissing (by number of images using it)\n")
+            .expect("the list of missing imports");
+        let listed: Vec<&str> = missing.lines().collect();
+        for expected in [
+            format!("     2  {MISSING_DLL}!{MISSING_FUNCTION}"),
+            format!("     2  {MISSING_DLL}!#7"),
+            "     2  victory-test-delayed.dll!VIctoryTestDelayed".to_owned(),
+        ] {
+            assert!(listed.contains(&expected.as_str()), "{expected}\n{text}");
+        }
+        assert!(!missing.contains("XGameRuntimeInitialize"), "{text}");
+
+        // Without --missing only the table is printed.
+        let text = report_of(|out| run(vec![dir.path().into()], false, false, out));
+        assert!(!text.contains("missing (by number"), "{text}");
+        assert!(!text.contains(MISSING_FUNCTION), "{text}");
+
+        // --strict takes host pass-through away, not our own runtime.
+        let text = report_of(|out| run(vec![dir.path().into()], true, false, out));
+        assert_eq!(row(&text, "xgameruntime.dll"), [1, 1, 0, 0, 2]);
+        assert_eq!(row(&text, MISSING_DLL), [2, 0, 0, 2, 2]);
+    }
 }

@@ -2,6 +2,7 @@
 //! what it cannot handle yet is tallied (decision 0003).
 
 use std::collections::{BTreeMap, HashSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -158,16 +159,18 @@ pub fn run(
     pipelines: bool,
     list: bool,
     jobs: Option<usize>,
+    out: &mut dyn Write,
 ) -> Result<()> {
     let paths = crate::default_paths(paths)?;
     let dll = validate.then(Validator::default_path).flatten();
     if validate {
         Validator::load(dll.as_deref()).map_err(anyhow::Error::msg)?;
-        println!(
+        writeln!(
+            out,
             "validator    {}",
             dll.as_ref()
                 .map_or("dxil.dll".into(), |p| p.display().to_string())
-        );
+        )?;
     }
     if pipelines {
         Host::new(false).map_err(anyhow::Error::msg)?;
@@ -222,15 +225,18 @@ pub fn run(
         }
     }
     let t = total.into_inner().unwrap_or_else(|e| e.into_inner());
-    println!(
+    writeln!(
+        out,
         "containers   {} ({} duplicates skipped)",
         t.containers, t.duplicates
-    );
-    println!(
+    )?;
+    writeln!(
+        out,
         "programs     {} translated of {} ({} IR instructions)",
         t.translated, t.programs, t.instructions
-    );
-    println!(
+    )?;
+    writeln!(
+        out,
         "structured   {} of {} ({} vector instructions, {} guarded, {} on opaque masks; \
          branches {} per lane, {} uniform)",
         t.structured,
@@ -240,36 +246,42 @@ pub fn run(
         t.opaque,
         t.lane_branches,
         t.uniform_branches
-    );
-    println!(
+    )?;
+    writeln!(
+        out,
         "resources    {} of {} tracked (descriptors {} loaded, {} built, {} constant; \
          {} scalar accesses; {} with a computed term)",
         t.tracked, t.translated, t.loaded, t.built, t.constant, t.scalar, t.dynamic
-    );
-    println!(
+    )?;
+    writeln!(
+        out,
         "  used-resource entries {}: {} not traced {:?}; {} traced parameters not listed",
         t.used,
         t.untraced_used.values().sum::<usize>(),
         t.untraced_used,
         t.unlisted
-    );
-    println!(
+    )?;
+    writeln!(
+        out,
         "I/O          {} of {} vertex and pixel programs raised ({} interpolations, \
          {} vertex values; exports {:?}, {} still f16 pairs)",
         t.io_raised, t.io_programs, t.interpolated, t.vertex_values, t.exports, t.compressed
-    );
-    println!(
+    )?;
+    writeln!(
+        out,
         "DXIL         {} emitted of {} vertex and pixel programs; {} validated, {} pipelines",
         t.emitted, t.emit_programs, t.validated, t.pipelines
-    );
-    println!(
+    )?;
+    writeln!(
+        out,
         "             {} emitted of {} compute programs; {} validated, {} pipelines",
         t.cs_emitted, t.cs_programs, t.cs_validated, t.cs_pipelines
-    );
-    println!(
+    )?;
+    writeln!(
+        out,
         "             {} emitted of {} mesh programs; {} validated, {} pipelines",
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
-    );
+    )?;
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
@@ -285,18 +297,18 @@ pub fn run(
                 .unwrap_or_else(|e| e),
                 _ => "not emitted".to_owned(),
             };
-            println!("pair {v} + {p}: {made}");
+            writeln!(out, "pair {v} + {p}: {made}")?;
         }
     }
     let mut lines = t.lines;
     lines.sort();
     for l in lines {
-        println!("{l}");
+        writeln!(out, "{l}")?;
     }
     let mut failed: Vec<_> = t.failed.into_iter().collect();
     failed.sort_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
     for (reason, (n, example)) in failed {
-        println!("  {n:>7}  {reason}  (e.g. {example})");
+        writeln!(out, "  {n:>7}  {reason}  (e.g. {example})")?;
     }
     Ok(())
 }

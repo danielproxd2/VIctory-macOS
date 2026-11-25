@@ -7,9 +7,12 @@ mod census;
 mod inspect;
 mod run;
 mod shader;
+#[cfg(test)]
+mod testing;
 #[cfg(windows)]
 mod translate;
 
+use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -129,24 +132,29 @@ fn main() -> Result<()> {
     if victory_hle::modules::audio::capture::child() {
         return Ok(());
     }
-    let cli = Cli::parse();
+    // Not locked: a running title's threads log while `run` is in here.
+    dispatch(Cli::parse(), &mut std::io::stdout())
+}
+
+/// Runs the command; its report goes to `out`.
+fn dispatch(cli: Cli, out: &mut dyn Write) -> Result<()> {
     match cli.command {
         Command::Inspect {
             file,
             imports,
             exports,
-        } => inspect::run(&file, imports, exports),
+        } => inspect::run(&file, imports, exports, out),
         Command::Census {
             paths,
             strict,
             missing,
-        } => census::run(paths, strict, missing),
-        Command::LibExports { lib, list } => inspect::lib_exports(&lib, list),
+        } => census::run(paths, strict, missing, out),
+        Command::LibExports { lib, list } => inspect::lib_exports(&lib, list, out),
         Command::ShaderInfo {
             paths,
             verbose,
             disasm,
-        } => shader::run(paths, verbose || disasm, disasm),
+        } => shader::run(paths, verbose || disasm, disasm, out),
         Command::Translate {
             paths,
             validate,
@@ -156,7 +164,7 @@ fn main() -> Result<()> {
         } => {
             #[cfg(windows)]
             {
-                translate::run(paths, validate, pipelines, list, jobs)
+                translate::run(paths, validate, pipelines, list, jobs, out)
             }
             // Translation checks shaders with the Windows DXC host, which
             // other hosts do not have yet.
@@ -174,28 +182,44 @@ fn main() -> Result<()> {
             console,
             title_args: _,
         } => run::run(&exe, unimplemented, strict, execute, console),
-        Command::Config => show_config(),
+        Command::Config => show_config(
+            &victory_core::Config::load()?,
+            &|path| victory_core::ensure_outside_repo(path).map_err(|e| e.to_string()),
+            out,
+        ),
     }
 }
 
-fn show_config() -> Result<()> {
-    let cfg = victory_core::Config::load()?;
-    let status = |p: &Option<PathBuf>| match p {
-        Some(p) if p.exists() => format!("{}", p.display()),
-        Some(p) => format!("{}  (does not exist)", p.display()),
-        None => "(not set)".to_owned(),
+/// Prints `cfg` in full, then fails if `outside_repo` refuses one of its
+/// paths (the asset policy).
+fn show_config(
+    cfg: &victory_core::Config,
+    outside_repo: &dyn Fn(&std::path::Path) -> Result<(), String>,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let status = |p: &PathBuf| {
+        if p.exists() {
+            format!("{}", p.display())
+        } else {
+            format!("{}  (does not exist)", p.display())
+        }
     };
-    println!(
+    writeln!(
+        out,
         "config file : {}",
         cfg.source
             .as_ref()
             .map_or("(none)".into(), |p| p.display().to_string())
-    );
-    println!("game_dir    : {}", status(&cfg.game_dir));
-    println!("cache_dir   : {}", cfg.cache_dir.display());
-    println!("data_dir    : {}", cfg.data_dir.display());
+    )?;
+    writeln!(
+        out,
+        "game_dir    : {}",
+        cfg.game_dir.as_ref().map_or("(not set)".into(), status)
+    )?;
+    writeln!(out, "cache_dir   : {}", cfg.cache_dir.display())?;
+    writeln!(out, "data_dir    : {}", cfg.data_dir.display())?;
     for t in &cfg.test_titles {
-        println!("test_title  : {}", status(&Some(t.clone())));
+        writeln!(out, "test_title  : {}", status(t))?;
     }
     let mut violations = 0usize;
     for p in cfg
@@ -204,8 +228,8 @@ fn show_config() -> Result<()> {
         .chain(&cfg.test_titles)
         .chain([&cfg.cache_dir, &cfg.data_dir])
     {
-        if let Err(e) = victory_core::ensure_outside_repo(p) {
-            println!("POLICY VIOLATION: {e}");
+        if let Err(e) = outside_repo(p) {
+            writeln!(out, "POLICY VIOLATION: {e}")?;
             violations += 1;
         }
     }
@@ -229,4 +253,115 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
         "no paths given and none configured (see victory.example.toml)"
     );
     Ok(all)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use victory_core::Config;
+
+    use super::*;
+    use crate::testing::{line, report, report_of};
+
+    /// A command's report goes where `dispatch` is told, and its failure
+    /// comes back as an error.
+    #[test]
+    fn dispatch_writes_the_report_to_its_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = crate::testing::write(dir.path(), "title.dll", &crate::testing::title_image());
+        let cli = Cli::try_parse_from(["victory", "inspect", image.to_str().unwrap()]).unwrap();
+        let text = report_of(|out| dispatch(cli, out));
+        assert_eq!(line(&text, "kind "), "kind           dll");
+
+        let absent = dir.path().join("absent.dll");
+        let cli = Cli::try_parse_from(["victory", "inspect", absent.to_str().unwrap()]).unwrap();
+        let (text, result) = report(|out| dispatch(cli, out));
+        assert!(result.is_err());
+        assert_eq!(text, "");
+    }
+
+    /// The policy check of these tests: inside is what lies below `repo`.
+    fn outside(repo: &Path) -> impl Fn(&Path) -> Result<(), String> + '_ {
+        move |path| {
+            if path.starts_with(repo) {
+                Err(format!("{} is inside the repository", path.display()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// A machine in a temporary folder: `repo`, and a game directory that
+    /// exists outside it. The cache and data directories do not exist.
+    fn configured(root: &Path) -> Config {
+        std::fs::create_dir(root.join("repo")).unwrap();
+        std::fs::create_dir(root.join("game")).unwrap();
+        Config {
+            game_dir: Some(root.join("game")),
+            cache_dir: root.join("cache"),
+            data_dir: root.join("data"),
+            test_titles: vec![root.join("titles")],
+            source: Some(root.join("victory.toml")),
+        }
+    }
+
+    #[test]
+    fn config_reports_every_path_and_passes_when_they_can_be_used() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = configured(tmp.path());
+        let repo = tmp.path().join("repo");
+        let text = report_of(|out| show_config(&cfg, &outside(&repo), out));
+        let shown = |name: &str| tmp.path().join(name).display().to_string();
+        assert_eq!(
+            line(&text, "config file : "),
+            format!("config file : {}", shown("victory.toml"))
+        );
+        assert_eq!(
+            line(&text, "game_dir    : "),
+            format!("game_dir    : {}", shown("game"))
+        );
+        // Created on first use: not being there yet is no fault.
+        assert_eq!(
+            line(&text, "cache_dir   : "),
+            format!("cache_dir   : {}", shown("cache"))
+        );
+        assert_eq!(
+            line(&text, "data_dir    : "),
+            format!("data_dir    : {}", shown("data"))
+        );
+        assert_eq!(
+            line(&text, "test_title  : "),
+            format!("test_title  : {}  (does not exist)", shown("titles"))
+        );
+        assert!(!text.contains("POLICY VIOLATION"), "{text}");
+
+        // No game directory configured is a configuration too.
+        let cfg = Config {
+            game_dir: None,
+            source: None,
+            ..cfg
+        };
+        let text = report_of(|out| show_config(&cfg, &outside(&repo), out));
+        assert_eq!(line(&text, "config file : "), "config file : (none)");
+        assert_eq!(line(&text, "game_dir    : "), "game_dir    : (not set)");
+    }
+
+    #[test]
+    fn config_fails_when_a_path_is_inside_the_repository() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let cfg = Config {
+            cache_dir: repo.join("cache"),
+            data_dir: repo.join("data"),
+            ..configured(tmp.path())
+        };
+        let (text, result) = report(|out| show_config(&cfg, &outside(&repo), out));
+        line(&text, "data_dir    : ");
+        assert_eq!(text.matches("POLICY VIOLATION: ").count(), 2, "{text}");
+        assert_eq!(
+            result.expect_err("two paths inside").to_string(),
+            "2 configured path(s) violate the asset policy (see docs/asset-policy.md)"
+        );
+    }
 }

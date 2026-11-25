@@ -2,6 +2,7 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -71,7 +72,7 @@ struct Totals {
     files_with_shaders: usize,
 }
 
-pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
+pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool, out: &mut dyn Write) -> Result<()> {
     let paths = crate::default_paths(paths)?;
     let mut t = Totals::default();
     for root in &paths {
@@ -169,50 +170,55 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                     None => "no parsable DXIL program".to_owned(),
                 } + &native;
                 if verbose {
-                    println!("{}{}: {line}", path.display(), source.label());
+                    writeln!(out, "{}{}: {line}", path.display(), source.label())?;
                     for l in &listing {
-                        println!("{l}");
+                        writeln!(out, "{l}")?;
                     }
                 }
             }
             t.files_with_shaders += usize::from(found_here > 0);
         }
     }
-    println!(
+    writeln!(
+        out,
         "containers found       {} (in {} files)",
         t.containers, t.files_with_shaders
-    );
-    println!("  with DXIL part       {}", t.with_dxil_part);
-    println!("  with LLVM bitcode    {}", t.with_bitcode);
-    println!("  PC-standard layout   {}", t.standard_layout);
-    println!("  XDAT prefix          {}", t.xdat);
-    println!("  xbop trailer         {}", t.xbop);
+    )?;
+    writeln!(out, "  with DXIL part       {}", t.with_dxil_part)?;
+    writeln!(out, "  with LLVM bitcode    {}", t.with_bitcode)?;
+    writeln!(out, "  PC-standard layout   {}", t.standard_layout)?;
+    writeln!(out, "  XDAT prefix          {}", t.xdat)?;
+    writeln!(out, "  xbop trailer         {}", t.xbop)?;
     for (k, n) in &t.kinds {
-        println!("  {k:<20} {n}");
+        writeln!(out, "  {k:<20} {n}")?;
     }
-    println!("  with native code     {}", t.with_native);
+    writeln!(out, "  with native code     {}", t.with_native)?;
     for (stage, n) in &t.native_stages {
-        println!("    {:<18} {n}", format!("{stage:?}"));
+        writeln!(out, "    {:<18} {n}", format!("{stage:?}"))?;
     }
     for (e, n) in &t.native_errors {
-        println!("  native unreadable    {n}: {e}");
+        writeln!(out, "  native unreadable    {n}: {e}")?;
     }
     if t.with_native > 0 {
-        println!(
+        writeln!(
+            out,
             "  decoded programs     {} ({} instructions)",
             t.decoded, t.instructions
-        );
+        )?;
         for (e, n) in &t.decode_errors {
-            println!("  decode failed        {n}: {e}");
+            writeln!(out, "  decode failed        {n}: {e}")?;
         }
         let mut unnamed: Vec<_> = t.unnamed.iter().collect();
         unnamed.sort_by_key(|&(_, n)| std::cmp::Reverse(*n));
         for (op, n) in unnamed.iter().take(10) {
-            println!("  opcode not in table  {op} x{n}");
+            writeln!(out, "  opcode not in table  {op} x{n}")?;
         }
     }
     if t.containers == 0 {
-        println!("(none found: shaders may sit in compressed or encrypted archives)");
+        writeln!(
+            out,
+            "(none found: shaders may sit in compressed or encrypted archives)"
+        )?;
     }
     Ok(())
 }
@@ -224,4 +230,63 @@ fn format_instruction(i: &Instruction, wave64: bool) -> String {
         None => format!("<{:?} {:#x}>", i.encoding, i.opcode),
     };
     format!("    {:06x}: {:<44} {text}", i.offset, words.join(" "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::{
+        line, pixel_container, report_of, sgd5_file, sgd5_record, vertex_container, write,
+    };
+
+    #[test]
+    fn shader_info_reports_a_synthetic_container_and_a_packed_record() {
+        let dir = tempfile::tempdir().unwrap();
+        // A container as it is, between other bytes (as in an archive).
+        let mut raw = vec![0x5A; 0x30];
+        raw.extend(vertex_container());
+        raw.extend([0xA5; 0x11]);
+        let raw = write(dir.path(), "archive.bin", &raw);
+        // One in a packed record of an SGD5 file.
+        let record = sgd5_record("PS_Synthetic_0011aabb_Wrapped", 0x32, &pixel_container());
+        let packed = write(dir.path(), "shaders.sgd5", &sgd5_file(&[record]));
+        write(dir.path(), "notes.txt", b"no shader in here");
+
+        let text = report_of(|out| run(vec![dir.path().into()], true, false, out));
+        assert_eq!(
+            line(&text, "containers found"),
+            "containers found       2 (in 2 files)"
+        );
+        assert_eq!(line(&text, "  with DXIL part"), "  with DXIL part       2");
+        assert_eq!(
+            line(&text, "  with native code"),
+            "  with native code     2"
+        );
+        assert_eq!(line(&text, "    Vs").split_whitespace().last(), Some("1"));
+        assert_eq!(line(&text, "    Ps").split_whitespace().last(), Some("1"));
+        assert!(
+            line(&text, "  decoded programs").starts_with("  decoded programs     2 ("),
+            "{text}"
+        );
+        // --verbose: one line per container, saying where it is.
+        let at_offset = format!("{}@0x30: ", raw.display());
+        assert!(line(&text, &at_offset).contains("native Vs "), "{text}");
+        let in_record = line(&text, &format!("{}@", packed.display()));
+        assert!(
+            in_record.contains(" PS_Synthetic_0011aabb_Wrapped: "),
+            "{text}"
+        );
+        assert!(in_record.contains("native Ps "), "{text}");
+
+        // Without --verbose only the summary is printed.
+        let quiet = report_of(|out| run(vec![dir.path().into()], false, false, out));
+        assert!(!quiet.contains("@0x30"), "{quiet}");
+        assert_eq!(
+            line(&quiet, "containers found"),
+            "containers found       2 (in 2 files)"
+        );
+        // --disasm lists the decoded instructions under each container.
+        let listing = report_of(|out| run(vec![raw.clone()], true, true, out));
+        assert!(listing.contains("s_endpgm"), "{listing}");
+    }
 }
