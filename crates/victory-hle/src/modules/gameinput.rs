@@ -2,7 +2,8 @@
 //! (host slots 0-3); while none is connected, the keyboard drives one
 //! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
 //! too. A poll thread turns host state into readings (a new one per change)
-//! and runs device callbacks on connect and disconnect.
+//! and runs device callbacks on connect and disconnect, and reading
+//! callbacks for each new reading.
 #![allow(non_snake_case)]
 // Title code calls these through the objects, passing pointers the real API
 // would trust.
@@ -257,6 +258,12 @@ impl Ref {
         reading_add_ref(self.0.as_ptr());
         self.0.as_ptr()
     }
+
+    /// Another reference, for us.
+    fn again(&self) -> Ref {
+        reading_add_ref(self.0.as_ptr());
+        Ref(self.0)
+    }
 }
 
 impl Deref for Ref {
@@ -274,6 +281,16 @@ impl Drop for Ref {
 }
 
 type DeviceCallback = extern "system" fn(u64, *mut c_void, *const Device, u64, u32, u32);
+/// Token, context, the new reading (the callee adds a reference to keep
+/// it) and, in this version of the interface, whether readings were lost
+/// before it: never, each new reading is reported.
+type ReadingCallback = extern "system" fn(u64, *mut c_void, *const Reading, bool);
+
+#[derive(Clone, Copy)]
+enum Callback {
+    Device(DeviceCallback),
+    Reading(ReadingCallback),
+}
 
 #[derive(Clone, Copy)]
 struct Registration {
@@ -281,9 +298,10 @@ struct Registration {
     /// One device's address, or 0 for any.
     device: usize,
     kind: u32,
+    /// Device callbacks: the status bits to report changes of.
     status: u32,
     context: usize,
-    callback: DeviceCallback,
+    callback: Callback,
 }
 
 impl Registration {
@@ -296,19 +314,31 @@ impl Registration {
         Event {
             registration: *self,
             device,
-            timestamp,
-            current,
-            previous,
+            what: What::Status {
+                timestamp,
+                current,
+                previous,
+            },
         }
     }
+}
+
+/// What a callback is called about.
+enum What {
+    /// A device's status changed.
+    Status {
+        timestamp: u64,
+        current: u32,
+        previous: u32,
+    },
+    /// A device has a new reading; ours until the callback returned.
+    Reading(Ref),
 }
 
 struct Event {
     registration: Registration,
     device: usize,
-    timestamp: u64,
-    current: u32,
-    previous: u32,
+    what: What,
 }
 
 #[derive(Default)]
@@ -424,14 +454,25 @@ impl Hub {
                 }
                 state.running.push((r.token, me));
             }
-            (r.callback)(
-                r.token,
-                r.context as *mut c_void,
-                &self.devices[e.device],
-                e.timestamp,
-                e.current,
-                e.previous,
-            );
+            let context = r.context as *mut c_void;
+            match (r.callback, &e.what) {
+                (
+                    Callback::Device(callback),
+                    &What::Status {
+                        timestamp,
+                        current,
+                        previous,
+                    },
+                ) => {
+                    let device = &self.devices[e.device];
+                    callback(r.token, context, device, timestamp, current, previous);
+                }
+                (Callback::Reading(callback), What::Reading(reading)) => {
+                    callback(r.token, context, reading.0.as_ptr(), false);
+                }
+                // An event is made for its registration's kind of callback.
+                _ => {}
+            }
             let mut state = self.state();
             if let Some(i) = state.running.iter().position(|&x| x == (r.token, me)) {
                 state.running.swap_remove(i);
@@ -477,6 +518,7 @@ impl State {
         let slot = &mut self.slots[index];
         let was = slot.connected;
         slot.connected = value.is_some();
+        let mut arrived = None;
         if let Some(value) = value
             && (!was || slot.history.back().is_none_or(|r| r.value != value))
         {
@@ -484,14 +526,16 @@ impl State {
             if slot.history.len() == HISTORY {
                 slot.history.pop_front();
             }
-            slot.history.push_back(Ref::new(Reading {
+            let reading = Ref::new(Reading {
                 vtable: &READING,
                 refs: AtomicU32::new(1),
                 device: &devices[index],
                 sequence: slot.sequence,
                 timestamp: now,
                 value,
-            }));
+            });
+            arrived = Some(reading.again());
+            slot.history.push_back(reading);
         }
         if was != slot.connected {
             tracing::info!(device = index, connected = !was, "input device");
@@ -503,8 +547,23 @@ impl State {
             events.extend(
                 self.callbacks
                     .iter()
+                    .filter(|r| matches!(r.callback, Callback::Device(_)))
                     .filter(|r| r.matches(devices, index) && r.status & STATUS_CONNECTED != 0)
                     .map(|r| r.event(index, now, current, previous)),
+            );
+        }
+        // After the device's own arrival, its reading.
+        if let Some(reading) = arrived {
+            events.extend(
+                self.callbacks
+                    .iter()
+                    .filter(|r| matches!(r.callback, Callback::Reading(_)))
+                    .filter(|r| r.matches(devices, index))
+                    .map(|r| Event {
+                        registration: *r,
+                        device: index,
+                        what: What::Reading(reading.again()),
+                    }),
             );
         }
     }
@@ -723,19 +782,44 @@ fn token(out: *mut u64) -> HRESULT {
     S_OK
 }
 
-// shortcut: reading callbacks never run; Grand Theft Auto VI registers none
-// (it polls).
+/// Reading callbacks run on our poll thread "when a new reading arrives in
+/// the input stream", for the device given (any if null) and the kinds
+/// asked for. "Registering a callback does not cause an initial callback
+/// to be dispatched with the most current reading": only readings made
+/// from now on are reported. The analog threshold of this version of the
+/// interface (gone from the current reference) is not applied, so a
+/// change smaller than it is reported too. The token is zero on failure.
 extern "system" fn register_reading(
-    _: This,
-    _device: *const c_void,
-    _kind: u32,
+    this: This,
+    device: *const Device,
+    kind: u32,
     _threshold: f32,
-    _context: *mut c_void,
-    _callback: *const c_void,
+    context: *mut c_void,
+    callback: Option<ReadingCallback>,
     out: *mut u64,
 ) -> HRESULT {
-    tracing::warn!("input reading callbacks are never called");
-    token(out)
+    let Some(callback) = callback else {
+        if !out.is_null() {
+            // SAFETY: checked non-null.
+            unsafe { out.write(0) };
+        }
+        return E_INVALIDARG;
+    };
+    let registration = Registration {
+        token: NEXT_TOKEN.fetch_add(1, Ordering::Relaxed),
+        device: device as usize,
+        kind,
+        status: 0,
+        context: context as usize,
+        callback: Callback::Reading(callback),
+    };
+    tracing::info!(kind = format_args!("{kind:#x}"), "input reading callback");
+    hub(this).state().callbacks.push(registration);
+    if !out.is_null() {
+        // SAFETY: checked non-null.
+        unsafe { out.write(registration.token) };
+    }
+    S_OK
 }
 
 /// Device callbacks run on our poll thread when a device comes or goes.
@@ -762,7 +846,7 @@ extern "system" fn register_device(
         kind,
         status,
         context: context as usize,
-        callback,
+        callback: Callback::Device(callback),
     };
     let mut found = Vec::new();
     {
@@ -1902,5 +1986,122 @@ mod tests {
         for r in [stand_in, keyboard, a0, b1, x0] {
             release(r);
         }
+    }
+
+    /// Reading callbacks seen: token, device, sequence, kind, overrun.
+    type Seen = Mutex<Vec<(u64, usize, u64, u32, bool)>>;
+
+    extern "system" fn see(token: u64, context: *mut c_void, new: *const Reading, overrun: bool) {
+        let new = reading(new);
+        // SAFETY: the test passes its log; the reading names its device.
+        let (seen, device) = unsafe { (&*(context as *const Seen), (*new.device).index) };
+        let entry = (token, device, new.sequence, new.kind(), overrun);
+        seen.lock().unwrap().push(entry);
+    }
+
+    type RegisterReading = extern "system" fn(
+        This,
+        *const Device,
+        u32,
+        f32,
+        *mut c_void,
+        Option<ReadingCallback>,
+        *mut u64,
+    ) -> HRESULT;
+
+    fn watch(hub: &Hub, device: *const Device, kind: u32, seen: &Seen) -> u64 {
+        let register = slot::<RegisterReading, _>(&hub.object, 0x40);
+        let context = seen as *const Seen as *mut c_void;
+        let mut token = 0;
+        let hr = register(
+            &hub.object,
+            device,
+            kind,
+            0.0,
+            context,
+            Some(see),
+            &mut token,
+        );
+        assert_eq!(hr, S_OK);
+        assert_ne!(token, 0);
+        token
+    }
+
+    #[test]
+    fn reading_callbacks_fire_on_new_readings_and_stop_when_unregistered() {
+        let (hub, host) = fake();
+        let seen = Seen::default();
+        let take = || std::mem::take(&mut *seen.lock().unwrap());
+        let any = std::ptr::null();
+        let pads = watch(hub, any, GAMEPAD_KIND, &seen);
+        // No initial callback with the current reading, and none while
+        // nothing changes.
+        hub.poll();
+        assert_eq!(take(), []);
+
+        let set = |slot: usize, buttons: u32| {
+            host.lock().unwrap().pads[slot] = Some(PadState {
+                buttons,
+                ..Default::default()
+            });
+            hub.poll();
+        };
+        // A pad arrives: its first reading; then one per change.
+        set(1, A);
+        assert_eq!(take(), [(pads, 1, 1, GAMEPAD_KIND, false)]);
+        set(1, B);
+        assert_eq!(take(), [(pads, 1, 2, GAMEPAD_KIND, false)]);
+        // What was reported is the device's current reading.
+        let now = current(hub, GAMEPAD_KIND, 1).unwrap();
+        assert_eq!((stamp(now).1, pad(now).buttons), (2, B));
+        release(now);
+
+        // Filters: a kind, and one device.
+        let keyboard = watch(hub, &hub.devices[KEYBOARD], KEYBOARD_KIND, &seen);
+        let third = watch(hub, &hub.devices[2], GAMEPAD_KIND, &seen);
+        host.lock().unwrap().keys = vec![key(b'W')];
+        hub.poll();
+        // The keyboard's first reading was made by the hub's first poll.
+        assert_eq!(take(), [(keyboard, KEYBOARD, 2, KEYBOARD_KIND, false)]);
+        set(1, X);
+        assert_eq!(take(), [(pads, 1, 3, GAMEPAD_KIND, false)]);
+        set(2, Y);
+        assert_eq!(
+            take(),
+            [
+                (pads, 2, 1, GAMEPAD_KIND, false),
+                (third, 2, 1, GAMEPAD_KIND, false)
+            ]
+        );
+
+        // Unregistered or stopped, a callback is not called again.
+        let unregister = slot::<extern "system" fn(This, u64, u64) -> bool, _>(&hub.object, 0x68);
+        assert!(unregister(&hub.object, pads, 5000));
+        let stop = slot::<extern "system" fn(This, u64), _>(&hub.object, 0x60);
+        stop(&hub.object, keyboard);
+        host.lock().unwrap().keys = Vec::new();
+        set(2, A);
+        assert_eq!(take(), [(third, 2, 2, GAMEPAD_KIND, false)]);
+        assert!(unregister(&hub.object, third, 5000));
+        set(2, B);
+        assert_eq!(take(), []);
+
+        // A registration needs its function; the token is zero on failure.
+        let register = slot::<RegisterReading, _>(&hub.object, 0x40);
+        let mut token = 0x55;
+        let context = std::ptr::null_mut();
+        assert_eq!(
+            register(
+                &hub.object,
+                any,
+                GAMEPAD_KIND,
+                0.0,
+                context,
+                None,
+                &mut token
+            ),
+            E_INVALIDARG
+        );
+        assert_eq!(token, 0);
     }
 }
