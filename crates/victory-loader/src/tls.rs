@@ -30,7 +30,7 @@ const TLS64_ADDRESS_OF_INDEX: u64 = 16;
 /// `base` is the image `info` describes, mapped and not yet running.
 pub(crate) unsafe fn redirect(base: usize, info: &ImageInfo) -> Result<usize> {
     // SAFETY: forwarded from the caller.
-    Ok(unsafe { redirect_image(base, info) }?.patched)
+    Ok(unsafe { redirect_image(base, info) }?.rewritten())
 }
 
 /// The bytes of `section` in memory: where a section says it has none, the
@@ -59,7 +59,8 @@ fn in_a_section(info: &ImageInfo, rva: u64, len: u64) -> bool {
 }
 
 /// The functions the mapped image's exception directory lists (see
-/// [`tls_scan::functions`]); `None` for an image without one.
+/// [`tls_scan::functions`]); `None` for an image without one. They decide
+/// only how a rewritten load is counted, not whether it is rewritten.
 ///
 /// # Safety
 /// As for [`redirect`].
@@ -178,23 +179,26 @@ unsafe fn redirect_image(base: usize, info: &ImageInfo) -> Result<Scan> {
     let Scan {
         patched,
         unpatched,
-        outside_functions,
+        patched_outside_functions,
     } = found;
+    // Both counts, so that a run of a real title records how many loads
+    // lie outside the functions its exception directory lists (leaf
+    // functions, or data: see `tls_scan`); for an image that lists none,
+    // all are in `patched_in_functions`.
     tracing::info!(
         index,
-        patched,
+        patched_in_functions = patched,
+        patched_outside_functions,
         unpatched,
-        outside_functions,
+        lists_functions = functions.is_some(),
         "static TLS redirected"
     );
-    if unpatched != 0 || outside_functions != 0 {
+    if unpatched != 0 {
         // Each of these still reads the TLS array itself, and so slot 0:
         // another image's block.
         tracing::warn!(
             unpatched,
-            outside_functions,
-            "TLS-array accesses were left as they are: forms that are not rewritten, and matches \
-             outside the functions the image lists (data, or leaf functions)"
+            "TLS-array accesses were left as they are: forms that are not rewritten"
         );
     }
     Ok(found)
@@ -466,25 +470,30 @@ mod tests {
         }
     }
 
-    fn found(patched: usize, unpatched: usize, outside_functions: usize) -> Scan {
+    fn found(patched: usize, unpatched: usize, patched_outside_functions: usize) -> Scan {
         Scan {
             patched,
             unpatched,
-            outside_functions,
+            patched_outside_functions,
         }
     }
 
+    /// The load between the two listed functions (a leaf function has no
+    /// unwind entry, so it would look like this) is rewritten too, and
+    /// counted apart from the two inside them.
     #[test]
-    fn redirect_patches_the_listed_functions_only() {
+    fn redirect_patches_outside_the_listed_functions_and_counts_it_apart() {
         let image = Mapped::new(&title(true), 3);
         assert_eq!(image.redirect().unwrap(), found(2, 2, 1));
         let (code, before) = (image.code(), title_code());
         assert_eq!(
             (code[0], code[SECOND]),
             (0xE8, 0xE8),
-            "the two loads are calls"
+            "the two loads in listed functions are calls"
         );
-        assert_eq!(code[TABLE..SECOND], before[TABLE..SECOND], "the table");
+        assert_eq!(code[TABLE], 0xE8, "so is the one between them");
+        assert_eq!(code[TABLE + 5..TABLE + 9], [0x0F, 0x1F, 0x40, 0x00]);
+        assert_eq!(code[TABLE + 9..SECOND], before[TABLE + 9..SECOND]);
         assert_eq!(code[SECOND + 9..], before[SECOND + 9..], "the other forms");
         assert_eq!(image.index(), 0, "CRT code adds the index itself");
         // Redirected once: the index is 0 now, and there is nothing to do.
@@ -492,7 +501,47 @@ mod tests {
         // The public entry reports the loads patched.
         let image = Mapped::new(&title(true), 3);
         // SAFETY: mapped as `info` describes; nothing runs its code.
-        assert_eq!(unsafe { redirect(image.base, &image.info) }.unwrap(), 2);
+        assert_eq!(unsafe { redirect(image.base, &image.info) }.unwrap(), 3);
+    }
+
+    /// Only executable sections are scanned: the same nine bytes in
+    /// read-only or writable data are not code, whatever the exception
+    /// directory lists.
+    #[test]
+    fn a_match_in_a_non_executable_section_is_never_patched() {
+        let mut data = load(2).to_vec();
+        data.extend(load(9));
+        data.extend([0xAA; 14]);
+        for listed in [true, false] {
+            let builder = title(listed).section(".rdata", scn::RDATA, &data).section(
+                ".data",
+                scn::DATA,
+                &data,
+            );
+            let image = Mapped::new(&builder, 3);
+            let scan = image.redirect().unwrap();
+            // What the code section alone holds (see the tests above).
+            let expected = if listed {
+                found(2, 2, 1)
+            } else {
+                found(3, 2, 0)
+            };
+            assert_eq!(scan, expected, "listed {listed}");
+            let mut seen = 0;
+            for s in &image.info.sections {
+                if !(s.name.starts_with(".rdata") || s.name.starts_with(".data")) {
+                    continue;
+                }
+                assert_eq!(s.characteristics & SCN_MEM_EXECUTE, 0);
+                let at = (image.base + s.rva as usize) as *const u8;
+                // SAFETY: a section of our mapped image.
+                let mapped = unsafe { std::slice::from_raw_parts(at, data.len()) };
+                assert_eq!(mapped, data, "{} (listed {listed})", s.name);
+                seen += 1;
+            }
+            assert_eq!(seen, 2, "both data sections were looked at");
+            assert_eq!(image.code()[0], 0xE8, "the code was redirected");
+        }
     }
 
     #[test]

@@ -3,15 +3,28 @@
 //! The part of the static TLS redirect (see `tls`) that only looks at
 //! bytes, so it is built and tested on every host.
 //!
-//! shortcut: a byte match, not a decode. In Grand Theft Auto VI all 53,246
-//! hits of the whole-section match were instruction starts and none was
-//! missed (checked against a full disassembly). Two things keep a match
-//! from being a mistake without a decoder: only bytes inside the functions
-//! the image's exception directory lists are rewritten, so tables and
-//! constants between functions are left alone, and whatever the match
-//! leaves is counted, so that it shows in the log. What remains is a match
-//! inside a longer instruction of a function (an immediate that happens to
-//! hold the nine bytes); decode the functions if a title shows one.
+//! shortcut: a byte match over every executable section, not a decode.
+//!
+//! Established: in Grand Theft Auto VI all 53,246 hits of the whole-section
+//! match were instruction starts and none was missed (checked against a
+//! full disassembly). That is the behaviour kept here: every match in an
+//! executable section is rewritten.
+//!
+//! Not established: how many of those hits lie outside the functions the
+//! image's exception directory lists. That was never recorded, and the PE
+//! format does not say that every function is listed: an x64 leaf function
+//! (a small thread-local getter is one) has no unwind entry. So a match
+//! outside the listed functions cannot be taken for data, and leaving it
+//! would make such a function read slot 0, another image's block, in
+//! silence. The scan therefore rewrites those too and counts them apart
+//! (`patched_outside_functions`), and the redirect logs both counts, so
+//! that a run of a real title records the number.
+//!
+//! What a byte match can still get wrong, and no title is known to show:
+//! the nine bytes in a table or constant inside an executable section, and
+//! the nine bytes inside a longer instruction (an immediate). Decode the
+//! code if a title shows either; a large outside count with a crash in
+//! data-driven code would be the sign of the first.
 
 use std::ops::Range;
 
@@ -25,26 +38,34 @@ const RUNTIME_FUNCTION_SIZE: usize = 12;
 /// What a scan of code found.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Scan {
-    /// Loads rewritten as calls.
+    /// Loads rewritten as calls inside the functions the image lists; for
+    /// an image that lists none, all of them.
     pub(crate) patched: usize,
-    /// Accesses to the TLS array inside functions that were recognised but
-    /// not rewritten: the 32-bit load, the `moffs` form, a load into `rsp`,
-    /// one with a redundant REX bit, or a call out of `rel32` reach. Code
-    /// that goes on to index the array from one of these reads the wrong
-    /// thread-local block.
+    /// Accesses to the TLS array that were recognised but not rewritten,
+    /// inside listed functions or not: the 32-bit load, the `moffs` form, a
+    /// load into `rsp`, one with a redundant REX bit, or a call out of
+    /// `rel32` reach. Code that goes on to index the array from one of
+    /// these reads the wrong thread-local block.
     pub(crate) unpatched: usize,
-    /// Byte matches of the load between the functions of an image that
-    /// lists its functions. Not rewritten: they are data, or a leaf
-    /// function (one that needs no unwind data is not listed), which the
-    /// bytes alone do not tell apart.
-    pub(crate) outside_functions: usize,
+    /// Loads rewritten as calls between the functions of an image that
+    /// lists its functions: leaf functions (one that needs no unwind data
+    /// is not listed) or, which the bytes alone do not tell apart, data
+    /// that holds the same nine bytes (see the module's note).
+    pub(crate) patched_outside_functions: usize,
+}
+
+impl Scan {
+    /// Every load rewritten, listed function or not.
+    pub(crate) fn rewritten(&self) -> usize {
+        self.patched + self.patched_outside_functions
+    }
 }
 
 impl std::ops::AddAssign for Scan {
     fn add_assign(&mut self, other: Scan) {
         self.patched += other.patched;
         self.unpatched += other.unpatched;
-        self.outside_functions += other.outside_functions;
+        self.patched_outside_functions += other.patched_outside_functions;
     }
 }
 
@@ -93,9 +114,10 @@ fn access(code: &[u8]) -> Option<Access> {
     }
 }
 
-/// Scans `code[range]`, which is at address `at + range.start`. In a
-/// function, loads become `call thunks[r]; nop4`; elsewhere they are only
-/// counted. An instruction is looked for inside the range only.
+/// Scans `code[range]`, which is at address `at + range.start`: loads
+/// become `call thunks[r]; nop4`, counted as inside a listed function or
+/// (`function` false) outside. An instruction is looked for inside the
+/// range only.
 fn scan(
     code: &mut [u8],
     range: Range<usize>,
@@ -107,25 +129,25 @@ fn scan(
     let mut i = range.start;
     while i < range.end {
         i += match access(&code[i..range.end]) {
-            Some(Access::Load(reg)) if function => {
+            Some(Access::Load(reg)) => {
                 let target = (thunks + reg * THUNK_SIZE) as i128;
                 let rel = i32::try_from(target - (at + i + 5) as i128);
                 if let Ok(rel) = rel {
                     code[i] = 0xE8;
                     code[i + 1..i + 5].copy_from_slice(&rel.to_le_bytes());
                     code[i + 5..i + 9].copy_from_slice(&[0x0F, 0x1F, 0x40, 0x00]);
-                    found.patched += 1;
+                    if function {
+                        found.patched += 1;
+                    } else {
+                        found.patched_outside_functions += 1;
+                    }
                 } else {
                     found.unpatched += 1;
                 }
                 LOAD_LEN
             }
-            Some(Access::Load(_)) => {
-                found.outside_functions += 1;
-                LOAD_LEN
-            }
             Some(Access::Other(len)) => {
-                found.unpatched += usize::from(function);
+                found.unpatched += 1;
                 len
             }
             None => 1,
@@ -142,9 +164,11 @@ pub(crate) fn patch(code: &mut [u8], at: usize, thunks: usize) -> Scan {
     found
 }
 
-/// [`patch`] for the parts of `code` that `functions` names (offsets into
-/// `code`, sorted and apart, as [`within`] returns them). Matches in the
-/// bytes between them are counted and left as they are.
+/// [`patch`] for code whose listed functions are `functions` (offsets into
+/// `code`, sorted and apart, as [`within`] returns them). The bytes between
+/// them are scanned as well, apart from the functions (a match does not
+/// straddle a function's start or end), and what is rewritten there is
+/// counted as outside.
 pub(crate) fn patch_functions(
     code: &mut [u8],
     at: usize,
@@ -217,11 +241,11 @@ mod tests {
     const AT: usize = 0x1_4000_1000;
     const THUNKS: usize = 0x1_3fff_0000;
 
-    fn found(patched: usize, unpatched: usize, outside_functions: usize) -> Scan {
+    fn found(patched: usize, unpatched: usize, patched_outside_functions: usize) -> Scan {
         Scan {
             patched,
             unpatched,
-            outside_functions,
+            patched_outside_functions,
         }
     }
 
@@ -264,33 +288,55 @@ mod tests {
         assert_eq!(other, [0x64, 0x48, 0x8B, 0x04, 0x25, 0x58, 0, 0, 0]);
     }
 
+    /// A load between the listed functions (a leaf function has no unwind
+    /// entry) is rewritten like one inside, and counted apart.
     #[test]
-    fn pattern_in_data_outside_functions_is_left_alone() {
-        // A function with a load, eight bytes of a table that hold the
-        // same nine bytes (with a neighbour), then a second function.
+    fn a_load_outside_the_listed_functions_is_patched_and_counted_apart() {
+        // A listed function with a load, a leaf that is not listed (a
+        // load into rcx, a return and padding), then a second listed one.
         let mut code = Vec::new();
         code.extend(load(0));
         code.push(0xC3);
-        let table = code.len();
+        let leaf = code.len();
         code.extend(load(1));
-        code.extend([0xAA; 7]);
+        code.push(0xC3);
+        code.extend([0xCC; 6]);
         let second = code.len();
         code.extend(load(8));
         code.push(0xC3);
         let before = code.clone();
-        let functions = [0..table, second..code.len()];
+        let functions = [0..leaf, second..code.len()];
         let scan = patch_functions(&mut code, AT, THUNKS, &functions);
         assert_eq!(scan, found(2, 0, 1));
-        assert_eq!(code[table..second], before[table..second], "the table");
-        assert_eq!((code[0], code[second]), (0xE8, 0xE8));
-        // With no functions listed, nothing is rewritten and all three
-        // matches are counted.
+        assert_eq!(scan.rewritten(), 3);
+        assert_eq!((code[0], code[leaf], code[second]), (0xE8, 0xE8, 0xE8));
+        // The leaf's call goes to its own register's thunk.
+        let rel = i32::from_le_bytes([
+            code[leaf + 1],
+            code[leaf + 2],
+            code[leaf + 3],
+            code[leaf + 4],
+        ]);
+        let target = (AT + leaf + 5).wrapping_add_signed(rel as isize);
+        assert_eq!(target, THUNKS + THUNK_SIZE);
+        assert_eq!(code[leaf + 9..second], before[leaf + 9..second]);
+        // With no functions listed at all, every one is outside.
         let mut code = before.clone();
         assert_eq!(patch_functions(&mut code, AT, THUNKS, &[]), found(0, 0, 3));
-        assert_eq!(code, before);
-        // The same bytes as one stretch of code: all three are rewritten.
+        let whole = code.clone();
+        // The same bytes as one stretch of code: the same rewrite, all
+        // counted as inside.
         let mut code = before.clone();
         assert_eq!(patch(&mut code, AT, THUNKS), found(3, 0, 0));
+        assert_eq!(code, whole);
+        // Outside a function a thunk out of reach is counted as left too.
+        let mut code = before.clone();
+        let far = AT + (1 << 32);
+        assert_eq!(
+            patch_functions(&mut code, AT, far, &functions),
+            found(0, 3, 0)
+        );
+        assert_eq!(code, before);
     }
 
     #[test]
@@ -348,9 +394,11 @@ mod tests {
             let before = code.clone();
             assert_eq!(patch(&mut code, AT, THUNKS), found(0, 1, 0), "{name}");
             assert_eq!(code, before, "{name}");
-            // Between functions they are not code: not counted either.
+            // Between listed functions they may be a leaf function's:
+            // counted there as well.
             let scan = patch_functions(&mut code, AT, THUNKS, &[]);
-            assert_eq!(scan, found(0, 0, 0), "{name}");
+            assert_eq!(scan, found(0, 1, 0), "{name}");
+            assert_eq!(code, before, "{name}");
         }
         // One of each after a load that is rewritten: counted apiece.
         let mut code = load(3).to_vec();
@@ -393,9 +441,8 @@ mod tests {
         }
     }
 
-    /// What bounding the match to functions does not cure: inside a
-    /// function, the nine bytes as part of a longer instruction are taken
-    /// for a load. Telling them apart needs a decoder (see the module's
+    /// What a byte match cannot tell: the nine bytes as part of a longer
+    /// instruction are taken for a load. Telling them apart needs a decoder (see the module's
     /// note); this test is to change when one is used.
     #[test]
     fn known_limit_pattern_inside_an_imm64_is_still_patched() {
