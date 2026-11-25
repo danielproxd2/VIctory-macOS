@@ -38,7 +38,6 @@ pub(crate) fn line<'a>(text: &'a str, start: &str) -> &'a str {
 
 /// Says that the running test did not check something and why, as the
 /// line `skipped: <reason> (<test>)` past the test harness's capture.
-#[cfg(windows)]
 pub(crate) fn skip(reason: &str) {
     let thread = std::thread::current();
     victory_gpu::test_support::skipped(&format!("{reason} ({})", thread.name().unwrap_or("?")));

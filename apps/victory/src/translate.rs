@@ -25,7 +25,7 @@ use victory_shader::{
 };
 use victory_shader::{io, resource};
 
-use crate::shader::{MAX_FILE, Source, sources};
+use crate::shader::{MAX_FILE, Skipped, Source, sources, walk};
 
 #[derive(Default)]
 struct Tally {
@@ -212,6 +212,12 @@ impl Options {
 pub fn run(paths: Vec<PathBuf>, options: &Options, out: &mut dyn Write) -> Result<()> {
     options.check_host()?;
     let paths = crate::default_paths(paths)?;
+    scan(&paths, options, MAX_FILE, out)
+}
+
+/// [`run`] on `paths` as they are, reading no file above `max_file` bytes.
+fn scan(paths: &[PathBuf], options: &Options, max_file: u64, out: &mut dyn Write) -> Result<()> {
+    options.check_host()?;
     let &Options {
         validate,
         pipelines,
@@ -243,48 +249,40 @@ pub fn run(paths: Vec<PathBuf>, options: &Options, out: &mut dyn Write) -> Resul
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     let seen = Mutex::new(HashSet::new());
     let total = Mutex::new(Tally::default());
-    for root in &paths {
-        for entry in walkdir::WalkDir::new(root)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
-                continue;
+    let mut skipped = Skipped::default();
+    // One file is in memory at a time; its sources are shared out.
+    walk(paths, max_file, &mut skipped, |path, data| {
+        let jobs = sources(data);
+        let next = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..threads.min(jobs.len()) {
+                s.spawn(|| {
+                    let mut t = Tally {
+                        list,
+                        ..Tally::default()
+                    };
+                    let mut checks = Checks {
+                        keep: (!pairs.is_empty()).then(|| kept.clone()),
+                        #[cfg(windows)]
+                        validator: validate
+                            .then(|| Validator::load(dll.as_deref()).ok())
+                            .flatten(),
+                        #[cfg(windows)]
+                        host: pipelines
+                            .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
+                            .flatten(),
+                    };
+                    while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        translate(job, path, &seen, &mut t, &mut checks);
+                    }
+                    lock(&total).merge(t);
+                });
             }
-            let Ok(data) = std::fs::read(entry.path()) else {
-                continue;
-            };
-            let path = entry.path();
-            let jobs = sources(&data);
-            let next = AtomicUsize::new(0);
-            std::thread::scope(|s| {
-                for _ in 0..threads.min(jobs.len()) {
-                    s.spawn(|| {
-                        let mut t = Tally {
-                            list,
-                            ..Tally::default()
-                        };
-                        let mut checks = Checks {
-                            keep: (!pairs.is_empty()).then(|| kept.clone()),
-                            #[cfg(windows)]
-                            validator: validate
-                                .then(|| Validator::load(dll.as_deref()).ok())
-                                .flatten(),
-                            #[cfg(windows)]
-                            host: pipelines
-                                .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
-                                .flatten(),
-                        };
-                        while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            translate(job, path, &seen, &mut t, &mut checks);
-                        }
-                        lock(&total).merge(t);
-                    });
-                }
-            });
-        }
-    }
+        });
+        Ok(())
+    })?;
     let t = total.into_inner().unwrap_or_else(|e| e.into_inner());
+    skipped.report(max_file, out)?;
     writeln!(
         out,
         "containers   {} ({} duplicates skipped)",
@@ -788,6 +786,10 @@ mod tests {
         let dir = shaders();
         let text = report_of(|out| run(vec![dir.path().into()], &options(), out));
         assert_eq!(
+            line(&text, "files "),
+            "files                  4 searched, 0 unreadable, 0 over 2 GiB"
+        );
+        assert_eq!(
             line(&text, "containers "),
             "containers   4 (1 duplicates skipped)"
         );
@@ -805,6 +807,47 @@ mod tests {
             "DXIL         2 emitted of 2 vertex and pixel programs; 0 validated, 0 pipelines"
         );
         assert!(!text.contains("validator "), "{text}");
+    }
+
+    #[test]
+    fn a_path_that_is_not_there_is_reported_unreadable() {
+        let dir = shaders();
+        let missing = dir.path().join("not-there");
+        let roots = vec![missing.clone(), dir.path().to_path_buf()];
+        let text = report_of(|out| run(roots, &options(), out));
+        assert_eq!(
+            line(&text, "files "),
+            "files                  4 searched, 1 unreadable, 0 over 2 GiB"
+        );
+        line(&text, &format!("  unreadable {}: ", missing.display()));
+        assert_eq!(
+            line(&text, "containers "),
+            "containers   4 (1 duplicates skipped)"
+        );
+    }
+
+    #[test]
+    fn files_over_the_limit_are_reported_and_not_translated() {
+        let dir = tempfile::tempdir().unwrap();
+        let small = vertex_container();
+        let mut large = pixel_container();
+        large.resize(small.len() + 1, 0);
+        write(dir.path(), "small.bin", &small);
+        let large = write(dir.path(), "large.bin", &large);
+        let limit = small.len() as u64;
+        let text = report_of(|out| scan(&[dir.path().into()], &options(), limit, out));
+        assert_eq!(
+            line(&text, "files "),
+            format!("files                  1 searched, 0 unreadable, 1 over {limit} bytes")
+        );
+        assert_eq!(
+            line(&text, "  too large"),
+            format!("  too large {}", large.display())
+        );
+        assert_eq!(
+            line(&text, "containers "),
+            "containers   1 (0 duplicates skipped)"
+        );
     }
 
     #[test]
