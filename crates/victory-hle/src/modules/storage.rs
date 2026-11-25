@@ -309,6 +309,47 @@ mod tests {
         );
     }
 
+    /// The same through the calls a title makes: the file layer's
+    /// `CreateFileW` on the storage drive and the host's write.
+    #[test]
+    #[cfg(windows)]
+    fn a_title_write_past_the_quota_succeeds_and_leaves_nothing_free() {
+        use super::super::files;
+        use std::io::Write;
+        use std::os::windows::io::FromRawHandle;
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const CREATE_ALWAYS: u32 = 2;
+        let dir = tempfile::tempdir().unwrap();
+        let letter = files::mount(dir.path()).expect("a free drive letter");
+        let path: Vec<u16> = format!("{letter}:\\big.dat\0").encode_utf16().collect();
+        let null = std::ptr::null_mut();
+        let file = files::CreateFileW(
+            path.as_ptr(),
+            GENERIC_WRITE,
+            0,
+            null,
+            CREATE_ALWAYS,
+            0,
+            null,
+        );
+        assert_ne!(file as isize, -1);
+        // SAFETY: a file handle opened above and owned from here on.
+        let mut file = unsafe { std::fs::File::from_raw_handle(file) };
+        let written = file.write_all(&[7u8; 2000]);
+        drop(file);
+        assert_eq!(
+            written.map_err(|e| e.kind()),
+            Ok(()),
+            "the write is not refused"
+        );
+        files::unmount(letter);
+        let info = space_of(dir.path(), 1000);
+        assert_eq!(
+            (info.used, info.total_free, info.available_free, info.total),
+            (2000, 0, 0, 1000)
+        );
+    }
+
     #[test]
     fn a_sum_of_sizes_stops_at_the_largest_number() {
         assert_eq!(total([1, 2, 3]), 6);
