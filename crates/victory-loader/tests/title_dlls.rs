@@ -160,3 +160,67 @@ fn a_title_dll_that_does_not_prepare_is_named() {
     let text = format!("{error:#}");
     assert!(text.contains("broken.dll"), "{text}");
 }
+
+fn names(dlls: &[(String, victory_loader::LoadedImage)]) -> Vec<&str> {
+    dlls.iter().map(|(name, _)| name.as_str()).collect()
+}
+
+/// A DLL name is the title's own text. As a path it could name any file on
+/// the machine; only a plain file name in the title's folder is looked for.
+#[test]
+fn traversal_names_load_nothing() {
+    let outer = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let title = outer.path().join("title");
+    std::fs::create_dir(&title).unwrap();
+    // A DLL that loads, inside the folder and outside it.
+    let escaped = outer.path().join("escape.dll");
+    std::fs::copy(fixture("title_a.dll"), &escaped).unwrap();
+    std::fs::copy(fixture("title_a.dll"), title.join("inside.dll")).unwrap();
+    let absolute = escaped.to_str().unwrap().to_owned();
+    let outside = [
+        "..\\escape.dll",
+        "../escape.dll",
+        "inside.dll\\..\\..\\escape.dll",
+        ".\\inside.dll",
+        "inside.dll.",
+        "inside.dll::$DATA",
+        absolute.as_str(),
+    ];
+
+    // What the title asks for itself.
+    let load =
+        |name: &str| victory_loader::load_title_dll(name, &title, cache.path(), &|_| true).unwrap();
+    for name in outside {
+        assert_eq!(names(&load(name)), [""; 0], "{name:?}");
+    }
+
+    // What its import table names.
+    let named = |name: &str| ImportSymbol::Name {
+        hint: 0,
+        name: name.to_owned(),
+    };
+    let mut importer = victory_pe::testing::PeBuilder::new().dll(true);
+    for name in outside {
+        importer = importer.import(name, &[named("title_a_named")]);
+    }
+    importer = importer.delay_import(
+        "..\\escape.dll",
+        victory_pe::testing::DELAYLOAD_RVA_BASED,
+        &[named("title_a_named")],
+    );
+    let importer = ImageInfo::parse(&importer.build().unwrap().bytes).unwrap();
+    let asked: Vec<_> = importer.imports.iter().map(|m| m.dll.as_str()).collect();
+    assert_eq!(asked, outside);
+    assert_eq!(importer.delay_imports[0].dll, "..\\escape.dll");
+    let dlls = victory_loader::load_title_dlls(&importer, &title, cache.path(), &|_| true).unwrap();
+    assert_eq!(names(&dlls), [""; 0]);
+
+    // The plain name is found, so the folder and the file are as said.
+    let dlls = load("inside.dll");
+    assert_eq!(names(&dlls), ["inside.dll"]);
+    for (_, image) in dlls {
+        // SAFETY: none of its code ran or will.
+        unsafe { image.unload() };
+    }
+}

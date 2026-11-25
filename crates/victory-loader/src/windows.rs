@@ -100,7 +100,9 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
 /// Maps the DLLs the title ships in `title_dir` that `main` imports,
 /// directly or through each other, in initialisation order (dependencies
 /// first). Only DLL names `wanted` accepts are considered, so DLLs the host
-/// or our runtime provide stay with them. Imports are not bound.
+/// or our runtime provide stay with them, and only plain file names: an
+/// import table cannot name a file outside `title_dir`. Imports are not
+/// bound.
 pub fn load_title_dlls(
     main: &ImageInfo,
     title_dir: &Path,
@@ -115,7 +117,8 @@ pub fn load_title_dlls(
 
 /// Maps the DLL `name` from `title_dir` like [`load_title_dlls`] does, with
 /// the title DLLs it imports (dependencies first, `name` last); empty if
-/// `wanted` refuses it or the folder has no such file. For DLLs a title
+/// `wanted` refuses it, the folder has no such file or `name` is not the
+/// plain name of a file (a path, a drive, a device). For DLLs a title
 /// loads itself; `wanted` must refuse those already mapped.
 pub fn load_title_dll(
     name: &str,
@@ -150,8 +153,16 @@ fn map_dll(
     loaded: &mut Vec<(String, LoadedImage)>,
 ) -> Result<()> {
     let name = name.to_ascii_lowercase();
-    let path = dirs.0.join(&name);
-    if !seen.insert(name.clone()) || !wanted(&name) || !path.is_file() {
+    if !seen.insert(name.clone()) || !wanted(&name) {
+        return Ok(());
+    }
+    // The name is the title's: only a plain file name is looked for, and
+    // only in the title's folder.
+    let Some(path) = crate::names::title_dll_path(dirs.0, &name) else {
+        tracing::warn!(dll = name, "not a file name: no title DLL is looked for");
+        return Ok(());
+    };
+    if !path.is_file() {
         return Ok(());
     }
     let original = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
