@@ -17,6 +17,8 @@ pub struct HostPolicy {
 impl Default for HostPolicy {
     fn default() -> Self {
         let allow = [
+            // Includes the Windows Runtime's activation functions, whose
+            // network classes `modules::net::elsewhere` refuses.
             "api-ms-win-core-*",
             "api-ms-win-eventing-*",
             "api-ms-win-security-*",
@@ -27,7 +29,8 @@ impl Default for HostPolicy {
             "ucrtbase.dll",
             "vcruntime140*",
             "msvcp140*",
-            // Off-machine traffic is refused in `modules::net`.
+            // Off-machine traffic is refused in `modules::net`: Winsock,
+            // WinHTTP, and what a certificate check would fetch.
             "ws2_32.dll",
             "bcrypt.dll",
             "crypt32.dll",
@@ -43,6 +46,7 @@ impl Default for HostPolicy {
             "msvcp_win.dll",
             "ole32.dll",
             "advapi32.dll",
+            // Echo requests are refused in `modules::net::elsewhere`.
             "iphlpapi.dll",
             // The title's crash handler writes minidumps with it (loaded by name).
             "dbghelp.dll",

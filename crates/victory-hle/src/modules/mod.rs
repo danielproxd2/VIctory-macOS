@@ -86,6 +86,8 @@ pub(crate) fn all() -> Vec<HleModule> {
     #[cfg(windows)]
     all.push(net::module());
     #[cfg(windows)]
+    all.push(net::elsewhere::module());
+    #[cfg(windows)]
     all.push(xmem::module());
     #[cfg(windows)]
     all.push(xsystem::module());

@@ -1,8 +1,10 @@
 //! A console without a network cable: the title reaches loopback only.
 //!
 //! What is vetted, and nothing else is claimed: the functions below, by
-//! the names a title imports from `ws2_32.dll` and `winhttp.dll`. The
-//! rest of both DLLs is the host's own.
+//! the names a title imports from the DLLs [`HostPolicy`] passes through
+//! (`ws2_32.dll`, `winhttp.dll`, `iphlpapi.dll`, `crypt32.dll` and the
+//! `api-ms-win-core-winrt-l1` API set). The rest of those DLLs is the
+//! host's own.
 //!
 //! * Connects (`connect`, `WSAConnect`, by name, by list, `WSAJoinLeaf`,
 //!   `ConnectEx` from `WSAIoctl`) and datagram sends (`sendto`,
@@ -19,15 +21,21 @@
 //!   downloads) fails with `ERROR_WINHTTP_AUTODETECTION_FAILED`.
 //! * A bind to all interfaces is narrowed to loopback, so nothing on the
 //!   network can connect in.
+//! * Echo requests, Windows Runtime network classes and what certificate
+//!   checks would fetch: see [`elsewhere`], which also names what is not
+//!   vetted.
 //!
 //! Wine's `ws2_32` lacks `WSAConnectByList` and `GetAddrInfoExA`; both are
 //! done here from functions it has, as their public references describe
 //! them.
+//!
+//! [`HostPolicy`]: crate::HostPolicy
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 #![allow(clippy::too_many_arguments)]
 
 pub(crate) mod addr;
+pub(crate) mod elsewhere;
 #[cfg(test)]
 mod tests;
 
@@ -81,10 +89,19 @@ const WSAID_WSASENDMSG: Guid = Guid(
 type Socket = usize;
 type Handle = *mut c_void;
 
-/// Every host function this file binds with `host!`, sorted: checked
-/// against the host at start-up (`crate::host::missing_exports`) and
-/// against this file by a test.
+/// Every host function this file and [`elsewhere`] bind with `host!`,
+/// sorted: checked against the host at start-up
+/// (`crate::host::missing_exports`) and against both files by a test.
 pub(crate) const HOST_IMPORTS: &[(&str, &str)] = &[
+    ("combase.dll", "RoActivateInstance"),
+    ("combase.dll", "RoGetActivationFactory"),
+    ("combase.dll", "WindowsGetStringRawBuffer"),
+    ("crypt32.dll", "CertGetCertificateChain"),
+    ("crypt32.dll", "CertVerifyRevocation"),
+    ("iphlpapi.dll", "Icmp6SendEcho2"),
+    ("iphlpapi.dll", "IcmpSendEcho"),
+    ("iphlpapi.dll", "IcmpSendEcho2"),
+    ("iphlpapi.dll", "IcmpSendEcho2Ex"),
     ("winhttp.dll", "WinHttpConnect"),
     ("winhttp.dll", "WinHttpOpen"),
     ("winhttp.dll", "WinHttpSetOption"),

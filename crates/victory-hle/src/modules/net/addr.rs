@@ -1,5 +1,6 @@
 //! Reading the addresses a title passes to Winsock, and telling loopback
-//! from the network. No host calls, so it builds and is tested everywhere.
+//! from the network, by address and by Windows Runtime class name. No host
+//! calls, so it builds and is tested everywhere.
 
 use std::ffi::c_char;
 use std::net::{IpAddr, SocketAddr};
@@ -46,6 +47,17 @@ pub(crate) fn loopback(ip: IpAddr) -> bool {
 pub(crate) fn loopback_name(name: &str) -> bool {
     let bare = name.trim_start_matches('[').trim_end_matches(']');
     bare.eq_ignore_ascii_case("localhost") || bare.parse().is_ok_and(loopback)
+}
+
+/// A Windows Runtime class that works over the network, by its name:
+/// sockets, connectivity and proximity (`Windows.Networking.*`), HTTP, feeds
+/// and publishing (`Windows.Web.*`).
+pub(crate) fn network_class(class: &str) -> bool {
+    ["Windows.Networking.", "Windows.Web."].iter().any(|space| {
+        class
+            .get(..space.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(space))
+    })
 }
 
 #[cfg(test)]
@@ -179,5 +191,38 @@ mod tests {
         assert!(loopback("::ffff:127.0.0.1".parse().unwrap()));
         assert!(!loopback("::ffff:192.168.0.1".parse().unwrap()));
         assert!(!loopback("169.254.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn network_classes_table() {
+        for class in [
+            "Windows.Networking.Sockets.StreamSocket",
+            "Windows.Networking.Sockets.DatagramSocket",
+            "Windows.Networking.Sockets.MessageWebSocket",
+            "Windows.Networking.Connectivity.NetworkInformation",
+            "Windows.Networking.BackgroundTransfer.BackgroundDownloader",
+            "Windows.Networking.HostName",
+            "Windows.Web.Http.HttpClient",
+            "Windows.Web.Http.Filters.HttpBaseProtocolFilter",
+            "Windows.Web.Syndication.SyndicationClient",
+            "windows.web.http.httpclient",
+        ] {
+            assert!(network_class(class), "{class}");
+        }
+        for class in [
+            "",
+            "Windows.Networking",
+            "Windows.Web",
+            "Windows.WebUI.Core.WebUICommandBar",
+            "Windows.NetworkingX.Thing",
+            "Windows.Foundation.Uri",
+            "Windows.Globalization.Calendar",
+            "Windows.Storage.Streams.Buffer",
+            "Contoso.Windows.Networking.Sockets.StreamSocket",
+            // No character boundary where the name space would end.
+            "Windows.Networking\u{e9}X",
+        ] {
+            assert!(!network_class(class), "{class}");
+        }
     }
 }

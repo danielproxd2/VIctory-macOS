@@ -10,6 +10,13 @@ use victory_pe::ImportSymbol;
 use windows_sys::Win32::Foundation::GetLastError;
 
 use super::addr::{AF_INET, AF_INET6};
+use super::elsewhere::{
+    CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL, CERT_CHAIN_DISABLE_AUTH_ROOT_AUTO_UPDATE,
+    CERT_CHAIN_REVOCATION_CHECK_CACHE_ONLY, CERT_VERIFY_CACHE_ONLY_BASED_REVOCATION,
+    CertGetCertificateChain, CertVerifyRevocation, IP_DEST_NET_UNREACHABLE, Icmp6SendEcho2,
+    IcmpSendEcho, IcmpSendEcho2, IcmpSendEcho2Ex, REGDB_E_CLASSNOTREG, RoActivateInstance,
+    RoGetActivationFactory, chain_from_cache, revocation_from_cache,
+};
 use super::*;
 
 const WSAECONNREFUSED: i32 = 10061;
@@ -133,6 +140,9 @@ fn home_of(module: &HleModule, export: &str) -> &'static str {
     match (module.name, export) {
         ("net", e) if e.starts_with("WinHttp") => "winhttp.dll",
         ("net", _) => "ws2_32.dll",
+        (_, e) if e.starts_with("Icmp") => "iphlpapi.dll",
+        (_, e) if e.starts_with("Cert") => "crypt32.dll",
+        (_, e) if e.starts_with("Ro") => "api-ms-win-core-winrt-l1-1-0.dll",
         (module, export) => panic!("{module} has {export}, which this test knows no DLL for"),
     }
 }
@@ -146,7 +156,8 @@ fn every_host_import_exists_or_has_a_fallback() {
         ("ws2_32.dll", "GetAddrInfoExA"),
         ("ws2_32.dll", "WSAConnectByList"),
     ];
-    crate::host::check_bindings(include_str!("../net.rs"), HOST_IMPORTS, WINE_LACKS);
+    let source = [include_str!("../net.rs"), include_str!("elsewhere.rs")].concat();
+    crate::host::check_bindings(&source, HOST_IMPORTS, WINE_LACKS);
 }
 
 #[test]
@@ -319,7 +330,7 @@ fn every_override_names_an_export_of_its_dll() {
     const NEWER_WINDOWS_ONLY: &[&str] = &["WinHttpGetProxySettingsEx"];
     const WINE_LACKS: &[&str] = &["WSAConnectByList", "GetAddrInfoExA"];
     let wine = crate::host::function("ntdll.dll", "wine_get_version").is_some();
-    for m in [module()] {
+    for m in [module(), elsewhere::module()] {
         for e in m.exports.iter().filter(|e| !e.name.starts_with('#')) {
             let dll = home_of(&m, e.name);
             assert!(m.serves(dll), "{} does not serve {dll}", m.name);
@@ -343,6 +354,14 @@ fn imports_that_could_leave_the_machine_are_ours() {
         ("ws2_32.dll", "FreeAddrInfoEx"),
         ("ws2_32.dll", "WSASendMsg"),
         ("winhttp.dll", "WinHttpOpen"),
+        ("iphlpapi.dll", "IcmpSendEcho"),
+        ("IPHLPAPI.DLL", "IcmpSendEcho2"),
+        ("iphlpapi.dll", "IcmpSendEcho2Ex"),
+        ("iphlpapi.dll", "Icmp6SendEcho2"),
+        ("crypt32.dll", "CertGetCertificateChain"),
+        ("CRYPT32.dll", "CertVerifyRevocation"),
+        ("api-ms-win-core-winrt-l1-1-0.dll", "RoGetActivationFactory"),
+        ("api-ms-win-core-winrt-l1-1-0.dll", "RoActivateInstance"),
     ] {
         assert_eq!(
             resolver.classify(dll, &named(name)),
@@ -1320,4 +1339,419 @@ fn winhttp_never_uses_a_proxy() {
         assert_eq!(win32_error(), ERROR_WINHTTP_CANNOT_CONNECT, "{server}");
     }
     assert_eq!(close(session), 1);
+}
+
+#[test]
+fn icmp_away_is_unreachable() {
+    let null = std::ptr::null_mut::<c_void>();
+    let no = std::ptr::null::<c_void>();
+    let request = *b"ping";
+    let data = request.as_ptr().cast::<c_void>();
+    let mut reply = [0u8; 256];
+    let away = u32::from_ne_bytes(AWAY);
+    let home = u32::from_ne_bytes(HOME);
+    let away6 = v6(AWAY6, 0);
+    let home6 = v6(Ipv6Addr::LOCALHOST.octets(), 0);
+    // A handle the host never sees: the refusal comes first.
+    let unused = std::ptr::without_provenance_mut::<c_void>(0x1c4f);
+
+    let refused = |replies: u32| (replies, win32_error());
+    let unreachable = (0, IP_DEST_NET_UNREACHABLE);
+    let room = reply.len() as u32;
+    let buffer = reply.as_mut_ptr().cast::<c_void>();
+    clear_win32_error();
+    assert_eq!(
+        refused(IcmpSendEcho(unused, away, data, 4, no, buffer, room, 10)),
+        unreachable
+    );
+    clear_win32_error();
+    assert_eq!(
+        refused(IcmpSendEcho2(
+            unused, null, no, null, away, data, 4, no, buffer, room, 10
+        )),
+        unreachable
+    );
+    clear_win32_error();
+    assert_eq!(
+        refused(IcmpSendEcho2Ex(
+            unused, null, no, null, home, away, data, 4, no, buffer, room, 10
+        )),
+        unreachable
+    );
+    clear_win32_error();
+    assert_eq!(
+        refused(Icmp6SendEcho2(
+            unused,
+            null,
+            no,
+            null,
+            home6.as_ptr(),
+            away6.as_ptr(),
+            data,
+            4,
+            no,
+            buffer,
+            room,
+            10
+        )),
+        unreachable
+    );
+    // No destination to read is no destination on this machine.
+    clear_win32_error();
+    assert_eq!(
+        refused(Icmp6SendEcho2(
+            unused,
+            null,
+            no,
+            null,
+            home6.as_ptr(),
+            std::ptr::null(),
+            data,
+            4,
+            no,
+            buffer,
+            room,
+            10
+        )),
+        unreachable
+    );
+    assert_eq!(reply, [0u8; 256]);
+
+    // Loopback is the host's to answer: whatever it says (an echo needs
+    // rights not every host grants), it is not our refusal.
+    let create = host!("iphlpapi.dll", "IcmpCreateFile": extern "system" fn() -> Handle);
+    let close = host!("iphlpapi.dll", "IcmpCloseHandle": extern "system" fn(Handle) -> i32);
+    let handle = create();
+    assert!(handle as isize != -1 && !handle.is_null());
+    clear_win32_error();
+    let replies = IcmpSendEcho(handle, home, data, 4, no, buffer, room, 1000);
+    assert_ne!(refused(replies), unreachable);
+    close(handle);
+}
+
+/// `IActivationFactory`.
+static IID_ACTIVATION_FACTORY: Guid =
+    Guid(0x0000_0035, 0x0000, 0x0000, [0xc0, 0, 0, 0, 0, 0, 0, 0x46]);
+
+/// An `HSTRING` of the host's, deleted when dropped.
+struct RuntimeString(Handle);
+
+impl RuntimeString {
+    fn new(text: &str) -> RuntimeString {
+        let create = host!("combase.dll", "WindowsCreateString": extern "system" fn(*const u16, u32, *mut Handle) -> i32);
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let mut string = std::ptr::null_mut();
+        assert_eq!(create(units.as_ptr(), units.len() as u32, &mut string), 0);
+        RuntimeString(string)
+    }
+}
+
+impl Drop for RuntimeString {
+    fn drop(&mut self) {
+        host!("combase.dll", "WindowsDeleteString": extern "system" fn(Handle) -> i32)(self.0);
+    }
+}
+
+/// Drops the reference a COM call returned, if it returned one.
+fn release(object: *mut c_void) {
+    if !object.is_null() {
+        // SAFETY: a COM object; `Release` is the third function of every one.
+        unsafe {
+            let table = object.cast::<*const extern "system" fn(*mut c_void) -> u32>();
+            (*(*table).add(2))(object);
+        }
+    }
+}
+
+#[test]
+fn winrt_network_factories_are_not_registered() {
+    let iid = (&raw const IID_ACTIVATION_FACTORY).cast::<c_void>();
+    let sentinel = std::ptr::without_provenance_mut::<c_void>(0x5e7);
+    for class in [
+        "Windows.Networking.Sockets.StreamSocket",
+        "Windows.Networking.Sockets.DatagramSocket",
+        "Windows.Networking.Sockets.MessageWebSocket",
+        "Windows.Networking.Connectivity.NetworkInformation",
+        "Windows.Networking.BackgroundTransfer.BackgroundDownloader",
+        "Windows.Web.Http.HttpClient",
+        "Windows.Web.Syndication.SyndicationClient",
+    ] {
+        let id = RuntimeString::new(class);
+        let mut factory = sentinel;
+        assert_eq!(
+            RoGetActivationFactory(id.0, iid, &mut factory),
+            REGDB_E_CLASSNOTREG,
+            "{class}"
+        );
+        assert!(factory.is_null(), "{class}");
+        let mut instance = sentinel;
+        assert_eq!(
+            RoActivateInstance(id.0, &mut instance),
+            REGDB_E_CLASSNOTREG,
+            "{class}"
+        );
+        assert!(instance.is_null(), "{class}");
+        // Nowhere to put the answer changes nothing about it.
+        assert_eq!(
+            RoGetActivationFactory(id.0, iid, std::ptr::null_mut()),
+            REGDB_E_CLASSNOTREG
+        );
+    }
+
+    // Other classes are the host's to answer, whatever it says here
+    // (the thread has not started the Windows Runtime).
+    let get = host!("combase.dll", "RoGetActivationFactory": extern "system" fn(Handle, *const c_void, *mut *mut c_void) -> i32);
+    let activate = host!("combase.dll", "RoActivateInstance": extern "system" fn(Handle, *mut *mut c_void) -> i32);
+    for class in [
+        "Windows.Foundation.Uri",
+        "Windows.Globalization.Calendar",
+        "",
+    ] {
+        let id = RuntimeString::new(class);
+        let (mut ours, mut theirs) = (std::ptr::null_mut(), std::ptr::null_mut());
+        let answers = (
+            RoGetActivationFactory(id.0, iid, &mut ours),
+            get(id.0, iid, &mut theirs),
+        );
+        assert_eq!(answers.0, answers.1, "{class}");
+        assert_eq!(ours.is_null(), theirs.is_null(), "{class}");
+        release(ours);
+        release(theirs);
+        let (mut ours, mut theirs) = (std::ptr::null_mut(), std::ptr::null_mut());
+        let answers = (
+            RoActivateInstance(id.0, &mut ours),
+            activate(id.0, &mut theirs),
+        );
+        assert_eq!(answers.0, answers.1, "{class}");
+        release(ours);
+        release(theirs);
+    }
+}
+
+/// What the stand-ins for the host's certificate functions were asked.
+static CHAIN_FLAGS: Mutex<Vec<(usize, usize, u32)>> = Mutex::new(Vec::new());
+static REVOCATION_FLAGS: Mutex<Vec<(u32, usize, u32)>> = Mutex::new(Vec::new());
+
+extern "system" fn recording_chain(
+    _engine: Handle,
+    certificate: *const c_void,
+    _time: *const c_void,
+    _store: Handle,
+    parameters: *const c_void,
+    flags: u32,
+    _reserved: *const c_void,
+    _chain: *mut *const c_void,
+) -> i32 {
+    let mut seen = CHAIN_FLAGS.lock().unwrap_or_else(|e| e.into_inner());
+    seen.push((certificate as usize, parameters as usize, flags));
+    1
+}
+
+extern "system" fn recording_revocation(
+    _encoding: u32,
+    _kind: u32,
+    count: u32,
+    contexts: *const *const c_void,
+    flags: u32,
+    _parameters: *const c_void,
+    _status: *mut c_void,
+) -> i32 {
+    let mut seen = REVOCATION_FLAGS.lock().unwrap_or_else(|e| e.into_inner());
+    seen.push((count, contexts as usize, flags));
+    1
+}
+
+/// DER: `tag`, the length of `body`, `body`.
+fn der(tag: u8, body: &[u8]) -> Vec<u8> {
+    let mut out = vec![tag];
+    match body.len() {
+        n @ 0..0x80 => out.push(n as u8),
+        n @ 0x80..0x100 => out.extend([0x81, n as u8]),
+        n => out.extend([0x82, (n >> 8) as u8, n as u8]),
+    }
+    out.extend(body);
+    out
+}
+
+/// A self-issued X.509 certificate made here, byte by byte: a name, ten
+/// years, an RSA key that is not one and a signature that is not one. It
+/// names no URL.
+fn certificate() -> Vec<u8> {
+    const SEQUENCE: u8 = 0x30;
+    const SET: u8 = 0x31;
+    const INTEGER: u8 = 0x02;
+    const BITS: u8 = 0x03;
+    const NULL: u8 = 0x05;
+    const OID: u8 = 0x06;
+    const UTF8: u8 = 0x0c;
+    const UTC_TIME: u8 = 0x17;
+    let rsa = |last: u8| [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, last];
+    let algorithm = |last: u8| der(SEQUENCE, &[der(OID, &rsa(last)), der(NULL, &[])].concat());
+    // sha256WithRSAEncryption, rsaEncryption.
+    let (signed_with, key_kind) = (algorithm(11), algorithm(1));
+    let common_name = [der(OID, &[0x55, 0x04, 0x03]), der(UTF8, b"VIctory test")].concat();
+    let name = der(SEQUENCE, &der(SET, &der(SEQUENCE, &common_name)));
+    let validity = der(
+        SEQUENCE,
+        &[
+            der(UTC_TIME, b"250101000000Z"),
+            der(UTC_TIME, b"350101000000Z"),
+        ]
+        .concat(),
+    );
+    let mut number: Vec<u8> = (0..128u8)
+        .map(|i| i.wrapping_mul(7).wrapping_add(3))
+        .collect();
+    number[0] |= 0x80;
+    number[127] |= 1;
+    // A leading zero keeps the modulus positive.
+    let modulus = der(INTEGER, &[&[0][..], &number].concat());
+    let key = der(SEQUENCE, &[modulus, der(INTEGER, &[1, 0, 1])].concat());
+    let bits = |bytes: &[u8]| der(BITS, &[&[0][..], bytes].concat());
+    let public_key = der(SEQUENCE, &[key_kind, bits(&key)].concat());
+    let to_be_signed = der(
+        SEQUENCE,
+        &[
+            der(INTEGER, &[1]),
+            signed_with.clone(),
+            name.clone(),
+            validity,
+            name,
+            public_key,
+        ]
+        .concat(),
+    );
+    der(
+        SEQUENCE,
+        &[to_be_signed, signed_with, bits(&number)].concat(),
+    )
+}
+
+#[test]
+fn certificate_chains_never_fetch_urls() {
+    const CERT_CHAIN_REVOCATION_CHECK_CHAIN: u32 = 0x2000_0000;
+    const CERT_CHAIN_CACHE_END_CERT: u32 = 0x0000_0001;
+    const CERT_VERIFY_REV_CHAIN_FLAG: u32 = 0x0000_0001;
+    const X509_ASN_ENCODING: u32 = 1;
+    const CERT_CONTEXT_REVOCATION_TYPE: u32 = 1;
+    let null = std::ptr::null_mut::<c_void>();
+    let no = std::ptr::null::<c_void>();
+    let cached = CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL
+        | CERT_CHAIN_DISABLE_AUTH_ROOT_AUTO_UPDATE
+        | CERT_CHAIN_REVOCATION_CHECK_CACHE_ONLY;
+    assert_eq!(cached, 0x8000_0104);
+
+    // What the host is asked for: the title's flags, and cache only.
+    let (a, b) = (
+        std::ptr::without_provenance::<c_void>(0xa0),
+        std::ptr::without_provenance::<c_void>(0xb0),
+    );
+    let mut chain = no;
+    for flags in [
+        0,
+        CERT_CHAIN_REVOCATION_CHECK_CHAIN | CERT_CHAIN_CACHE_END_CERT,
+        cached,
+    ] {
+        assert_eq!(
+            chain_from_cache(recording_chain, null, a, no, null, b, flags, no, &mut chain),
+            1
+        );
+        let seen = std::mem::take(&mut *CHAIN_FLAGS.lock().unwrap());
+        assert_eq!(seen, [(0xa0, 0xb0, flags | cached)]);
+    }
+    let contexts = [a];
+    for flags in [0, CERT_VERIFY_REV_CHAIN_FLAG, 0x8] {
+        assert_eq!(
+            revocation_from_cache(
+                recording_revocation,
+                X509_ASN_ENCODING,
+                CERT_CONTEXT_REVOCATION_TYPE,
+                1,
+                contexts.as_ptr(),
+                flags,
+                no,
+                null
+            ),
+            1
+        );
+        let seen = std::mem::take(&mut *REVOCATION_FLAGS.lock().unwrap());
+        let asked = flags | CERT_VERIFY_CACHE_ONLY_BASED_REVOCATION;
+        assert_eq!(seen, [(1, contexts.as_ptr() as usize, asked)]);
+    }
+
+    // The real functions, on a certificate that names no URL: a chain of
+    // one comes back, and its revocation cannot be checked.
+    let create = host!("crypt32.dll", "CertCreateCertificateContext": extern "system" fn(u32, *const u8, u32) -> *mut c_void);
+    let free = host!("crypt32.dll", "CertFreeCertificateContext": extern "system" fn(*const c_void) -> i32);
+    let free_chain =
+        host!("crypt32.dll", "CertFreeCertificateChain": extern "system" fn(*const c_void));
+    let encoded = certificate();
+    let context = create(X509_ASN_ENCODING, encoded.as_ptr(), encoded.len() as u32).cast_const();
+    assert!(
+        !context.is_null(),
+        "CertCreateCertificateContext: {:#x}",
+        win32_error()
+    );
+    /// A `CERT_CHAIN_PARA` without its optional fields.
+    #[repr(C)]
+    struct ChainParameters {
+        size: u32,
+        usage_kind: u32,
+        usage_count: u32,
+        usages: *const *const c_char,
+    }
+    let parameters = ChainParameters {
+        size: size_of::<ChainParameters>() as u32,
+        usage_kind: 0,
+        usage_count: 0,
+        usages: std::ptr::null(),
+    };
+    let mut chain = no;
+    let built = CertGetCertificateChain(
+        null,
+        context,
+        no,
+        null,
+        (&raw const parameters).cast(),
+        CERT_CHAIN_REVOCATION_CHECK_CHAIN,
+        no,
+        &mut chain,
+    );
+    assert_eq!(built, 1, "CertGetCertificateChain: {:#x}", win32_error());
+    assert!(!chain.is_null());
+    free_chain(chain);
+
+    /// A `CERT_REVOCATION_STATUS`.
+    #[repr(C)]
+    #[derive(Default)]
+    struct RevocationStatus {
+        size: u32,
+        index: u32,
+        error: u32,
+        reason: u32,
+        has_freshness_time: i32,
+        freshness_time: u32,
+    }
+    const CRYPT_E_NO_REVOCATION_CHECK: u32 = 0x8009_2012;
+    let mut status = RevocationStatus {
+        size: size_of::<RevocationStatus>() as u32,
+        ..Default::default()
+    };
+    let contexts = [context];
+    let checked = CertVerifyRevocation(
+        X509_ASN_ENCODING,
+        CERT_CONTEXT_REVOCATION_TYPE,
+        1,
+        contexts.as_ptr(),
+        0,
+        no,
+        (&raw mut status).cast(),
+    );
+    assert_eq!(
+        (checked, status.index, status.error),
+        (0, 0, CRYPT_E_NO_REVOCATION_CHECK),
+        "{:#x}",
+        status.error
+    );
+    assert_eq!(free(context), 1);
 }
