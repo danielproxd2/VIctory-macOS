@@ -1,31 +1,43 @@
 //! A console without a network cable: the title reaches loopback only.
 //!
-//! Every way out of Winsock and WinHTTP a title can import or look up by
-//! name is vetted here; the rest of both DLLs is the host's own.
+//! What is vetted, and nothing else is claimed: the functions below, by
+//! the names a title imports from `ws2_32.dll` and `winhttp.dll`. The
+//! rest of both DLLs is the host's own.
 //!
-//! * Connects (also by name, by list, `ConnectEx` from `WSAIoctl`) and
-//!   datagram sends to anything but 127.0.0.0/8 and ::1 fail with
-//!   `WSAENETUNREACH`.
+//! * Connects (`connect`, `WSAConnect`, by name, by list, `WSAJoinLeaf`,
+//!   `ConnectEx` from `WSAIoctl`) and datagram sends (`sendto`,
+//!   `WSASendTo`, `WSASendMsg`, also from `WSAIoctl`) to anything but
+//!   127.0.0.0/8 and ::1 fail with `WSAENETUNREACH`. The multi-pointer
+//!   `WSAIoctl` query, which would hand out Registered I/O, is refused.
 //! * Forward lookups other than `localhost` and IP literals fail with
 //!   `WSAHOST_NOT_FOUND`; reverse lookups of other addresses come back
 //!   numeric, or fail if a name is required, as with no network.
+//!   Name-space queries (`WSALookupServiceBegin`) find nothing.
 //! * `WinHttpConnect` to a host that is not loopback fails with
 //!   `ERROR_WINHTTP_CANNOT_CONNECT`, so no request (or WebSocket) handle can
 //!   exist for one. Proxies are off and proxy auto-detection (WPAD, PAC
 //!   downloads) fails with `ERROR_WINHTTP_AUTODETECTION_FAILED`.
 //! * A bind to all interfaces is narrowed to loopback, so nothing on the
 //!   network can connect in.
+//!
+//! Wine's `ws2_32` lacks `WSAConnectByList` and `GetAddrInfoExA`; both are
+//! done here from functions it has, as their public references describe
+//! them.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 #![allow(clippy::too_many_arguments)]
 
 pub(crate) mod addr;
+#[cfg(test)]
+mod tests;
 
 use std::ffi::{CStr, c_char, c_void};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::SetLastError;
+use windows_sys::Win32::Globalization::{CP_ACP, MultiByteToWideChar, WideCharToMultiByte};
 
 use self::addr::{loopback, loopback_name, raw_ip, socket_addr};
 use crate::modules::files::host;
@@ -33,9 +45,11 @@ use crate::{HleExport, HleModule, hle_export};
 
 const SOCKET_ERROR: i32 = -1;
 const INVALID_SOCKET: Socket = !0;
+const WSAEFAULT: i32 = 10014;
 const WSAEINVAL: i32 = 10022;
 const WSAEADDRNOTAVAIL: i32 = 10049;
 const WSAENETUNREACH: i32 = 10051;
+const WSAETIMEDOUT: i32 = 10060;
 const WSASERVICE_NOT_FOUND: i32 = 10108;
 const WSAHOST_NOT_FOUND: i32 = 11001;
 const ERROR_WINHTTP_CANNOT_CONNECT: u32 = 12029;
@@ -74,6 +88,8 @@ pub(crate) const HOST_IMPORTS: &[(&str, &str)] = &[
     ("winhttp.dll", "WinHttpConnect"),
     ("winhttp.dll", "WinHttpOpen"),
     ("winhttp.dll", "WinHttpSetOption"),
+    ("ws2_32.dll", "FreeAddrInfoEx"),
+    ("ws2_32.dll", "FreeAddrInfoExW"),
     ("ws2_32.dll", "GetAddrInfoExA"),
     ("ws2_32.dll", "GetAddrInfoExW"),
     ("ws2_32.dll", "GetAddrInfoW"),
@@ -84,22 +100,21 @@ pub(crate) const HOST_IMPORTS: &[(&str, &str)] = &[
     ("ws2_32.dll", "WSAConnectByList"),
     ("ws2_32.dll", "WSAConnectByNameA"),
     ("ws2_32.dll", "WSAConnectByNameW"),
-    ("ws2_32.dll", "WSAGetLastError"),
     ("ws2_32.dll", "WSAIoctl"),
     ("ws2_32.dll", "WSAJoinLeaf"),
     ("ws2_32.dll", "WSASendMsg"),
     ("ws2_32.dll", "WSASendTo"),
     ("ws2_32.dll", "WSASetLastError"),
     ("ws2_32.dll", "bind"),
-    ("ws2_32.dll", "closesocket"),
     ("ws2_32.dll", "connect"),
     ("ws2_32.dll", "getaddrinfo"),
     ("ws2_32.dll", "gethostbyaddr"),
     ("ws2_32.dll", "gethostbyname"),
     ("ws2_32.dll", "getnameinfo"),
+    ("ws2_32.dll", "getpeername"),
+    ("ws2_32.dll", "getsockname"),
     ("ws2_32.dll", "getsockopt"),
     ("ws2_32.dll", "sendto"),
-    ("ws2_32.dll", "socket"),
 ];
 
 /// Logs `what` for `destination` the first time (no payload, ever).
@@ -291,39 +306,117 @@ struct SocketAddress {
     len: i32,
 }
 
+/// The Winsock `timeval`.
+#[repr(C)]
+pub struct TimeVal {
+    seconds: i32,
+    microseconds: i32,
+}
+
 /// Every candidate must be loopback.
 pub extern "system" fn WSAConnectByList(
     s: Socket,
     list: *const u8,
     local_len: *mut u32,
-    local: *mut c_void,
+    local: *mut u8,
     remote_len: *mut u32,
-    remote: *mut c_void,
-    timeout: *const c_void,
+    remote: *mut u8,
+    timeout: *const TimeVal,
     reserved: *mut c_void,
 ) -> i32 {
-    if !list.is_null() {
+    let entries: &[SocketAddress] = if list.is_null() {
+        &[]
+    } else {
         // SAFETY: the title passes a `SOCKET_ADDRESS_LIST`.
-        let entries = unsafe {
+        unsafe {
             let count = usize::try_from(list.cast::<i32>().read()).unwrap_or(0);
             std::slice::from_raw_parts(list.add(8).cast::<SocketAddress>(), count)
-        };
-        if !entries
-            .iter()
-            .all(|e| reachable("network connect blocked", e.addr, e.len))
-        {
-            return 0;
         }
-    }
-    // Wine's ws2_32 has no WSAConnectByList. FALSE is a failed connect,
-    // which an offline title already handles.
-    if crate::host::function("ws2_32.dll", "WSAConnectByList").is_none() {
-        tracing::warn!("WSAConnectByList is missing from the host ws2_32");
+    };
+    if !entries
+        .iter()
+        .all(|e| reachable("network connect blocked", e.addr, e.len))
+    {
         return 0;
     }
-    host!("ws2_32.dll", "WSAConnectByList": extern "system" fn(Socket, *const u8, *mut u32, *mut c_void, *mut u32, *mut c_void, *const c_void, *mut c_void) -> i32)(
+    // Wine's ws2_32 has no WSAConnectByList.
+    if crate::host::function("ws2_32.dll", "WSAConnectByList").is_none() {
+        return connect_by_list(
+            s, entries, local_len, local, remote_len, remote, timeout, reserved,
+        );
+    }
+    host!("ws2_32.dll", "WSAConnectByList": extern "system" fn(Socket, *const u8, *mut u32, *mut u8, *mut u32, *mut u8, *const TimeVal, *mut c_void) -> i32)(
         s, list, local_len, local, remote_len, remote, timeout, reserved,
     )
+}
+
+/// `WSAConnectByList` on a host without it, as its public reference
+/// (learn.microsoft.com, winsock2/nf-winsock2-wsaconnectbylist) describes
+/// it: the candidates are tried one by one with `connect`; the time limit
+/// is looked at between attempts, never during one (`WSAETIMEDOUT`); on
+/// failure the error is the last attempt's; on success the two buffers
+/// get what `getsockname` and `getpeername` say; `reserved` must be null
+/// (`WSAEINVAL`). The candidates are loopback, so there are no pairs of
+/// local and remote addresses to rank. An empty list is an invalid
+/// parameter too: there was no attempt whose error could be reported.
+// shortcut: a socket in non-blocking mode is not made to block for the
+// call, as the reference says the real one does; its first attempt ends
+// with WSAEWOULDBLOCK.
+// Wine on macOS does not connect a socket again after a refused attempt,
+// and the call has only the title's socket: there a candidate after a
+// refused one fails too, with Wine's error for the second connect.
+fn connect_by_list(
+    s: Socket,
+    entries: &[SocketAddress],
+    local_len: *mut u32,
+    local: *mut u8,
+    remote_len: *mut u32,
+    remote: *mut u8,
+    timeout: *const TimeVal,
+    reserved: *mut c_void,
+) -> i32 {
+    if entries.is_empty() || !reserved.is_null() {
+        wsa_error(WSAEINVAL);
+        return 0;
+    }
+    // SAFETY: the title passes a `timeval` or null.
+    let limit = unsafe { timeout.as_ref() }.map(|t| {
+        Duration::from_secs(u64::try_from(t.seconds).unwrap_or(0))
+            + Duration::from_micros(u64::try_from(t.microseconds).unwrap_or(0))
+    });
+    let started = Instant::now();
+    let host_connect =
+        host!("ws2_32.dll", "connect": extern "system" fn(Socket, *const u8, i32) -> i32);
+    for (tried, entry) in entries.iter().enumerate() {
+        if tried > 0 && limit.is_some_and(|limit| started.elapsed() >= limit) {
+            wsa_error(WSAETIMEDOUT);
+            return 0;
+        }
+        if host_connect(s, entry.addr, entry.len) == 0 {
+            let name = host!("ws2_32.dll", "getsockname": extern "system" fn(Socket, *mut u8, *mut i32) -> i32);
+            let peer = host!("ws2_32.dll", "getpeername": extern "system" fn(Socket, *mut u8, *mut i32) -> i32);
+            return (told(name, s, local, local_len) && told(peer, s, remote, remote_len)).into();
+        }
+    }
+    0
+}
+
+/// Fills one of `WSAConnectByList`'s address buffers; a null buffer is
+/// not wanted, and its length then is not looked at.
+fn told(
+    address_of: extern "system" fn(Socket, *mut u8, *mut i32) -> i32,
+    s: Socket,
+    buffer: *mut u8,
+    len: *mut u32,
+) -> bool {
+    if buffer.is_null() {
+        return true;
+    }
+    if len.is_null() {
+        wsa_error(WSAEFAULT);
+        return false;
+    }
+    address_of(s, buffer, len.cast()) == 0
 }
 
 pub extern "system" fn WSAJoinLeaf(
@@ -566,6 +659,136 @@ pub extern "system" fn GetAddrInfoW(
     )
 }
 
+/// `ADDRINFOEXA` and `ADDRINFOEXW`: one layout, and only what
+/// `canonical_name` points to differs (ANSI or UTF-16 text).
+#[repr(C)]
+struct AddrInfoEx {
+    flags: i32,
+    family: i32,
+    socket_type: i32,
+    protocol: i32,
+    addr_len: usize,
+    canonical_name: *mut c_void,
+    addr: *mut u8,
+    blob: *mut c_void,
+    blob_len: usize,
+    provider: *mut c_void,
+    next: *mut AddrInfoEx,
+}
+
+/// A list `GetAddrInfoExW` made that a title holds as an `ADDRINFOEXA`
+/// list: its head, and per entry with a canonical name the entry, the
+/// host's UTF-16 name and our ANSI copy the entry points to meanwhile.
+struct Converted {
+    head: usize,
+    names: Vec<(usize, usize, Vec<u8>)>,
+}
+
+static CONVERTED: Mutex<Vec<Converted>> = Mutex::new(Vec::new());
+
+/// The UTF-16 form of an ANSI string, NUL included; none for null.
+fn from_ansi(text: *const c_char) -> Option<Vec<u16>> {
+    if text.is_null() {
+        return None;
+    }
+    // SAFETY: a NUL-terminated string; a sizing call, then one with room.
+    unsafe {
+        let n = MultiByteToWideChar(CP_ACP, 0, text.cast(), -1, std::ptr::null_mut(), 0);
+        let mut wide = vec![0u16; usize::try_from(n).unwrap_or(0).max(1)];
+        MultiByteToWideChar(CP_ACP, 0, text.cast(), -1, wide.as_mut_ptr(), n);
+        Some(wide)
+    }
+}
+
+/// The ANSI form of a NUL-terminated UTF-16 string, NUL included.
+fn to_ansi(text: *const u16) -> Vec<u8> {
+    let (null, no) = (std::ptr::null(), std::ptr::null_mut());
+    // SAFETY: a NUL-terminated string; a sizing call, then one with room.
+    unsafe {
+        let n = WideCharToMultiByte(CP_ACP, 0, text, -1, std::ptr::null_mut(), 0, null, no);
+        let mut ansi = vec![0u8; usize::try_from(n).unwrap_or(0).max(1)];
+        WideCharToMultiByte(CP_ACP, 0, text, -1, ansi.as_mut_ptr(), n, null, no);
+        ansi
+    }
+}
+
+/// `GetAddrInfoExA` done with `GetAddrInfoExW`, for a host without the
+/// ANSI function. The two differ in the encoding of their strings only
+/// (learn.microsoft.com, ws2tcpip/nf-ws2tcpip-getaddrinfoexa): the names
+/// go in converted from the ANSI code page, and each canonical name in
+/// the result is replaced by an ANSI copy until [`FreeAddrInfoEx`] puts
+/// the host's back and frees the list.
+fn addr_info_ex_a_through_w(
+    name: *const c_char,
+    service: *const c_char,
+    namespace: u32,
+    provider: *const c_void,
+    hints: *const c_void,
+    result: *mut *mut c_void,
+    timeout: *const c_void,
+    handle: *mut Handle,
+) -> i32 {
+    let get = host!("ws2_32.dll", "GetAddrInfoExW": extern "system" fn(*const u16, *const u16, u32, *const c_void, *const c_void, *mut *mut c_void, *const c_void, *mut c_void, *const c_void, *mut Handle) -> i32);
+    let (name, service) = (from_ansi(name), from_ansi(service));
+    let text = |wide: &Option<Vec<u16>>| wide.as_ref().map_or(std::ptr::null(), |w| w.as_ptr());
+    let (no, null) = (std::ptr::null_mut(), std::ptr::null());
+    if result.is_null() {
+        // Nowhere to put a list: the host's answer to that.
+        return get(
+            text(&name),
+            text(&service),
+            namespace,
+            provider,
+            hints,
+            result,
+            timeout,
+            no,
+            null,
+            handle,
+        );
+    }
+    let mut list = std::ptr::null_mut::<c_void>();
+    let code = get(
+        text(&name),
+        text(&service),
+        namespace,
+        provider,
+        hints,
+        &mut list,
+        timeout,
+        no,
+        null,
+        handle,
+    );
+    if code == 0 && !list.is_null() {
+        let mut names = Vec::new();
+        let mut entry = list.cast::<AddrInfoEx>();
+        // SAFETY: the list the host just made, which no one else has yet.
+        while let Some(e) = unsafe { entry.as_mut() } {
+            if !e.canonical_name.is_null() {
+                let mut ansi = to_ansi(e.canonical_name.cast());
+                let wide = std::mem::replace(&mut e.canonical_name, ansi.as_mut_ptr().cast());
+                names.push((entry as usize, wide as usize, ansi));
+            }
+            entry = e.next;
+        }
+        let mut converted = CONVERTED.lock().unwrap_or_else(|e| e.into_inner());
+        // An address seen before was freed behind our back.
+        converted.retain(|c| c.head != list as usize);
+        converted.push(Converted {
+            head: list as usize,
+            names,
+        });
+    }
+    // SAFETY: the title's place for the list.
+    unsafe { result.write(list) };
+    code
+}
+
+/// On a host without the ANSI function (Wine) it is done with the wide
+/// one, for calls that complete at once. The ANSI function has no other
+/// kind: its reference says the overlapped and completion parameters must
+/// be null, so with either set the call fails as it always has here.
 pub extern "system" fn GetAddrInfoExA(
     name: *const c_char,
     service: *const c_char,
@@ -581,14 +804,42 @@ pub extern "system" fn GetAddrInfoExA(
     if !resolvable(narrow(name)) {
         return WSAHOST_NOT_FOUND;
     }
-    // Wine's ws2_32 has only the wide GetAddrInfoExW.
     if crate::host::function("ws2_32.dll", "GetAddrInfoExA").is_none() {
-        tracing::warn!("GetAddrInfoExA is missing from the host ws2_32");
-        return WSAHOST_NOT_FOUND;
+        if !overlapped.is_null() || !completion.is_null() {
+            tracing::warn!("GetAddrInfoExA is missing from the host ws2_32");
+            wsa_error(WSAHOST_NOT_FOUND);
+            return WSAHOST_NOT_FOUND;
+        }
+        return addr_info_ex_a_through_w(
+            name, service, namespace, provider, hints, result, timeout, handle,
+        );
     }
     host!("ws2_32.dll", "GetAddrInfoExA": extern "system" fn(*const c_char, *const c_char, u32, *const c_void, *const c_void, *mut *mut c_void, *const c_void, *mut c_void, *const c_void, *mut Handle) -> i32)(
         name, service, namespace, provider, hints, result, timeout, overlapped, completion, handle,
     )
+}
+
+/// Frees an `ADDRINFOEXA` list: one [`addr_info_ex_a_through_w`] made gets
+/// the host's canonical names back and goes to `FreeAddrInfoExW`, whose
+/// list it is; any other is the host's own.
+pub extern "system" fn FreeAddrInfoEx(list: *mut c_void) {
+    let ours = {
+        let mut converted = CONVERTED.lock().unwrap_or_else(|e| e.into_inner());
+        converted
+            .iter()
+            .position(|c| c.head == list as usize && !list.is_null())
+            .map(|at| converted.swap_remove(at))
+    };
+    match ours {
+        Some(ours) => {
+            for (entry, wide, _ansi) in &ours.names {
+                // SAFETY: an entry of the list, which lives until the call below.
+                unsafe { (*(*entry as *mut AddrInfoEx)).canonical_name = *wide as *mut c_void };
+            }
+            host!("ws2_32.dll", "FreeAddrInfoExW": extern "system" fn(*mut c_void))(list);
+        }
+        None => host!("ws2_32.dll", "FreeAddrInfoEx": extern "system" fn(*mut c_void))(list),
+    }
 }
 
 pub extern "system" fn GetAddrInfoExW(
@@ -857,6 +1108,7 @@ pub(crate) fn module() -> HleModule {
             hle_export!(GetAddrInfoW),
             hle_export!(GetAddrInfoExA),
             hle_export!(GetAddrInfoExW),
+            hle_export!(FreeAddrInfoEx),
             hle_export!(gethostbyname),
             hle_export!(WSAAsyncGetHostByName),
             hle_export!(WSALookupServiceBeginA),
@@ -881,213 +1133,5 @@ pub(crate) fn module() -> HleModule {
             ordinal("#102", WSAAsyncGetHostByAddr as *const () as usize),
             ordinal("#103", WSAAsyncGetHostByName as *const () as usize),
         ],
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::addr::AF_INET;
-    use super::*;
-    use victory_pe::ImportSymbol;
-
-    fn v4(ip: [u8; 4], port: u16) -> [u8; 16] {
-        let mut a = [0u8; 16];
-        a[..2].copy_from_slice(&AF_INET.to_le_bytes());
-        a[2..4].copy_from_slice(&port.to_be_bytes());
-        a[4..8].copy_from_slice(&ip);
-        a
-    }
-
-    // TEST-NET-1 (192.0.2.0/24): never routed, and never tried here.
-    const AWAY: [u8; 4] = [192, 0, 2, 1];
-    const HOME: [u8; 4] = [127, 0, 0, 1];
-
-    /// The table lists what this file binds. Wine's ws2_32 lacks two of
-    /// the functions; `WSAConnectByList` and `GetAddrInfoExA` here answer
-    /// for themselves before they would reach the host's.
-    #[test]
-    fn every_host_import_exists_or_has_a_fallback() {
-        const WINE_LACKS: &[(&str, &str)] = &[
-            ("ws2_32.dll", "GetAddrInfoExA"),
-            ("ws2_32.dll", "WSAConnectByList"),
-        ];
-        crate::host::check_bindings(include_str!("net.rs"), HOST_IMPORTS, WINE_LACKS);
-    }
-
-    #[test]
-    fn only_loopback_is_reachable() {
-        // Also starts Winsock for the raw calls below.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let socket = host!("ws2_32.dll", "socket": extern "system" fn(i32, i32, i32) -> Socket);
-        let close = host!("ws2_32.dll", "closesocket": extern "system" fn(Socket) -> i32);
-        let last_error = host!("ws2_32.dll", "WSAGetLastError": extern "system" fn() -> i32);
-        let null = std::ptr::null_mut::<c_void>();
-
-        // Connects.
-        let s = socket(2, 1, 6);
-        assert_ne!(s, INVALID_SOCKET);
-        assert_eq!(connect(s, v4(AWAY, 80).as_ptr(), 16), SOCKET_ERROR);
-        assert_eq!(last_error(), WSAENETUNREACH);
-        let n = null.cast();
-        assert_eq!(
-            WSAConnectByNameA(
-                s,
-                c"example.com".as_ptr(),
-                c"80".as_ptr(),
-                n,
-                null,
-                n,
-                null,
-                null,
-                null
-            ),
-            0
-        );
-        assert_eq!(last_error(), WSAHOST_NOT_FOUND);
-        assert_eq!(connect(s, v4(HOME, port).as_ptr(), 16), 0);
-        listener.accept().unwrap();
-        // A stream socket sends to its vetted peer whatever `to` says.
-        assert_eq!(sendto(s, b"x".as_ptr(), 1, 0, v4(AWAY, 9).as_ptr(), 16), 1);
-        close(s);
-
-        // `ConnectEx` from `WSAIoctl` is the vetted one.
-        let s = socket(2, 1, 6);
-        let mut f = 0usize;
-        let mut size = 0u32;
-        let guid = WSAID_CONNECTEX;
-        let got = WSAIoctl(
-            s,
-            SIO_GET_EXTENSION_FUNCTION_POINTER,
-            (&raw const guid).cast(),
-            16,
-            (&raw mut f).cast(),
-            8,
-            &mut size,
-            null,
-            null,
-        );
-        assert_eq!((got, f), (0, connect_ex as *const () as usize));
-        assert_eq!(
-            connect_ex(s, v4(AWAY, 80).as_ptr(), 16, null, 0, n, null),
-            0
-        );
-        assert_eq!(last_error(), WSAENETUNREACH);
-        close(s);
-
-        // Datagram sends.
-        let u = socket(2, 2, 17);
-        assert_eq!(
-            sendto(u, b"x".as_ptr(), 1, 0, v4(AWAY, 9).as_ptr(), 16),
-            SOCKET_ERROR
-        );
-        assert_eq!(last_error(), WSAENETUNREACH);
-        assert_eq!(
-            sendto(u, b"x".as_ptr(), 1, 0, v4(HOME, port).as_ptr(), 16),
-            1
-        );
-        close(u);
-
-        // Forward and reverse lookups.
-        let mut result = null;
-        assert_eq!(
-            getaddrinfo(
-                c"example.com".as_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-                &mut result
-            ),
-            WSAHOST_NOT_FOUND
-        );
-        let name: Vec<u16> = "example.com\0".encode_utf16().collect();
-        assert_eq!(
-            GetAddrInfoW(
-                name.as_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-                &mut result
-            ),
-            WSAHOST_NOT_FOUND
-        );
-        let mut text = [0 as c_char; 64];
-        let away = v4(AWAY, 80);
-        assert_eq!(
-            getnameinfo(
-                away.as_ptr(),
-                16,
-                text.as_mut_ptr(),
-                64,
-                std::ptr::null_mut(),
-                0,
-                0
-            ),
-            0
-        );
-        // SAFETY: NUL-terminated by `getnameinfo`.
-        let numeric = unsafe { CStr::from_ptr(text.as_ptr()) };
-        assert_eq!(numeric.to_str(), Ok("192.0.2.1"));
-        assert_eq!(
-            getnameinfo(
-                away.as_ptr(),
-                16,
-                text.as_mut_ptr(),
-                64,
-                std::ptr::null_mut(),
-                0,
-                NI_NAMEREQD
-            ),
-            WSAHOST_NOT_FOUND
-        );
-        assert!(gethostbyaddr(AWAY.as_ptr().cast(), 4, 2).is_null());
-
-        // WinHTTP.
-        assert!(WinHttpConnect(null, name.as_ptr(), 443, 0).is_null());
-        // SAFETY: no arguments.
-        let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
-        assert_eq!(error, ERROR_WINHTTP_CANNOT_CONNECT);
-        assert_eq!(
-            WinHttpGetProxyForUrlEx(null, name.as_ptr(), std::ptr::null(), 0),
-            ERROR_WINHTTP_AUTODETECTION_FAILED
-        );
-
-        // The ordinals we override name the functions they stand for.
-        let m = module();
-        for e in m.exports.iter().filter(|e| e.name.starts_with('#')) {
-            let named = m
-                .exports
-                .iter()
-                .find(|n| n.address == e.address && !n.name.starts_with('#'))
-                .unwrap();
-            let by_ordinal = ImportSymbol::Ordinal(e.name[1..].parse().unwrap());
-            assert_eq!(
-                crate::HostPolicy::default().resolve("ws2_32.dll", &by_ordinal),
-                crate::host::function("ws2_32.dll", named.name),
-                "{} is not {}",
-                e.name,
-                named.name
-            );
-        }
-        // Every override names a real export of its DLL. Some exports only
-        // exist on newer Windows (WinHttpGetProxySettingsEx is absent from
-        // Windows 10's winhttp.dll), and Wine lacks a few more. The HLE
-        // supplies those itself or checks for them at run time, so skip them
-        // only when the host really lacks them.
-        const NEWER_WINDOWS_ONLY: &[&str] = &["WinHttpGetProxySettingsEx"];
-        const WINE_LACKS: &[&str] = &["WSAConnectByList", "GetAddrInfoExA"];
-        let wine = crate::host::function("ntdll.dll", "wine_get_version").is_some();
-        for e in m.exports.iter().filter(|e| !e.name.starts_with('#')) {
-            let dll = if e.name.starts_with("WinHttp") {
-                "winhttp.dll"
-            } else {
-                "ws2_32.dll"
-            };
-            let present = crate::host::function(dll, e.name).is_some();
-            if !present
-                && (NEWER_WINDOWS_ONLY.contains(&e.name) || wine && WINE_LACKS.contains(&e.name))
-            {
-                continue;
-            }
-            assert!(present, "{dll} lacks {}", e.name);
-        }
     }
 }
