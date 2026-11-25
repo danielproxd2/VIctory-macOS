@@ -760,8 +760,7 @@ struct Physical {
 // ordered by anything here.
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
     Mutex::new(Physical {
-        // Page numbers are opaque to titles; 0 stays unused.
-        next_page: 0x10_0000,
+        next_page: FIRST_NUMBER,
         ..Default::default()
     })
 });
@@ -776,21 +775,13 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     count: *mut usize,
     pages: *mut usize,
 ) -> BOOL {
-    if count.is_null() || pages.is_null() {
-        return 0;
-    }
-    // SAFETY: checked non-null.
-    let n = unsafe { *count };
-    let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
-        return 0;
-    };
-    // Room for `n` page numbers cannot lie at `pages` at all.
-    if !range::array_fits(pages as usize, n, size_of::<usize>()) {
-        return 0;
-    }
-    // A pagefile-backed section of `size` bytes, its pages committed when
-    // first mapped or written (`commit`): Grand Theft Auto VI asks for 6.1
-    // GiB at once, which a busy host often cannot commit (error 1450).
+    allocate_pages(&PHYSICAL, flags, count, pages, create_section)
+}
+
+/// A pagefile-backed section of `size` bytes, its pages committed when
+/// first mapped or written (`commit`): Grand Theft Auto VI asks for 6.1 GiB
+/// at once, which a busy host often cannot commit (error 1450).
+fn create_section(size: usize) -> std::io::Result<Section> {
     // SAFETY: plain section creation.
     let handle = unsafe {
         CreateFileMappingW(
@@ -807,39 +798,86 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         )
     };
     if handle.is_null() {
-        let error = std::io::Error::last_os_error();
-        tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
-        // Under Wine this is where the memory is asked for (`commit` has
-        // nothing left to do there), so this is the failure to explain.
-        if on_wine() {
-            report(&section_refused_message(
-                size,
-                &error,
-                system_commit().as_ref(),
-            ));
-        }
-        // SAFETY: checked non-null.
-        unsafe { count.write(0) };
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(Section(handle))
+}
+
+/// [`XMemAllocatePhysicalPages`], with the pages entered in `table` and the
+/// section made by `create` (the host's, or a test's refusal). A request
+/// that fails gives no page: no number is written, and `count` reads 0
+/// unless it named no size at all.
+fn allocate_pages(
+    table: &Mutex<Physical>,
+    flags: u64,
+    count: *mut usize,
+    pages: *mut usize,
+    create: impl FnOnce(usize) -> std::io::Result<Section>,
+) -> BOOL {
+    if count.is_null() || pages.is_null() {
         return 0;
     }
+    // SAFETY: checked non-null.
+    let n = unsafe { *count };
+    let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
+        return 0;
+    };
+    // Room for `n` page numbers cannot lie at `pages` at all.
+    if !range::array_fits(pages as usize, n, size_of::<usize>()) {
+        return 0;
+    }
+    let refused = || {
+        // SAFETY: checked non-null.
+        unsafe { count.write(0) };
+        0
+    };
+    // The count is the title's. More pages than there are numbers for are
+    // refused before the host is asked for anything: under Wine it would
+    // make a sparse section of almost any size, and the tables below would
+    // then grow by the title's count.
+    if n > MAX_PAGES {
+        tracing::warn!(
+            n,
+            most = MAX_PAGES,
+            "XMemAllocatePhysicalPages: more pages than there are page numbers"
+        );
+        return refused();
+    }
+    let section = match create(size) {
+        Ok(section) => Arc::new(section),
+        Err(error) => {
+            tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
+            // Under Wine this is where the memory is asked for (`commit`
+            // has nothing left to do there), so this is the failure to
+            // explain.
+            if on_wine() {
+                report(&section_refused_message(
+                    size,
+                    &error,
+                    system_commit().as_ref(),
+                ));
+            }
+            return refused();
+        }
+    };
     tracing::debug!(
         n,
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    let section = Arc::new(Section(handle));
-    let mut physical = physical();
-    let first = physical.next_page;
-    physical.next_page += n * FRAMES;
+    let mut physical = table.lock().unwrap_or_else(|e| e.into_inner());
+    // The section is closed again where its pages get no numbers.
+    let Some(first) = physical.number(&section, n) else {
+        tracing::warn!(
+            n,
+            next = physical.next_page,
+            "XMemAllocatePhysicalPages: out of page numbers, or of memory for the page table"
+        );
+        return refused();
+    };
     for index in 0..n {
-        let slice = Slice {
-            section: section.clone(),
-            index,
-        };
-        let number = first + index * FRAMES;
-        physical.pages.insert(number, slice);
         // SAFETY: the title passes room for `n` page numbers.
-        unsafe { pages.add(index).write(number) };
+        unsafe { pages.add(index).write(first + index * FRAMES) };
     }
     1
 }
@@ -848,6 +886,41 @@ pub extern "system" fn XMemAllocatePhysicalPages(
 /// 16: Grand Theft Auto VI keeps them as 21-bit `number >> 4` and rebuilds
 /// them with `<< 4` (128 GiB of pages at most).
 const FRAMES: usize = PAGE >> 12;
+/// The first page number handed out. Page numbers are opaque to titles; 0
+/// stays unused.
+const FIRST_NUMBER: usize = 0x10_0000;
+/// One past the last page number that survives 21 bits of `number >> 4`.
+const NUMBER_END: usize = 1 << (21 + FRAMES.trailing_zeros());
+/// The most pages there are numbers for, in one request or in all of them.
+// shortcut: the numbers of freed pages are not handed out again, so a title
+// that allocates and frees more than this over its run is refused from then
+// on (124 GiB of pages; Grand Theft Auto VI allocates its 6.1 GiB once).
+// Hand freed numbers out again if a title runs out.
+const MAX_PAGES: usize = (NUMBER_END - FIRST_NUMBER) / FRAMES;
+
+impl Physical {
+    /// Gives the `n` pages of `section` the next page numbers and returns
+    /// the first (the others follow, `FRAMES` apart). `None`, with nothing
+    /// changed, where fewer than `n` numbers are left or the page table
+    /// cannot grow by `n`.
+    fn number(&mut self, section: &Arc<Section>, n: usize) -> Option<usize> {
+        let first = self.next_page;
+        let end = n
+            .checked_mul(FRAMES)
+            .and_then(|frames| first.checked_add(frames))
+            .filter(|&end| end <= NUMBER_END)?;
+        self.pages.try_reserve(n).ok()?;
+        for index in 0..n {
+            let slice = Slice {
+                section: section.clone(),
+                index,
+            };
+            self.pages.insert(first + index * FRAMES, slice);
+        }
+        self.next_page = end;
+        Some(first)
+    }
+}
 
 /// Pages still mapped stay readable through their views until unmapped.
 pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> BOOL {
@@ -2618,32 +2691,29 @@ mod tests {
 
     #[test]
     fn a_request_the_host_cannot_meet_fails_and_is_reported() {
-        // More bytes than any section has, on any host.
-        let mut requests = vec![usize::MAX / PAGE];
+        // Every count the host itself would refuse is refused before it is
+        // asked (`a_page_count_past_the_page_numbers_is_refused`), so the
+        // host's refusal is a section that cannot be made: error 8 here.
+        let n = 12345;
+        let (mut count, mut pages) = (n, [7usize; 1]);
+        let asked = std::cell::Cell::new(0);
+        let given = allocate_pages(&PHYSICAL, 0, &mut count, pages.as_mut_ptr(), |size| {
+            asked.set(size);
+            Err(std::io::Error::from_raw_os_error(8))
+        });
+        assert_eq!(given, 0);
+        assert_eq!(asked.get(), n * PAGE, "the host was asked for the bytes");
+        assert_eq!(count, 0, "pages given");
+        assert_eq!(pages, [7], "no page number written");
         if on_wine() {
-            // Wine refuses this one for want of memory (measured: it
-            // creates sections up to 2^48 bytes, sparse).
-            requests.push(1 << 40);
-        }
-        for n in requests {
-            let (mut count, mut pages) = (n, [7usize; 1]);
-            assert_eq!(
-                XMemAllocatePhysicalPages(0, &mut count, pages.as_mut_ptr()),
-                0,
-                "{n:#x}"
-            );
-            assert_eq!(count, 0, "{n:#x}: pages given");
-            assert_eq!(pages, [7], "{n:#x}: no page number written");
-            if on_wine() {
-                // The Wine-only path: the section is where memory is asked
-                // for, so its failure is what the crash log explains.
-                let bytes = format!("{} bytes of physical pages", n * PAGE);
-                let said = reported(&bytes);
-                assert_eq!(said.len(), 1, "{n:#x}: {said:?}");
-                assert!(said[0].starts_with("VIctory: Wine could not create a section for"));
-                assert!(said[0].contains("os error"), "{said:?}");
-                assert!(said[0].contains("free memory and disk space"), "{said:?}");
-            }
+            // The Wine-only path: the section is where memory is asked
+            // for, so its failure is what the crash log explains.
+            let bytes = format!("{} bytes of physical pages", n * PAGE);
+            let said = reported(&bytes);
+            assert_eq!(said.len(), 1, "{said:?}");
+            assert!(said[0].starts_with("VIctory: Wine could not create a section for"));
+            assert!(said[0].contains("os error 8"), "{said:?}");
+            assert!(said[0].contains("free memory and disk space"), "{said:?}");
         }
         // A count that is no size at all is no failure of the host's:
         // nothing is asked of it and nothing reported.
@@ -2653,6 +2723,93 @@ mod tests {
             0
         );
         assert_eq!((count, pages), (WRAPS, [7]));
+    }
+
+    #[test]
+    fn a_page_count_past_the_page_numbers_is_refused() {
+        // What a title keeps of a page number: 21 bits of `number >> 4`.
+        let kept = |number: usize| (number >> 4 & 0x1f_ffff) << 4;
+        assert_eq!(kept(NUMBER_END - FRAMES), NUMBER_END - FRAMES);
+        assert_ne!(
+            kept(NUMBER_END),
+            NUMBER_END,
+            "the first number that is lost"
+        );
+        assert_eq!(FIRST_NUMBER + MAX_PAGES * FRAMES, NUMBER_END);
+
+        // One page more than there are numbers for, with room for every
+        // number a call that went on would write.
+        let n = MAX_PAGES + 1;
+        let (mut count, mut numbers) = (n, vec![7usize; n]);
+        assert_eq!(
+            XMemAllocatePhysicalPages(0, &mut count, numbers.as_mut_ptr()),
+            0
+        );
+        assert_eq!(count, 0, "pages given");
+        assert!(
+            numbers.iter().all(|&number| number == 7),
+            "no number written"
+        );
+        drop(numbers);
+        // Counts the host was left to refuse before (Wine made a section of
+        // 2^48 bytes when measured): not one reaches it now, so nothing is
+        // allocated and nothing reported.
+        for n in [1 << 21, 1 << 32, 1 << 40, usize::MAX / PAGE] {
+            let (mut count, mut pages) = (n, [7usize; 1]);
+            let asked = std::cell::Cell::new(false);
+            let given = allocate_pages(&PHYSICAL, 0, &mut count, pages.as_mut_ptr(), |size| {
+                asked.set(true);
+                create_section(size)
+            });
+            assert_eq!(given, 0, "{n:#x}");
+            assert!(!asked.get(), "{n:#x}: the host was asked for a section");
+            assert_eq!((count, pages), (0, [7]), "{n:#x}");
+            let mut count = n;
+            assert_eq!(
+                XMemAllocatePhysicalPages(0, &mut count, pages.as_mut_ptr()),
+                0,
+                "{n:#x}"
+            );
+            assert_eq!((count, pages), (0, [7]), "{n:#x}");
+            let bytes = format!(" {} bytes of physical pages", n * PAGE);
+            assert_eq!(reported(&bytes), Vec::<String>::new(), "{n:#x}");
+        }
+    }
+
+    #[test]
+    fn page_numbers_run_out_cleanly() {
+        let section = Arc::new(create_section(PAGE).expect("a section of one page"));
+        // A page table of its own, two numbers from the end.
+        let mut table = Physical {
+            next_page: NUMBER_END - 2 * FRAMES,
+            ..Default::default()
+        };
+        let state = |table: &Physical| (table.next_page, table.pages.len());
+        let before = state(&table);
+        // Too many by one, and counts whose frames wrap: nothing changes.
+        for n in [3, MAX_PAGES + 1, usize::MAX / FRAMES + 1, usize::MAX] {
+            assert_eq!(table.number(&section, n), None, "{n:#x}");
+            assert_eq!(state(&table), before, "{n:#x}");
+        }
+        let first = table.number(&section, 2).expect("the last two numbers");
+        assert_eq!(first, NUMBER_END - 2 * FRAMES);
+        for (index, number) in [first, first + FRAMES].into_iter().enumerate() {
+            assert_eq!((number >> 4 & 0x1f_ffff) << 4, number, "fits 21 bits");
+            assert_eq!(table.pages.get(&number).map(|s| s.index), Some(index));
+        }
+        assert_eq!(state(&table), (NUMBER_END, 2));
+        // None is left. A request for no pages takes none (the export
+        // refuses it before it gets here).
+        assert_eq!(table.number(&section, 1), None);
+        assert_eq!(table.number(&section, 0), Some(NUMBER_END));
+        assert_eq!(state(&table), (NUMBER_END, 2));
+
+        // Through the export the same refusal reads: no page given.
+        let n = 4;
+        let (mut count, mut pages) = (n, [7usize; 4]);
+        let full = Mutex::new(table);
+        let given = allocate_pages(&full, 0, &mut count, pages.as_mut_ptr(), create_section);
+        assert_eq!((given, count, pages), (0, 0, [7; 4]));
     }
 
     #[test]
