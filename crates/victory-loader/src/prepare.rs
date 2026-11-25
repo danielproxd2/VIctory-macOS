@@ -41,6 +41,10 @@ impl PreparedImage {
 ///   the image, but callbacks only run when we call them (after binding);
 ///   its base relocation is made a no-op so the 0 survives a rebase;
 /// * `FORCE_INTEGRITY` cleared, checksum zeroed: the copy is unsigned.
+///
+/// An image whose callback pointer cannot be kept at 0 through a rebase is
+/// refused: its relocation table is unreadable, or does not relocate the
+/// pointer the one way we can undo.
 pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
     let info = ImageInfo::parse(original)?;
     let mut bytes = original.to_vec();
@@ -89,6 +93,12 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
         let at = info
             .rva_to_file_offset(tls.directory_rva)
             .ok_or(PrepareError::Patch("TLS directory is not file-backed"))?;
+        // Header values are untrusted: a directory in a section placed at
+        // the top of the 32-bit address space overflows here.
+        let field_rva = u32::try_from(layout::TLS64_ADDRESS_OF_CALLBACKS)
+            .ok()
+            .and_then(|offset| tls.directory_rva.checked_add(offset))
+            .ok_or(PrepareError::Patch(CALLBACKS_FIELD_OVERFLOW))?;
         write_u64(
             &mut bytes,
             at as usize + layout::TLS64_ADDRESS_OF_CALLBACKS,
@@ -97,11 +107,29 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
         // The field's base relocation would turn the 0 into `delta` whenever
         // the loader maps the copy away from its preferred base (Wine always
         // does for DYNAMIC_BASE images), and the loader then reads callbacks
-        // from there. Make that entry a no-op.
-        let field_rva = tls.directory_rva + layout::TLS64_ADDRESS_OF_CALLBACKS as u32;
-        for (entry, target) in dir64_relocations(&bytes, &info) {
-            if target == field_rva {
-                write_u16(&mut bytes, entry, 0)?; // IMAGE_REL_BASED_ABSOLUTE
+        // from there. Make that entry a no-op. An image that the loader
+        // will not relocate needs nothing.
+        if info.has_relocations {
+            let mut neutralised = false;
+            for relocation in base_relocations(&bytes, &info)? {
+                let Some(target) = relocation.target else {
+                    continue;
+                };
+                if relocation.kind == REL_BASED_DIR64 && target == field_rva {
+                    write_u16(&mut bytes, relocation.entry, 0)?; // IMAGE_REL_BASED_ABSOLUTE
+                    neutralised = true;
+                } else if relocation.kind != REL_BASED_ABSOLUTE && target.abs_diff(field_rva) < 8 {
+                    // Another type, or a DIR64 that only overlaps the
+                    // field: it would change part of the 0 and we do not
+                    // know how to undo it.
+                    return Err(PrepareError::Patch(CALLBACKS_FIELD_ODD_RELOCATION));
+                }
+            }
+            // A pointer in a relocatable image always has its DIR64 entry.
+            // Without one the table is not what the image was linked with,
+            // and nothing we wrote above can be trusted to stay.
+            if !neutralised {
+                return Err(PrepareError::Patch(CALLBACKS_FIELD_NOT_RELOCATED));
             }
         }
     }
@@ -116,46 +144,91 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
 /// Size of an IMAGE_IMPORT_DESCRIPTOR in the PE file.
 const IMPORT_DESCRIPTOR_SIZE: u32 = 20;
 
-/// Every `IMAGE_REL_BASED_DIR64` base relocation: (file offset of its entry,
-/// RVA it patches). Empty if the image has no readable relocation table.
-fn dir64_relocations(bytes: &[u8], info: &ImageInfo) -> Vec<(usize, u32)> {
-    const DIR64: u16 = 10;
+/// `IMAGE_REL_BASED_ABSOLUTE`: padding, relocates nothing.
+const REL_BASED_ABSOLUTE: u8 = 0;
+/// `IMAGE_REL_BASED_DIR64`: adds the load delta to a 64-bit field.
+const REL_BASED_DIR64: u8 = 10;
+
+const CALLBACKS_FIELD_OVERFLOW: &str = "TLS callbacks field RVA overflow";
+const CALLBACKS_FIELD_NOT_RELOCATED: &str =
+    "the TLS callbacks field has no DIR64 base relocation in a relocatable image";
+const CALLBACKS_FIELD_ODD_RELOCATION: &str =
+    "a base relocation other than DIR64 at its start changes the TLS callbacks field";
+const RELOCATIONS_OUTSIDE_SECTIONS: &str = "base relocation directory is outside the sections";
+const RELOCATION_BLOCK_MALFORMED: &str = "malformed base relocation block";
+
+/// One entry of the base relocation table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BaseRelocation {
+    /// File offset of the 16-bit entry.
+    entry: usize,
+    /// `IMAGE_REL_BASED_*`.
+    kind: u8,
+    /// RVA it patches. `None` if page plus offset leaves the 32-bit address
+    /// space: such an entry names no place in any image.
+    target: Option<u32>,
+}
+
+/// Every entry of the base relocation table, in file order. The table comes
+/// from the title, so a directory that is not wholly inside one section's
+/// file data, or a block whose size does not fit the directory, is an error
+/// and not a shorter list: an entry we did not see is one we cannot disarm.
+fn base_relocations(bytes: &[u8], info: &ImageInfo) -> Result<Vec<BaseRelocation>, PrepareError> {
+    let outside = PrepareError::Patch(RELOCATIONS_OUTSIDE_SECTIONS);
     let mut out = Vec::new();
     let Some(d) = layout::data_directory_offset(bytes, dir::BASERELOC) else {
-        return out;
+        return Ok(out);
     };
-    let (Some(rva), Some(size)) = (layout::read_u32(bytes, d), layout::read_u32(bytes, d + 4))
-    else {
-        return out;
+    let (Some(rva), Some(size)) = (
+        layout::read_u32(bytes, d),
+        d.checked_add(4).and_then(|at| layout::read_u32(bytes, at)),
+    ) else {
+        return Ok(out);
     };
-    let Some(start) = info.rva_to_file_offset(rva).filter(|_| size != 0) else {
-        return out;
-    };
-    let (mut at, end) = (start as usize, start as usize + size as usize);
-    while at + 8 <= end {
-        let (Some(page), Some(block)) =
-            (layout::read_u32(bytes, at), layout::read_u32(bytes, at + 4))
-        else {
-            break;
-        };
-        let block = block as usize;
-        if block < 8 || at + block > end {
-            break;
-        }
-        for entry in (at + 8..at + block).step_by(2) {
-            let Some(e) = bytes.get(entry..entry + 2) else {
-                break;
-            };
-            let e = u16::from_le_bytes([e[0], e[1]]);
-            if e >> 12 == DIR64
-                && let Some(target) = page.checked_add(u32::from(e & 0xFFF))
-            {
-                out.push((entry, target));
-            }
-        }
-        at += block;
+    if rva == 0 || size == 0 {
+        return Ok(out);
     }
-    out
+    // First and last byte must map to the same run of file data.
+    let Some(start) = info.rva_to_file_offset(rva) else {
+        return Err(outside);
+    };
+    let last = rva
+        .checked_add(size - 1)
+        .and_then(|rva| info.rva_to_file_offset(rva));
+    if last != start.checked_add(size - 1) {
+        return Err(outside);
+    }
+    let table = (start as usize)
+        .checked_add(size as usize)
+        .and_then(|end| bytes.get(start as usize..end))
+        .ok_or(outside)?;
+
+    let mut at = 0usize;
+    // Fewer than 8 bytes cannot hold a block header: alignment padding.
+    while let (Some(page), Some(block)) = (
+        layout::read_u32(table, at),
+        at.checked_add(4).and_then(|at| layout::read_u32(table, at)),
+    ) {
+        // A block of size 0 ends the table for the Windows loader as well.
+        if block == 0 {
+            break;
+        }
+        let entries = at
+            .checked_add(block as usize)
+            .filter(|_| block >= 8 && block % 2 == 0)
+            .and_then(|end| table.get(at + 8..end))
+            .ok_or(PrepareError::Patch(RELOCATION_BLOCK_MALFORMED))?;
+        for (i, e) in entries.as_chunks::<2>().0.iter().enumerate() {
+            let e = u16::from_le_bytes(*e);
+            out.push(BaseRelocation {
+                entry: start as usize + at + 8 + i * 2,
+                kind: (e >> 12) as u8,
+                target: page.checked_add(u32::from(e & 0xFFF)),
+            });
+        }
+        at += block as usize;
+    }
+    Ok(out)
 }
 
 fn write_u16(bytes: &mut [u8], at: usize, v: u16) -> Result<(), PrepareError> {
@@ -230,6 +303,24 @@ mod tests {
         directory_rva
     }
 
+    /// Every DIR64 base relocation with a target: (file offset of its
+    /// entry, RVA it patches).
+    fn dir64_relocations(bytes: &[u8], info: &ImageInfo) -> Vec<(usize, u32)> {
+        base_relocations(bytes, info)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.kind == REL_BASED_DIR64)
+            .filter_map(|r| Some((r.entry, r.target?)))
+            .collect()
+    }
+
+    fn patch_error(result: Result<PreparedImage, PrepareError>) -> &'static str {
+        match result {
+            Err(PrepareError::Patch(why)) => why,
+            other => panic!("expected PrepareError::Patch, got {other:?}"),
+        }
+    }
+
     /// File offset of the first entry of the first base relocation block.
     fn first_relocation_entry(bytes: &[u8]) -> usize {
         let directory = layout::data_directory_offset(bytes, dir::BASERELOC).unwrap();
@@ -245,6 +336,17 @@ mod tests {
         let prepared = prepare(&original).unwrap();
         assert!(!prepared.info.is_dll(), "info describes the original");
         assert!(prepared.info.import_count() > 0);
+        if let Some(tls) = &prepared.info.tls
+            && tls.callbacks_va != 0
+            && prepared.info.has_relocations
+        {
+            let field = tls.directory_rva + layout::TLS64_ADDRESS_OF_CALLBACKS as u32;
+            let on_field = dir64_relocations(&original, &prepared.info)
+                .iter()
+                .filter(|&&(_, target)| target == field)
+                .count();
+            assert_eq!(on_field, 1, "one entry relocates the callbacks field");
+        }
 
         let patched = ImageInfo::parse(&prepared.bytes).unwrap();
         assert!(patched.is_dll());
@@ -432,12 +534,38 @@ mod tests {
     #[test]
     fn a_relocation_page_near_4_gib_does_not_overflow() {
         // Header values are untrusted: page + offset used to overflow u32.
-        let built = tls_title(Some(0xFFFF_FFFF));
+        // The block's other entry is the real relocation of the callbacks
+        // field, on the directory's own page.
+        let field = layout::TLS64_ADDRESS_OF_CALLBACKS as u16;
+        let built = title()
+            .tls_callbacks(&[0x1000, 0x1020])
+            .reloc_block(0xFFFF_FFFF, &[(reloc::DIR64, field), (reloc::DIR64, 0)])
+            .reloc_block(tls_directory_page(), &[(reloc::DIR64, field)])
+            .build()
+            .unwrap();
         let original = &built.bytes;
         let entry = first_relocation_entry(original);
         let dir64 = (u16::from(reloc::DIR64) << 12 | 0x18).to_le_bytes();
         assert_eq!(original[entry..entry + 2], dir64);
-        let prepared = prepare(original).expect("prepare must not panic");
+        // The answer is in the returned values, so it is the same answer
+        // in a build without overflow checks: an entry past 4 GiB has no
+        // target. Wrapping arithmetic would report RVA 0x17 for it.
+        let info = ImageInfo::parse(original).unwrap();
+        let relocations = base_relocations(original, &info).unwrap();
+        let targets: Vec<_> = relocations.iter().map(|r| (r.kind, r.target)).collect();
+        let field_rva = tls_directory_page() + 0x18;
+        assert_eq!(
+            targets,
+            [
+                (reloc::DIR64, None),
+                (reloc::DIR64, Some(0xFFFF_FFFF)),
+                (reloc::DIR64, Some(field_rva)),
+                (reloc::ABSOLUTE, Some(tls_directory_page())),
+            ]
+        );
+        assert_eq!(relocations[0].entry, entry);
+
+        let prepared = prepare(original).unwrap();
         // The original's TLS data is reported untouched: the callback array
         // is where the builder put it, 64 bytes into the `.tls` section
         // that follows `.text` and `.idata`.
@@ -445,14 +573,225 @@ mod tests {
         assert_eq!(tls.callbacks_va, callbacks_va(&built));
         assert_eq!(tls.callbacks_va, 0x1_8000_3040);
         assert_eq!(tls.callback_rvas, [0x1000, 0x1020]);
-        // The entry is left alone: it names no field of the image.
+        // The entry is left alone: it names no field of the image. The
+        // field's own entry, in the second block, is turned into a no-op.
         assert_eq!(prepared.bytes[entry..entry + 2], dir64);
-        // On the directory's own page it is the callbacks field's
-        // relocation, and is turned into a no-op.
+        let own = relocations[2].entry;
+        assert_eq!(original[own..own + 2], dir64);
+        assert_eq!(prepared.bytes[own..own + 2], [0, 0]);
+        let table = info.sections.last().unwrap();
+        let table = table.file_offset as usize..(table.file_offset + table.file_size) as usize;
+        assert!(table.contains(&entry) && table.contains(&own));
+        for i in table {
+            let same = original[i] == prepared.bytes[i];
+            assert_eq!(same, !(own..own + 2).contains(&i), "table byte {i:#x}");
+        }
+        // On the directory's own page the first entry is the callbacks
+        // field's relocation, and is turned into a no-op.
         let original = tls_title(Some(tls_directory_page())).bytes;
         assert_eq!(first_relocation_entry(&original), entry);
         let prepared = prepare(&original).unwrap();
         assert_eq!(prepared.bytes[entry..entry + 2], [0, 0]);
+    }
+
+    #[test]
+    fn an_unrelocated_callbacks_field_is_an_error() {
+        // The only DIR64 entry is on another page: after a rebase nothing
+        // about this image's TLS directory can be relied on.
+        let built = tls_title(Some(0xFFFF_FFFF));
+        assert!(ImageInfo::parse(&built.bytes).unwrap().has_relocations);
+        assert_eq!(
+            patch_error(prepare(&built.bytes)),
+            CALLBACKS_FIELD_NOT_RELOCATED
+        );
+        let other_page = tls_title(Some(tls_directory_page() + 0x1000));
+        assert_eq!(
+            patch_error(prepare(&other_page.bytes)),
+            CALLBACKS_FIELD_NOT_RELOCATED
+        );
+        // An image the loader does not relocate needs no entry: without a
+        // table, and with the table marked as stripped.
+        assert!(prepare(&tls_title(None).bytes).is_ok());
+        let stripped = title()
+            .tls_callbacks(&[0x1000])
+            .reloc_block(0x1000, &[(reloc::DIR64, 0)])
+            .relocs_stripped(true)
+            .build()
+            .unwrap();
+        assert!(prepare(&stripped.bytes).is_ok());
+        // Nor does an image without callbacks, whatever its table says.
+        let no_callbacks = title()
+            .tls_without_callbacks()
+            .reloc_block(0xFFFF_FFFF, &[(reloc::HIGHLOW, 0x18)])
+            .build()
+            .unwrap();
+        assert!(prepare(&no_callbacks.bytes).is_ok());
+    }
+
+    #[test]
+    fn highlow_relocation_on_callbacks_is_an_error() {
+        // A 32-bit relocation on the field would add the low half of the
+        // load delta to the 0 we wrote. It used to be skipped, and the
+        // image prepared as if the 0 were safe.
+        let page = tls_directory_page();
+        let with = |entries: &[(u8, u16)]| {
+            let built = title().tls_callbacks(&[0x1000, 0x1020]);
+            prepare(&built.reloc_block(page, entries).build().unwrap().bytes)
+        };
+        assert_eq!(
+            patch_error(with(&[(reloc::HIGHLOW, 0x18)])),
+            CALLBACKS_FIELD_ODD_RELOCATION
+        );
+        // Also next to the field's own DIR64 entry, on its upper half, and
+        // as a DIR64 that only overlaps the field.
+        for odd in [
+            (reloc::HIGHLOW, 0x18),
+            (reloc::HIGHLOW, 0x1C),
+            (reloc::DIR64, 0x14),
+            (reloc::DIR64, 0x1F),
+        ] {
+            assert_eq!(
+                patch_error(with(&[(reloc::DIR64, 0x18), odd])),
+                CALLBACKS_FIELD_ODD_RELOCATION,
+                "{odd:?}"
+            );
+        }
+        // Its neighbours are not the field: the 8 bytes before and after.
+        let prepared = with(&[
+            (reloc::DIR64, 0x10),
+            (reloc::DIR64, 0x18),
+            (reloc::HIGHLOW, 0x20),
+            (reloc::ABSOLUTE, 0x18),
+        ])
+        .unwrap();
+        let entry = first_relocation_entry(&prepared.bytes);
+        let entries: Vec<_> = prepared.bytes[entry..entry + 8]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|e| u16::from_le_bytes(*e))
+            .collect();
+        assert_eq!(entries, [0xA010, 0, 0x3020, 0x0018]);
+    }
+
+    #[test]
+    fn relocation_directory_outside_sections_is_an_error() {
+        let built = tls_title(Some(tls_directory_page()));
+        assert!(prepare(&built.bytes).is_ok());
+        let directory = layout::data_directory_offset(&built.bytes, dir::BASERELOC).unwrap();
+        let rva = layout::read_u32(&built.bytes, directory).unwrap();
+        let size = layout::read_u32(&built.bytes, directory + 4).unwrap();
+        let info = ImageInfo::parse(&built.bytes).unwrap();
+        let reloc_section = info.sections.last().unwrap();
+        assert_eq!((reloc_section.rva, reloc_section.virtual_size), (rva, size));
+
+        let moved = |rva: u32, size: u32| {
+            let mut bytes = built.bytes.clone();
+            write_u32(&mut bytes, directory, rva).unwrap();
+            write_u32(&mut bytes, directory + 4, size).unwrap();
+            assert!(ImageInfo::parse(&bytes).unwrap().has_relocations);
+            prepare(&bytes)
+        };
+        // Past the image, in the headers, at the 4 GiB limit; starting in
+        // the section but running out of it; and starting in one section
+        // and ending in the next. All used to be read as "no relocations",
+        // and the image was prepared with its callbacks field still
+        // relocated.
+        for (rva, size) in [
+            (info.size_of_image + 0x1000, size),
+            (0x80, size),
+            (0xFFFF_FFF8, 0x10),
+            (rva, size + 8),
+            (rva, 0x1000),
+            (rva + 4, size),
+            (0x1000, 0x2008),
+        ] {
+            assert_eq!(
+                patch_error(moved(rva, size)),
+                RELOCATIONS_OUTSIDE_SECTIONS,
+                "directory {rva:#x}+{size:#x}"
+            );
+        }
+        assert!(moved(rva, size).is_ok());
+    }
+
+    #[test]
+    fn a_malformed_relocation_block_is_an_error() {
+        let built = tls_title(Some(tls_directory_page()));
+        let entry = first_relocation_entry(&built.bytes);
+        let block_size = entry - 4;
+        assert_eq!(layout::read_u32(&built.bytes, block_size), Some(12));
+        // Shorter than its own header, odd, or longer than the directory.
+        for size in [1u32, 7, 9, 11, 14, 0x1000, u32::MAX] {
+            let mut bytes = built.bytes.clone();
+            write_u32(&mut bytes, block_size, size).unwrap();
+            assert_eq!(
+                patch_error(prepare(&bytes)),
+                RELOCATION_BLOCK_MALFORMED,
+                "block size {size}"
+            );
+        }
+        // A block of size 0 ends the table: the field's entry is then not
+        // in it, which is the "not relocated" refusal.
+        let mut bytes = built.bytes.clone();
+        write_u32(&mut bytes, block_size, 0).unwrap();
+        assert_eq!(patch_error(prepare(&bytes)), CALLBACKS_FIELD_NOT_RELOCATED);
+        // A block with a header and no entries is well formed.
+        let mut bytes = built.bytes.clone();
+        write_u32(&mut bytes, block_size, 8).unwrap();
+        let info = ImageInfo::parse(&bytes).unwrap();
+        let relocations = base_relocations(&bytes, &info).unwrap();
+        // The four bytes left over cannot hold another block header.
+        assert_eq!(relocations, []);
+    }
+
+    #[test]
+    fn tls_directory_near_4_gib_does_not_overflow() {
+        // `.text` at 0x1000, the callback array in `.cb` at 0x2000 and the
+        // TLS directory in the third section, which is then moved so that
+        // the directory's callbacks field would start exactly at 4 GiB.
+        let array = [DEFAULT_IMAGE_BASE + 0x1000, 0].map(u64::to_le_bytes);
+        let built = PeBuilder::new()
+            .section(".text", scn::CODE, &[0xC3; 0x40])
+            .section(".cb", scn::RDATA, array.as_flattened())
+            .tls_callbacks(&[0x1000])
+            .build()
+            .unwrap();
+        let mut bytes = built.bytes;
+        let info = ImageInfo::parse(&bytes).unwrap();
+        let old_rva = built.tls_directory_rva.unwrap();
+        let at = info.rva_to_file_offset(old_rva).unwrap() as usize;
+        let moved_to = u32::MAX - 0x17;
+        let section = victory_pe::testing::section_header_offset(&bytes, 2).unwrap();
+        assert_eq!(layout::read_u32(&bytes, section + 12), Some(old_rva));
+        write_u32(&mut bytes, section + 12, moved_to).unwrap();
+        let directory = layout::data_directory_offset(&bytes, dir::TLS).unwrap();
+        write_u32(&mut bytes, directory, moved_to).unwrap();
+        write_u64(
+            &mut bytes,
+            at + layout::TLS64_ADDRESS_OF_CALLBACKS,
+            DEFAULT_IMAGE_BASE + 0x2000,
+        )
+        .unwrap();
+
+        // The parser accepts it: the directory and the array are backed by
+        // file data and the callback is in `.text`.
+        let info = ImageInfo::parse(&bytes).unwrap();
+        let tls = info.tls.as_ref().unwrap();
+        assert_eq!(tls.directory_rva, moved_to);
+        assert_eq!(tls.callback_rvas, [0x1000]);
+        // `directory_rva + 24` was unchecked: a panic with overflow checks,
+        // and without them RVA 0, with the image prepared as if its
+        // callbacks field were there.
+        assert_eq!(patch_error(prepare(&bytes)), CALLBACKS_FIELD_OVERFLOW);
+        // One byte lower the field fits, and the image is prepared.
+        write_u32(&mut bytes, section + 12, moved_to - 8).unwrap();
+        write_u32(&mut bytes, directory, moved_to - 8).unwrap();
+        let prepared = prepare(&bytes).unwrap();
+        assert_eq!(
+            layout::read_u64(&prepared.bytes, at + layout::TLS64_ADDRESS_OF_CALLBACKS),
+            Some(0)
+        );
     }
 
     #[test]
