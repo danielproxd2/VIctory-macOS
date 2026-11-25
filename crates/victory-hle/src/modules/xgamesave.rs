@@ -268,6 +268,14 @@ fn step() {
     tests::crash_point();
 }
 
+/// Makes `to` another name of the file `from`. A test may have it refused,
+/// as a file system does that allows a file no further link.
+fn link(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    tests::link_refusal()?;
+    std::fs::hard_link(from, to)
+}
+
 /// A blob of a new version: new data, or the previous version's file.
 enum Source<'a> {
     Data(&'a [u8]),
@@ -298,7 +306,7 @@ fn commit(
             Source::Data(data) => write(path, data)?,
             // Files are never changed in place, so sharing one is safe.
             Source::Kept(from) => {
-                std::fs::hard_link(from, &path).or_else(|_| write(path, &std::fs::read(from)?))?
+                link(from, &path).or_else(|_| write(path, &std::fs::read(from)?))?
             }
         }
         step();
@@ -1169,6 +1177,23 @@ mod tests {
         }
     }
 
+    thread_local! {
+        /// Whether this thread's hard links are refused, and how many were.
+        static LINKS_REFUSED: std::cell::Cell<(bool, u32)> =
+            const { std::cell::Cell::new((false, 0)) };
+    }
+
+    /// For [`link`]: the refusal of a file system at its link limit, while
+    /// the test on this thread asks for it.
+    pub(super) fn link_refusal() -> std::io::Result<()> {
+        let (refuse, refused) = LINKS_REFUSED.get();
+        if !refuse {
+            return Ok(());
+        }
+        LINKS_REFUSED.set((refuse, refused + 1));
+        Err(std::io::ErrorKind::TooManyLinks.into())
+    }
+
     /// The per-user quota and the host disk fail with their own errors.
     #[test]
     fn a_full_disk_is_not_the_quota() {
@@ -1309,7 +1334,19 @@ mod tests {
         for i in 0..1023 {
             std::fs::hard_link(&old_b, links.path().join(i.to_string())).expect(NTFS);
         }
-        let full = std::fs::hard_link(&old_b, links.path().join("full")).expect_err(NTFS);
+        // Off NTFS (the Wine prefix on a Mac lies on APFS) the file takes
+        // more links and there is no limit to run into here: the copy is
+        // then checked by `a_kept_blob_that_cannot_be_linked_is_copied`
+        // alone. `VICTORY_REQUIRE_NTFS=1` makes that a failure.
+        let full = match std::fs::hard_link(&old_b, links.path().join("full")) {
+            Err(full) => full,
+            Ok(()) => {
+                return crate::testing::skip_unless_required(
+                    "VICTORY_REQUIRE_NTFS",
+                    "no NTFS link limit: this file system allows a file more than 1024 links",
+                );
+            }
+        };
         assert_eq!(full.kind(), std::io::ErrorKind::TooManyLinks, "{NTFS}");
 
         assert_eq!(update(root, "two", &[("a", Some("new a"))]), S_OK);
@@ -1321,6 +1358,42 @@ mod tests {
         assert_eq!(state(root), Some(new));
         assert!(!old_b.exists());
         assert_eq!(std::fs::read(links.path().join("0")).unwrap(), b"old b");
+    }
+
+    /// The same on any file system: a kept blob whose link is refused is
+    /// copied into the new version with its exact bytes, and the save goes
+    /// through.
+    #[test]
+    fn a_kept_blob_that_cannot_be_linked_is_copied() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(
+            update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]),
+            S_OK
+        );
+        let old_b = container_dir(root, "Slot").join("v1").join("1");
+        // Another name of the kept blob's file, which outlives version 1.
+        let links = tempfile::tempdir().unwrap();
+        let witness = links.path().join("witness");
+        std::fs::hard_link(&old_b, &witness).unwrap();
+
+        LINKS_REFUSED.set((true, 0));
+        let hr = update(root, "two", &[("a", Some("new a"))]);
+        let (_, refused) = LINKS_REFUSED.replace((false, 0));
+        assert_eq!(hr, S_OK);
+        // Only `b` is kept, so only its link was asked for.
+        assert_eq!(refused, 1);
+
+        let new = (
+            "two".into(),
+            vec![("a".into(), "new a".into()), ("b".into(), "old b".into())],
+        );
+        assert_eq!(state(root), Some(new));
+        assert!(!old_b.exists());
+        // A file of its own: writing through the old one's other name
+        // leaves the new version as it is.
+        std::fs::write(&witness, "changed").unwrap();
+        assert_eq!(state(root).unwrap().1[1].1, "old b");
     }
 
     #[test]

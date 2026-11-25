@@ -57,6 +57,7 @@ A shader test that lacks something it needs passes after printing one line that 
 - `VICTORY_REQUIRE_WARP=1`: the WARP software device beside it. D3DMetal under Wine has no WARP, so on a Mac the device tests run on the hardware adapter only, and each prints `skipped: no SM 6.6 WARP device`.
 - `VICTORY_REQUIRE_DXIL=1`: the DXIL validator, described below.
 - `VICTORY_REQUIRE_DIFF=1`: the console compiler (`VICTORY_CONSOLE_DXC`) and a PC `dxc.exe` (`VICTORY_PC_DXC`) for the differential shader tests.
+- `VICTORY_REQUIRE_NTFS=1`: a temporary folder on NTFS, whose limit of 1024 hard links to a file one save-game test runs into on purpose. The Wine prefix lies on APFS, which has no such limit, so on a Mac `a_kept_blob_past_the_link_limit_is_copied` prints `skipped: no NTFS link limit: ...`; the copy it is about is checked on every file system by `a_kept_blob_that_cannot_be_linked_is_copied`.
 
 ## The DXIL validator
 

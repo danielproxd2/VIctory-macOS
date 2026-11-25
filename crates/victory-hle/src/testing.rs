@@ -19,6 +19,29 @@ pub(crate) fn skip(reason: &str) {
     let _ = writeln!(std::io::stderr(), "{line}");
 }
 
+/// Whether a switch whose value in this run is `value` is on: only `1` is.
+fn on(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim() == "1")
+}
+
+/// What a test does that lacks something only some hosts give it: it
+/// fails if the switch `var` (`VICTORY_REQUIRE_...=1`) says this run is to
+/// prove the thing, and otherwise passes after the skip line. (So far
+/// only tests of the Windows build meet such a lack.)
+#[cfg(windows)]
+pub(crate) fn skip_unless_required(var: &str, reason: &str) {
+    assert!(!on(std::env::var(var).ok().as_deref()), "{var}=1: {reason}");
+    skip(reason);
+}
+
+#[test]
+fn only_one_turns_a_switch_on() {
+    assert!(on(Some("1")) && on(Some(" 1\n")));
+    for off in [None, Some(""), Some("0"), Some("true"), Some("11")] {
+        assert!(!on(off), "{off:?}");
+    }
+}
+
 #[test]
 fn a_skip_line_names_the_reason_and_the_test() {
     assert_eq!(
