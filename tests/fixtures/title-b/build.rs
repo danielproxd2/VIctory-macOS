@@ -16,7 +16,11 @@ fn main() {
         // library for the one delay-loaded DLL instead.
         let out = PathBuf::from(env::var("OUT_DIR").unwrap());
         let def = out.join("title_quiet.def");
-        std::fs::write(&def, "LIBRARY title_quiet.dll\nEXPORTS\ntitle_quiet_value\n").unwrap();
+        std::fs::write(
+            &def,
+            "LIBRARY title_quiet.dll\nEXPORTS\ntitle_quiet_value\n",
+        )
+        .unwrap();
         let status = Command::new("x86_64-w64-mingw32-dlltool")
             .arg("-d")
             .arg(&def)
