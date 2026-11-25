@@ -52,6 +52,8 @@ windows-core = { workspace = true, optional = true }
 [dev-dependencies]
 victory-loader = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
+# The console containers of the stand-in title that draws (`testkit`).
+victory-shader = { workspace = true, features = ["test-support"] }
 
 [features]
 # Debugging switches (scripted keys and the like).
