@@ -810,11 +810,7 @@ fn module_of(address: usize) -> Option<String> {
 /// cause: a wild pointer, an allocation whose commit failed, a stack
 /// overrun, a write to code or constants.
 fn memory_at(address: usize) -> String {
-    use windows_sys::Win32::System::Memory::{
-        MEM_FREE, MEM_IMAGE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE,
-        PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD,
-        PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery,
-    };
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
     // SAFETY: a zeroed MEMORY_BASIC_INFORMATION is valid.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: reads the address space's bookkeeping, not `address` itself.
@@ -824,6 +820,23 @@ fn memory_at(address: usize) -> String {
         // non-canonical address as all ones.
         return "outside the address space".into();
     }
+    memory_named(&info, || module_of(address))
+}
+
+/// [`memory_at`] for what `VirtualQuery` said of an address; `module` names
+/// the module the address is in, and is asked only for an image's pages.
+/// Nothing here asks the system, so every answer can be had from a record
+/// written by hand: memory that was released cannot be asked for by its
+/// address without another thread taking the range first.
+fn memory_named(
+    info: &windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION,
+    module: impl FnOnce() -> Option<String>,
+) -> String {
+    use windows_sys::Win32::System::Memory::{
+        MEM_FREE, MEM_IMAGE, MEM_RESERVE, PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+        PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
+        PAGE_WRITECOPY,
+    };
     let protect = match info.State {
         MEM_FREE => return "nothing mapped there".into(),
         MEM_RESERVE => return "reserved, never committed".into(),
@@ -840,9 +853,12 @@ fn memory_at(address: usize) -> String {
             _ => format!("protection {:#x}", info.Protect),
         },
     };
-    match module_of(address) {
-        Some(module) if info.Type == MEM_IMAGE => format!("{protect}, in {module}"),
-        _ => protect,
+    if info.Type != MEM_IMAGE {
+        return protect;
+    }
+    match module() {
+        Some(module) => format!("{protect}, in {module}"),
+        None => protect,
     }
 }
 
@@ -905,6 +921,8 @@ mod tests {
         // first 64 KiB, at both of its ends. The range released above is
         // not asked for: the other tests of this program run on their own
         // threads, and an allocation of theirs may take it at any moment.
+        // What a released range is named as is tested from its record, in
+        // `released_memory_is_named_from_its_record`.
         assert_eq!(memory_at(0), "nothing mapped there");
         assert_eq!(memory_at(0xfff8), "nothing mapped there");
         assert_eq!(memory_at(usize::MAX), "outside the address space");
@@ -912,6 +930,82 @@ mod tests {
         let code = memory_at(memory_at_names_what_an_access_hit as *const () as usize);
         let named = code.starts_with("read-execute, in victory_loader-");
         assert!(named, "{code}");
+    }
+
+    /// A record as `VirtualQuery` fills it in.
+    fn queried(
+        state: u32,
+        protect: u32,
+        kind: u32,
+    ) -> windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION {
+        // SAFETY: a zeroed MEMORY_BASIC_INFORMATION is valid.
+        let mut info: windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION =
+            unsafe { std::mem::zeroed() };
+        info.BaseAddress = 0x7ff6_1234_0000_usize as *mut _;
+        info.RegionSize = 0x4000;
+        info.State = state;
+        info.Protect = protect;
+        info.Type = kind;
+        info
+    }
+
+    /// What `memory_at_names_what_an_access_hit` cannot ask the system for:
+    /// memory that was released. `VirtualQuery` answers for it with a
+    /// `MEM_FREE` record (no allocation base, `PAGE_NOACCESS`, no type),
+    /// which is written here by hand; so are the other states, to pin the
+    /// order they are told apart in.
+    #[test]
+    fn released_memory_is_named_from_its_record() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_FREE, MEM_IMAGE, MEM_MAPPED, MEM_PRIVATE, MEM_RESERVE, PAGE_EXECUTE,
+            PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD,
+            PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
+        };
+        let never = || -> Option<String> { panic!("no module is asked for") };
+        let module = || Some("title.exe+0x1234".to_owned());
+
+        let released = queried(MEM_FREE, PAGE_NOACCESS, 0);
+        assert!(released.AllocationBase.is_null());
+        assert_eq!(memory_named(&released, never), "nothing mapped there");
+        // The state decides, whatever the other fields were left as.
+        let stale = queried(MEM_FREE, PAGE_READWRITE | PAGE_GUARD, MEM_IMAGE);
+        assert_eq!(memory_named(&stale, never), "nothing mapped there");
+
+        let reserved = queried(MEM_RESERVE, 0, MEM_PRIVATE);
+        assert_eq!(memory_named(&reserved, never), "reserved, never committed");
+        let reserved = queried(MEM_RESERVE, PAGE_GUARD, MEM_IMAGE);
+        assert_eq!(memory_named(&reserved, never), "reserved, never committed");
+        let guard = queried(MEM_COMMIT, PAGE_READWRITE | PAGE_GUARD, MEM_IMAGE);
+        assert_eq!(memory_named(&guard, never), "a guard page");
+
+        for (protect, name) in [
+            (PAGE_NOACCESS, "no access"),
+            (PAGE_READONLY, "read-only"),
+            (PAGE_READWRITE, "read-write"),
+            (PAGE_WRITECOPY, "copy-on-write"),
+            (PAGE_EXECUTE, "execute-only"),
+            (PAGE_EXECUTE_READ, "read-execute"),
+            (PAGE_EXECUTE_READWRITE, "read-write-execute"),
+            (PAGE_EXECUTE_WRITECOPY, "copy-on-write, executable"),
+            (0, "protection 0x0"),
+        ] {
+            // Memory of the process's own and a mapped file have no module.
+            let private = queried(MEM_COMMIT, protect, MEM_PRIVATE);
+            assert_eq!(memory_named(&private, never), name);
+            let mapped = queried(MEM_COMMIT, protect, MEM_MAPPED);
+            assert_eq!(memory_named(&mapped, never), name);
+            let image = queried(MEM_COMMIT, protect, MEM_IMAGE);
+            assert_eq!(
+                memory_named(&image, module),
+                format!("{name}, in title.exe+0x1234")
+            );
+            // An image page whose module is gone by now.
+            assert_eq!(memory_named(&image, || None), name);
+        }
+        // Modifier bits above the low byte do not change the name.
+        const PAGE_NOCACHE: u32 = 0x200;
+        let nocache = queried(MEM_COMMIT, PAGE_READWRITE | PAGE_NOCACHE, MEM_PRIVATE);
+        assert_eq!(memory_named(&nocache, never), "read-write");
     }
 
     /// On an Intel CPU, the real instructions go through the vectored
