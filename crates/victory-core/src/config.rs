@@ -80,6 +80,12 @@ impl Config {
         Self::resolve(parsed.paths, source, env)
     }
 
+    /// The configuration of an environment with no config file.
+    #[cfg(test)]
+    pub(crate) fn defaults_of(env: impl Fn(&str) -> Option<OsString>) -> Result<Self> {
+        Self::resolve(FilePaths::default(), None, env)
+    }
+
     fn resolve(
         file: FilePaths,
         source: Option<PathBuf>,

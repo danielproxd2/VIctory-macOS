@@ -45,8 +45,9 @@ the check refuses. It holds nothing from a game.
 ## Where data lives
 
 Outside the repository, configured in `victory.toml`: `game_dir` (the
-user's dump), `test_titles`, and `cache_dir` for everything derived
-(default `%LOCALAPPDATA%\victory\cache`).
+user's dump), `test_titles`, `cache_dir` for everything derived
+(default `%LOCALAPPDATA%\victory\cache`) and `data_dir` for what titles
+save (default `%LOCALAPPDATA%\victory\data`).
 
 ## Enforcement
 
@@ -59,7 +60,11 @@ user's dump), `test_titles`, and `cache_dir` for everything derived
    `docs/images` are the only binary type. Exceptions need an entry in
    `xtask/src/policy.rs` with a reason and the file's length and hash.
 3. At runtime, everything that writes derived data calls
-   `victory_core::ensure_outside_repo`.
+   `victory_core::ensure_outside_repo`. Under Wine it also looks at the
+   path's place on the host, so a Wine prefix inside the repository (which
+   puts all of `C:`, `%LOCALAPPDATA%` included, inside it) and host symlinks
+   into the repository are refused. The macOS scripts keep their prefixes
+   in `~/Library/Caches/victory-macos` for this reason.
 4. Tests that need real files take their paths from environment variables
    and skip when unset. They assert on properties, never on snapshots.
 
