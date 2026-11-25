@@ -976,6 +976,74 @@ mod tests {
         assert_eq!(h_and, hash_of(&program("v_and_b32")));
     }
 
+    /// Over every kind of program the tests here translate: no container
+    /// has an all-zero digest, two containers have one digest only if they
+    /// are the same bytes, and translating a program again gives the same
+    /// digest. Runs on every host; where D3DMetal is the device this is
+    /// what keeps one shader from running as another (docs/macos.md).
+    #[test]
+    fn translated_containers_have_distinct_nonzero_shader_hashes() {
+        let logic = |name: &str| {
+            let sources = [asm::sgpr(0), asm::sgpr(1)];
+            compute(&[asm::vop3(name, 0, &sources, asm::Vop3Mods::default())])
+        };
+        let float = |name: &str| compute(&[asm::vop2(name, 0, asm::sgpr(0), 1)]);
+        let programs: Vec<(&str, Vec<u8>)> = vec![
+            ("vs_fullscreen_triangle", testkit::vs_fullscreen_triangle()),
+            ("vs_position_buffer", testkit::vs_position_buffer()),
+            ("ps_constant 1", testkit::ps_constant([1.0, 0.5, 0.25, 1.0])),
+            ("ps_constant 2", testkit::ps_constant([1.0, 0.5, 0.25, 0.0])),
+            ("ps_root_constants", testkit::ps_root_constants()),
+            ("cs_store_root_constant", testkit::cs_store_root_constant()),
+            ("cs_store_words 1", testkit::cs_store_words(&[1, 2, 3])),
+            ("cs_store_words 2", testkit::cs_store_words(&[1, 2, 4])),
+            ("v_and_b32", logic("v_and_b32")),
+            ("v_or_b32", logic("v_or_b32")),
+            ("v_xor_b32", logic("v_xor_b32")),
+            ("v_max_f32", float("v_max_f32")),
+            ("v_min_f32", float("v_min_f32")),
+            ("v_add_f32", float("v_add_f32")),
+            ("v_mul_f32", float("v_mul_f32")),
+        ];
+        let hash_of = |name: &str, dxil: &[u8]| -> [u8; 20] {
+            let host = Container::parse(dxil).unwrap();
+            let part = host.part(FourCC::HASH);
+            let hash = part.unwrap_or_else(|| panic!("{name}: no HASH part")).data;
+            hash.try_into()
+                .unwrap_or_else(|_| panic!("{name}: a HASH part of {} bytes", hash.len()))
+        };
+        let mut seen: Vec<(&str, Vec<u8>, [u8; 20])> = Vec::new();
+        let mut wrong = Vec::new();
+        for (name, program) in &programs {
+            let out = translated(program);
+            let hash = hash_of(name, &out.dxil);
+            if hash[4..] == [0; 16] {
+                wrong.push(format!("{name}: an all-zero digest"));
+            }
+            let again = translated(program);
+            if again.dxil != out.dxil || hash_of(name, &again.dxil) != hash {
+                wrong.push(format!("{name}: translated twice, two results"));
+            }
+            for (other, dxil, other_hash) in &seen {
+                if *dxil == out.dxil {
+                    wrong.push(format!("{name} and {other}: one container; pick others"));
+                } else if *other_hash == hash {
+                    wrong.push(format!("{name} and {other}: one digest {hash:02x?}"));
+                }
+            }
+            seen.push((name, out.dxil, hash));
+        }
+        assert_eq!(wrong, Vec::<String>::new());
+        // The case that went wrong under D3DMetal is among them: different
+        // containers of one length.
+        let length = |name: &str| {
+            let found = seen.iter().find(|(n, ..)| *n == name);
+            found.map(|(_, dxil, _)| dxil.len()).expect(name)
+        };
+        assert_eq!(length("v_max_f32"), length("v_min_f32"), "pick others");
+        assert_eq!(length("v_and_b32"), length("v_or_b32"), "pick others");
+    }
+
     /// The whole path a title's shader takes, on containers assembled here:
     /// container, `DXIL` part, XDAT index, packed blob, stage record, code,
     /// signatures, and out comes a host shader that binds what the program
