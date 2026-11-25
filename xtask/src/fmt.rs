@@ -5,9 +5,10 @@
 //! touched line into a conflict at the next merge.
 //!
 //! A file is upstream's when the newest upstream commits merged here have
-//! it. Those commits are found two ways, and both count: the merge base of
-//! `HEAD` and the remote-tracking ref `upstream/main`, and the second
-//! parents of the merge commits on `HEAD`'s first-parent history. The second way does not need
+//! it, at its path or at the path the fork moved it from. Those commits
+//! are found two ways, and both count: the merge base of `HEAD` and the
+//! remote-tracking ref `upstream/main`, and the second parents of the merge
+//! commits on `HEAD`'s first-parent history. The second way does not need
 //! the ref to be there or to be current: a ref older than the last merge
 //! has an older merge base, and the files upstream added since must not
 //! look like the fork's. Every other Rust file is the fork's own.
@@ -128,6 +129,32 @@ fn merged_upstream(root: &Path) -> Result<std::result::Result<Vec<String>, Strin
     Ok(Ok(lines(&newest)))
 }
 
+/// The Rust files here that are upstream's under another name: `commit`
+/// has a file that is gone here, and a file here that `commit` lacks is at
+/// least half the same (git's rename detection, without its limit on the
+/// number of candidates). Files that are new and not added yet are not
+/// seen by git and so are not found.
+fn renamed_from(root: &Path, commit: &str) -> Result<Vec<String>> {
+    let out = git(
+        root,
+        &[
+            "diff",
+            "--find-renames=50%",
+            "-l0",
+            "--diff-filter=R",
+            "--name-status",
+            "-z",
+            commit,
+            "--",
+            "*.rs",
+        ],
+    )?
+    .with_context(|| format!("git cannot compare the files here with {commit}"))?;
+    // Each rename is three fields: R and the likeness, the old name, the new.
+    let fields: Vec<String> = names(&out).collect();
+    Ok(fields.chunks_exact(3).map(|r| r[2].clone()).collect())
+}
+
 /// The Rust files under `root` that are not upstream's (see the module's
 /// text): tracked ones and new ones that are not ignored.
 pub fn fork_owned(root: &Path) -> Result<Owned> {
@@ -140,6 +167,7 @@ pub fn fork_owned(root: &Path) -> Result<Owned> {
         let tree = git(root, &["ls-tree", "-r", "-z", "--name-only", commit])?
             .with_context(|| format!("git cannot list the files of {commit}"))?;
         upstream.extend(names(&tree));
+        upstream.extend(renamed_from(root, commit)?);
     }
     let here = git(
         root,
@@ -479,6 +507,49 @@ mod tests {
             .into();
         assert_eq!(with.unwrap(), Owned::Files(own.clone()));
         assert_eq!(without.unwrap(), Owned::Files(own));
+    }
+
+    /// Enough lines that a file moved and then changed a little is still
+    /// more than half the same; laid out as rustfmt would not.
+    #[cfg(unix)]
+    fn long_ugly() -> String {
+        (0..20)
+            .map(|i| format!("fn  f{i}( ){{let x={i};\n    let _ = x ;}}\n"))
+            .collect()
+    }
+
+    /// An upstream file the fork moves (and changes a little) is still
+    /// upstream's under its new name, committed or only added: it is not
+    /// checked and `fmt` does not reformat it. A new file with other text
+    /// beside it is the fork's. Before, the moved file counted as the
+    /// fork's own by its path and was reformatted whole.
+    #[test]
+    #[cfg(unix)]
+    fn a_renamed_upstream_file_stays_upstreams() {
+        let dir = scratch("renamed");
+        git(&dir, &["init", "-q"]);
+        std::fs::write(dir.join("list.rs"), long_ugly()).unwrap();
+        std::fs::write(dir.join("other.rs"), long_ugly().replace("f", "g")).unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-q", "-m", "upstream"]);
+        git(&dir, &["update-ref", "refs/remotes/upstream/main", "HEAD"]);
+        std::fs::create_dir_all(dir.join("moved")).unwrap();
+        git(&dir, &["mv", "list.rs", "moved/list2.rs"]);
+        let moved = format!("{}fn  more( ){{}}\n", long_ugly());
+        std::fs::write(dir.join("moved/list2.rs"), &moved).unwrap();
+        std::fs::write(dir.join("fork.rs"), "fn main() {}\n").unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-q", "-m", "the fork moves a file"]);
+        let committed = fork_owned(&dir);
+        git(&dir, &["mv", "other.rs", "moved/other2.rs"]);
+        let added = fork_owned(&dir);
+        let written = run(&dir, true);
+        let after = std::fs::read_to_string(dir.join("moved/list2.rs")).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(committed.unwrap(), Owned::Files(vec!["fork.rs".into()]));
+        assert_eq!(added.unwrap(), Owned::Files(vec!["fork.rs".into()]));
+        written.unwrap();
+        assert_eq!(after, moved, "the moved upstream file was reformatted");
     }
 
     /// Without an upstream to compare with (a plain clone) nothing is
