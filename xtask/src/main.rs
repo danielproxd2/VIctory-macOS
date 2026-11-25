@@ -35,16 +35,21 @@ enum Cmd {
     /// depth.dxbc in a folder (depth.hlsl compiled as the clamp-bytecode
     /// workflow compiles clamp.hlsl).
     EmbedDepth { folder: PathBuf },
-    /// Format the fork's own Rust files with rustfmt: those that are not in
-    /// the last merged upstream commit (the merge base of HEAD and
-    /// upstream/main). Files that exist upstream are left as they are, also
-    /// where the fork changed them: upstream's layout is kept so that
-    /// merges do not conflict on formatting.
+    /// Format the fork's own Rust files with rustfmt. A file is the fork's
+    /// own when the upstream commit last merged does not have it, neither
+    /// at its path nor under the name the fork moved it from (git's rename
+    /// detection, half the same or more). That commit is the merge base of
+    /// HEAD and upstream/main or the second parent of a merge commit in
+    /// HEAD's first-parent history, whichever is newer, so upstream/main
+    /// may be out of date or missing. Files that exist upstream are left
+    /// as they are, also where the fork changed them: upstream's layout is
+    /// kept so that merges do not conflict on formatting.
     Fmt,
-    /// Check that the fork's own Rust files are formatted, without writing.
-    /// Files that exist upstream are not checked, also where the fork
-    /// changed them. Without an `upstream` remote (a plain clone) nothing
-    /// is checked and the command succeeds with a message.
+    /// Check that the fork's own Rust files (see `fmt`) are formatted,
+    /// without writing. Files that exist upstream are not checked, also
+    /// where the fork changed or renamed them. Without an `upstream`
+    /// remote and without a merge of upstream in the history nothing is
+    /// checked and the command succeeds with a message.
     FmtCheck,
 }
 
