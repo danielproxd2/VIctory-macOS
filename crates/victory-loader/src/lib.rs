@@ -27,6 +27,8 @@ mod crash;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod names;
 pub mod prepare;
+// Used on Windows only; built everywhere, so that its tests run on every host.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) mod publish;
 pub mod resolve;
 #[cfg(all(windows, feature = "diagnostics"))]
