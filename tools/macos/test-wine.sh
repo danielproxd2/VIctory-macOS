@@ -45,9 +45,20 @@
 #   VICTORY_REQUIRE_IDLE=1    a machine idle enough to start a thread
 #                             within 8 ms; "skipped: the host ran the
 #                             thread that fills the page list only after".
-# A run that is meant to prove something on a Mac sets the first three:
+#   VICTORY_REQUIRE_DEPTH=1   the prebuilt depth conversion (16-bit depth
+#                             written through unordered views); "skipped:
+#                             no prebuilt depth conversion".
+#   VICTORY_REQUIRE_FIDELITYFX=1  the PC FidelityFX DLLs named by
+#                             VICTORY_FIDELITYFX_DIR, for the upscaler test.
+#   VICTORY_REQUIRE_POLICY=1  the repository's asset policy test, which
+#                             needs a git that Wine cannot start;
+#                             "skipped: Wine starts no git".
+#   VICTORY_REQUIRE_RECONNECT=1  a host that connects a socket again after
+#                             a refused attempt, which this Wine does not.
+# A run that is meant to prove something on a Mac sets these four:
 #   VICTORY_DXIL_UNIX="$HOME/Library/Caches/victory-macos/dxc/v1.9.2609/dxil.dll" \
 #   VICTORY_REQUIRE_DXIL=1 VICTORY_REQUIRE_GPU=1 VICTORY_REQUIRE_CLAMP=1 \
+#   VICTORY_REQUIRE_DEPTH=1 \
 #   tools/macos/test-wine.sh --workspace --no-fail-fast
 # and again with --release. Without them a machine with no device, no
 # validator or a stale clamp passes those tests without running them. The
@@ -133,6 +144,10 @@ export ROSETTA_ADVERTISE_AVX="${ROSETTA_ADVERTISE_AVX:-1}"
 [ -z "${VICTORY_REQUIRE_PC_GPU:-}" ] || export VICTORY_REQUIRE_PC_GPU
 [ -z "${VICTORY_REQUIRE_NTFS:-}" ] || export VICTORY_REQUIRE_NTFS
 [ -z "${VICTORY_REQUIRE_IDLE:-}" ] || export VICTORY_REQUIRE_IDLE
+[ -z "${VICTORY_REQUIRE_DEPTH:-}" ] || export VICTORY_REQUIRE_DEPTH
+[ -z "${VICTORY_REQUIRE_FIDELITYFX:-}" ] || export VICTORY_REQUIRE_FIDELITYFX
+[ -z "${VICTORY_REQUIRE_POLICY:-}" ] || export VICTORY_REQUIRE_POLICY
+[ -z "${VICTORY_REQUIRE_RECONNECT:-}" ] || export VICTORY_REQUIRE_RECONNECT
 if [ -n "${VICTORY_DXIL_UNIX:-}" ]; then
     [ -f "$VICTORY_DXIL_UNIX" ] || { echo "VICTORY_DXIL_UNIX: no file at $VICTORY_DXIL_UNIX" >&2; exit 1; }
     case "$VICTORY_DXIL_UNIX" in

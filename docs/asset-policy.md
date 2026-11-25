@@ -41,6 +41,8 @@ fails the check.
 different reason. It is our own shader, `clamp.hlsl`, compiled by
 Microsoft's compilers and written as an array of bytes, which is the shape
 the check refuses. It holds nothing from a game.
+`crates/victory-gpu/src/depth_bytecode.rs` is the same for `depth.hlsl`,
+the depth conversion, written by `cargo xtask embed-depth`.
 
 ## Where data lives
 
