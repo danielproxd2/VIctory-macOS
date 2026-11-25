@@ -51,15 +51,30 @@ After these fixes the whole suite passes under CrossOver Wine with D3DMetal on a
 
 ## What a test run did not check
 
-A shader test that lacks something it needs passes after printing one line that starts with `skipped:` and names the test. The line is written past the test harness's capture, so `tools/macos/test-wine.sh ... 2>&1 | grep 'skipped: '` lists everything a run left out. A switch per need turns the skip into a failure.
+A test that lacks something it needs passes after printing one line that starts with `skipped:` and names the test. The line is written past the test harness's capture, so `tools/macos/test-wine.sh ... 2>&1 | grep 'skipped: '` lists everything a run left out. A switch per need turns the skip into a failure. These are all the switches the tree reads; `tools/macos/test-wine.sh` lists each one at its top and hands each on to the tests, and `test_wine_lists_and_hands_on_every_require_switch` (`xtask/tests/shell_scripts.rs`) fails when a switch in the sources is missing from the script or from this list.
 
-- `VICTORY_REQUIRE_GPU=1`: the host's D3D12 device with shader model 6.6.
-- `VICTORY_REQUIRE_WARP=1`: the WARP software device beside it. D3DMetal under Wine has no WARP, so on a Mac the device tests run on the hardware adapter only, and each prints `skipped: no SM 6.6 WARP device`.
-- `VICTORY_REQUIRE_DXIL=1`: the DXIL validator, described below.
-- `VICTORY_REQUIRE_DIFF=1`: the console compiler (`VICTORY_CONSOLE_DXC`) and a PC `dxc.exe` (`VICTORY_PC_DXC`) for the differential shader tests.
+Three are set by a run that is meant to prove something on a Mac:
+
+- `VICTORY_REQUIRE_GPU=1`: the host's D3D12 device with shader model 6.6. Without it every device test of `victory-gpu`, `victory-shader`, `victory-hle` and `apps/victory` passes after `skipped: no host D3D12 device`.
+- `VICTORY_REQUIRE_DXIL=1`: the DXIL validator, described below. Without it each validating shader test prints `skipped: DXIL validation: ...`.
+- `VICTORY_REQUIRE_CLAMP=1`: an argument clamp for indirect draws and dispatches. Wine's HLSL compiler cannot build `clamp.hlsl`, so on a Mac the clamp exists only as the bytecode embedded by `cargo xtask embed-clamp`, which is used while its source hash matches `clamp.hlsl`. Where the bytecode is older than the source and the host cannot compile it, `argument_clamp_builds` prints `skipped: the prebuilt clamp bytecode is older than clamp.hlsl; ...`, and a title's indirect draws would all be dropped ("no argument clamp: indirect execution dropped"). With the switch that is a failure.
+
+The other six name something a Mac does not have or cannot promise, and are not part of the proving run:
+
+- `VICTORY_REQUIRE_HLSL=1`: a host HLSL compiler that builds the shaders some device tests of `victory-gpu` write themselves. Wine's compiler is vkd3d-shader's, which does not, so seven tests print `skipped: the host HLSL compiler cannot build this test shader`: `draw::a_depth_texture_written_through_unordered_views_reads_as_depth`, `draw::a_texture_written_in_one_format_reads_in_another_through_a_placed_view`, `draw::root_views_reach_their_copy_and_read_zeros_past_it`, `draw::unordered_1d_and_3d_textures_keep_their_writes`, `bindless::heap_views_are_current`, `bindless::heap_views_follow_writes_through_another_mapping` and `memory::lists_share_a_table_and_copies_keep_their_views`. What they cover (depth twins, unordered 1D and 3D textures, root views, bindless heap views and the shared page table) therefore has no device test under D3DMetal. With the switch they fail on a Mac.
+- `VICTORY_REQUIRE_WARP=1`: the WARP software device beside the hardware one. D3DMetal under Wine has no WARP, so on a Mac the device tests run on the hardware adapter only, and each prints `skipped: no SM 6.6 WARP device`.
+- `VICTORY_REQUIRE_DIFF=1`: the console compiler (`VICTORY_CONSOLE_DXC`) and a PC `dxc.exe` (`VICTORY_PC_DXC`) for the differential shader tests, which print `skipped: no console compiler (VICTORY_CONSOLE_DXC) or no PC compiler (VICTORY_PC_DXC)`.
 - `VICTORY_REQUIRE_NTFS=1`: a temporary folder on NTFS, whose limit of 1024 hard links to a file one save-game test runs into on purpose. The Wine prefix lies on APFS, which has no such limit, so on a Mac `a_kept_blob_past_the_link_limit_is_copied` prints `skipped: no NTFS link limit: ...`; the copy it is about is checked on every file system by `a_kept_blob_that_cannot_be_linked_is_copied`.
 - `VICTORY_REQUIRE_IDLE=1`: a machine with nothing else to do. One DirectStorage test (`a_page_list_filled_after_its_request_starts`) needs a thread of its own to run within 8 ms; where the host starts it later and the request therefore fails as designed, it prints `skipped: the host ran the thread that fills the page list only after ... ms`.
 - `VICTORY_REQUIRE_PC_GPU=1`: a device that gives the results of the PC hardware the device tests were measured on. Where D3DMetal is known to give another result (see "Open differences under D3DMetal"), the test that shows it checks that the device is D3DMetal and that the result is the measured one, prints `skipped: D3DMetal ...` and passes. With this switch it fails instead. On a Mac the switch therefore fails four shader tests today; it is for finding out whether a new D3DMetal has closed a difference, not for the proving run.
+
+The proving run on a Mac is this command, once as it stands and once with `--release` after `--workspace`:
+
+```sh
+VICTORY_DXIL_UNIX="$HOME/Library/Caches/victory-macos/dxc/v1.9.2609/dxil.dll" VICTORY_REQUIRE_DXIL=1 VICTORY_REQUIRE_GPU=1 VICTORY_REQUIRE_CLAMP=1 tools/macos/test-wine.sh --workspace --no-fail-fast
+```
+
+A total reported as "GPU, DXIL validation and the clamp required" is a total of this command. It does not require HLSL, WARP, the differential compilers, NTFS, an idle machine or the PC hardware's results: the `skipped:` lines of its output say which tests those are.
 
 Every device test of `victory-shader` gets its device and its validation through `crate::testing`, upstream's tests included, so these switches cover all of them. D3DMetal is recognised by the process running under Wine and the adapter naming itself "AMD Compatibility Mode", the name D3DMetal presents; a result that differs on any other device fails.
 

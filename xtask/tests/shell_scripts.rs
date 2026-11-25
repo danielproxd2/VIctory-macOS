@@ -329,6 +329,140 @@ fn test_wine_has_rosetta_advertise_avx_and_leaves_the_cpu_check_on() {
     }
 }
 
+/// Every `VICTORY_REQUIRE_*` switch the Rust sources of the workspace and
+/// of the fixtures read, sorted. The tests of a crate read a switch by its
+/// name in a string, so every name in a source file counts.
+fn require_switches() -> Vec<String> {
+    fn collect(dir: &Path, found: &mut Vec<String>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|n| n != "target") {
+                    collect(&path, found);
+                }
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let source = fs::read_to_string(&path).unwrap();
+                for (at, _) in source.match_indices("VICTORY_REQUIRE_") {
+                    let name: String = source[at..]
+                        .chars()
+                        .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_')
+                        .collect();
+                    found.push(name);
+                }
+            }
+        }
+    }
+    let mut found = Vec::new();
+    for part in ["crates", "apps", "tests"] {
+        collect(&root().join(part), &mut found);
+    }
+    found.sort();
+    found.dedup();
+    // A name cut off at a line's end, or the bare prefix, is no switch.
+    found.retain(|name| name != "VICTORY_REQUIRE_");
+    found
+}
+
+/// A switch that turns a skipped test into a failed one is of use only if
+/// whoever runs the tests can find it and it reaches the tests: every one
+/// the sources read is in test-wine.sh's list, is handed on by it, and is
+/// described in docs/macos.md, with the proving command that sets the ones
+/// a Mac can meet.
+#[test]
+fn test_wine_lists_and_hands_on_every_require_switch() {
+    let switches = require_switches();
+    for known in [
+        "VICTORY_REQUIRE_GPU",
+        "VICTORY_REQUIRE_DXIL",
+        "VICTORY_REQUIRE_CLAMP",
+        "VICTORY_REQUIRE_HLSL",
+        "VICTORY_REQUIRE_NTFS",
+        "VICTORY_REQUIRE_IDLE",
+        "VICTORY_REQUIRE_PC_GPU",
+    ] {
+        assert!(
+            switches.iter().any(|s| s == known),
+            "{known} is not found in the sources any more: {switches:?}"
+        );
+    }
+    let runner = fs::read_to_string(root().join("tools/macos/test-wine.sh")).unwrap();
+    let doc = fs::read_to_string(root().join("docs/macos.md")).unwrap();
+    let section = doc
+        .split_once("## What a test run did not check")
+        .expect("docs/macos.md has the section")
+        .1;
+    let section = section.split_once("\n## ").map_or(section, |(s, _)| s);
+    for switch in &switches {
+        assert!(
+            runner.contains(&format!("#   {switch}=1 ")),
+            "test-wine.sh does not list {switch}"
+        );
+        assert!(
+            runner.contains(&format!("[ -z \"${{{switch}:-}}\" ] || export {switch}\n")),
+            "test-wine.sh does not hand on {switch}"
+        );
+        assert!(
+            section.contains(&format!("- `{switch}=1`: ")),
+            "docs/macos.md does not describe {switch}"
+        );
+    }
+    // The command a proving run on a Mac uses, in both places.
+    for text in [runner.as_str(), section] {
+        for part in [
+            "VICTORY_REQUIRE_DXIL=1 VICTORY_REQUIRE_GPU=1 VICTORY_REQUIRE_CLAMP=1",
+            "tools/macos/test-wine.sh --workspace --no-fail-fast",
+        ] {
+            assert!(text.contains(part), "{part} is missing");
+        }
+    }
+
+    // And they arrive: with every switch set, the stand-in cargo that runs
+    // the tests has each of them in its environment; with none set, none.
+    let libdir = scratch("test-wine-switches-libdir");
+    let dir = scratch("test-wine-switches");
+    let log = dir.join("cargo.log");
+    script(&dir.join("bin/wine"), "exit 0");
+    script(
+        &dir.join("bin/rustc"),
+        &format!("echo '{}'", libdir.display()),
+    );
+    script(
+        &dir.join("bin/cargo"),
+        r#"env | sed -n 's/^\(VICTORY_REQUIRE_[A-Z0-9_]*\)=1$/has \1/p' >> "$STAND_IN_LOG""#,
+    );
+    for set in [true, false] {
+        let _ = fs::remove_file(&log);
+        let mut command = Command::new(root().join("tools/macos/test-wine.sh"));
+        command
+            .args(["-p", "victory-pe"])
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", dir.join("bin").display()),
+            )
+            .env("WINE", dir.join("bin/wine"))
+            .env("STAND_IN_LOG", &log)
+            .env_remove("WINEDLLOVERRIDES");
+        for switch in &switches {
+            if set {
+                command.env(switch, "1");
+            } else {
+                command.env_remove(switch);
+            }
+        }
+        let out = command.output().unwrap();
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        let mut has = if log.exists() {
+            logged(&log, "has ")
+        } else {
+            Vec::new()
+        };
+        has.sort();
+        has.dedup();
+        let expected = if set { switches.clone() } else { Vec::new() };
+        assert_eq!(has, expected, "set: {set}");
+    }
+}
+
 /// What victory.sh starts Wine with, from stand-ins for cargo and wine in a
 /// home folder of the test's own.
 struct Launched {
