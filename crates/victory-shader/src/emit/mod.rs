@@ -345,6 +345,13 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
         let mask = *part
             .get(at + 24)
             .ok_or(ShaderError::Malformed("truncated"))?;
+        // A register has four channels (`D3D_COMPONENT_MASK_X` to `_W`);
+        // the element's column count comes from this byte.
+        if mask > 0xF {
+            return Err(ShaderError::Malformed(
+                "signature mask past the four channels of a register",
+            ));
+        }
         if u32_at(part, at + 28)? != 0 {
             return Err(ShaderError::Unsupported {
                 offset: 0,
@@ -506,6 +513,38 @@ mod tests {
         // Loose on purpose (a slow, loaded machine): the table the old code
         // built for 0x1000_0000 took minutes and gigabytes.
         assert!(started.elapsed() < std::time::Duration::from_secs(20));
+    }
+
+    /// A signature row's mask is a byte of the title's container, and the
+    /// element's columns are counted from it. A register has four
+    /// channels: with more bits set the element had up to eight columns,
+    /// and the masks built from that count shifted past their width (a
+    /// panic with overflow checks, a wrong mask without; found by
+    /// random-input testing).
+    #[test]
+    fn a_signature_mask_past_four_channels_is_malformed() {
+        use crate::testkit::{self, Element};
+        let words = [0xBF81_0000u32]; // s_endpgm
+        let translate = |mask: u8| {
+            let isg1 = [Element::float("TEXCOORD", 0, 0, mask)];
+            let osg1 = [Element::float("SV_Target", 64, 0, mask)];
+            let input = testkit::console_container(HwStage::Ps, &words, &isg1, &[]);
+            let output = testkit::console_container(HwStage::Ps, &words, &[], &osg1);
+            [input, output].map(|c| super::translate(&c).map(|s| s.stage))
+        };
+        let malformed = Err(ShaderError::Malformed(
+            "signature mask past the four channels of a register",
+        ));
+        for mask in [0x10, 0x1F, 0x80, 0xFF] {
+            for result in translate(mask) {
+                assert_eq!(result, malformed, "{mask:#x}");
+            }
+        }
+        for mask in [0x0, 0x1, 0x8, 0xF] {
+            for result in translate(mask) {
+                assert_eq!(result, Ok(HwStage::Ps), "{mask:#x}");
+            }
+        }
     }
 
     use super::container::SigElement;
