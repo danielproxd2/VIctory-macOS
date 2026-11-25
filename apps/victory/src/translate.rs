@@ -150,6 +150,9 @@ impl Tally {
     }
 }
 
+/// Why a program of a stage without a host counterpart here stops.
+const OTHER_STAGE: &str = "emit: not a vertex, pixel, compute or mesh program";
+
 /// Emitted shaders by label, shared between threads.
 type Kept = std::sync::Arc<Mutex<Vec<(String, emit::HostShader)>>>;
 
@@ -445,6 +448,13 @@ fn translate(
                             }),
                         Err(e) => t.fail(e.to_string(), || format!("{} {:?}", example(), p.stage)),
                     }
+                } else {
+                    // Hull, domain and geometry programs: the runtime's
+                    // translator takes none of them (`emit::translate`),
+                    // and nothing below would say that they stop here.
+                    t.fail(OTHER_STAGE.into(), || {
+                        format!("{} {:?}", example(), p.stage)
+                    });
                 }
                 let structured = match structured {
                     Ok(s) => {
@@ -807,6 +817,37 @@ mod tests {
             "DXIL         2 emitted of 2 vertex and pixel programs; 0 validated, 0 pipelines"
         );
         assert!(!text.contains("validator "), "{text}");
+        // The hull program is counted as stopped, with where it is.
+        let stopped = line(&text, "        1  emit: ");
+        assert!(stopped.contains(OTHER_STAGE), "{text}");
+        let hull = dir.path().join("d-hs.bin");
+        assert!(
+            stopped.ends_with(&format!("(e.g. {}@0x0 Hs)", hull.display())),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn list_names_each_program_that_stopped() {
+        let dir = shaders();
+        let listing = Options {
+            list: true,
+            ..options()
+        };
+        let text = report_of(|out| run(vec![dir.path().into()], &listing, out));
+        let hull = dir.path().join("d-hs.bin");
+        assert_eq!(
+            line(&text, &hull.display().to_string()),
+            format!("{}@0x0 Hs  {OTHER_STAGE}", hull.display())
+        );
+        // Without --list the per-program lines are left out.
+        let text = report_of(|out| run(vec![dir.path().into()], &options(), out));
+        assert!(
+            !text
+                .lines()
+                .any(|l| l.starts_with(&hull.display().to_string())),
+            "{text}"
+        );
     }
 
     #[test]
