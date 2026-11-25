@@ -1255,15 +1255,22 @@ fn program_holds(part: &[u8], kind: u32) -> Result<(), String> {
 ///   [`program_holds`]);
 /// * what the host is told to bind is what the container declares: a
 ///   static sampler per immediate sampler, at most the 64 the comparison
-///   mask has bits for, each bound as its own register; every root CBV
-///   and SRV once and bound at its slot's register; the user-data buffer
-///   bound exactly when user data is read;
+///   mask has bits for, each bound as its own register; every root CBV,
+///   SRV and UAV once and bound at its slot's register; the user-data
+///   buffer bound exactly when user data is read; the title-memory
+///   buffers ([`MEMORY_SPACE`](crate::emit::MEMORY_SPACE)) bound exactly
+///   when the shader says so: the page table `t0` and the page bitmap
+///   `u0` (always together), the view addresses `t1`, the view-mark
+///   table and its bitmap;
+/// * a shader that writes through the heap's views reads the heap;
 /// * each user-data dword is listed once, at the index of an SGPR (so
 ///   the buffer's size cannot wrap) which the buffer's size covers, and
 ///   (with the program at hand) comes from a root parameter of the
 ///   program's layout, at that parameter's own dword.
 fn invariants(shader: &HostShader, native: Option<&NativeProgram>) -> Result<(), String> {
-    use crate::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+    use crate::emit::{
+        MEMORY_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE, VIEW_MARKS, VIEW_WRITES,
+    };
     let (kind, mesh) = match shader.stage {
         HwStage::Ps => (0, false),
         HwStage::Vs => (1, false),
@@ -1310,12 +1317,31 @@ fn invariants(shader: &HostShader, native: Option<&NativeProgram>) -> Result<(),
             shader.static_samplers.len()
         ));
     }
-    for (what, slots) in [("CBV", &shader.root_cbvs), ("SRV", &shader.root_srvs)] {
+    for (what, slots) in [
+        ("CBV", &shader.root_cbvs),
+        ("SRV", &shader.root_srvs),
+        ("UAV", &shader.root_uavs),
+    ] {
         let once: std::collections::HashSet<u8> = slots.iter().copied().collect();
         if once.len() != slots.len() {
             return Err(format!("root {what}s {slots:?} name a slot twice"));
         }
     }
+    // The page bitmap is bound whenever the page table is, and a shader
+    // that writes through the heap's views reads the heap.
+    if shader.memory != shader.memory_writes {
+        return Err(format!(
+            "title memory: page table {}, page bitmap {}",
+            shader.memory, shader.memory_writes
+        ));
+    }
+    if shader.heap_writes && !shader.heap {
+        return Err("writes through a heap it does not read".into());
+    }
+    // PSV0 lists the bindings as the emitter does: constant buffers (2),
+    // samplers (1), shader resource views (4), unordered access views
+    // (7); within the views the title's root descriptors, then the
+    // title-memory buffers of `emit/host.rs`.
     let mut bound: Vec<(u32, u32, u32)> = Vec::new();
     if !shader.user_data.is_empty() {
         bound.push((2, USER_DATA_SPACE, 0));
@@ -1324,9 +1350,16 @@ fn invariants(shader: &HostShader, native: Option<&NativeProgram>) -> Result<(),
         let registers = slots.iter().map(|&s| (kind, ROOT_CBV_SPACE, u32::from(s)));
         registers.collect::<Vec<_>>()
     };
+    let memory = |kind, bound: bool, register| bound.then_some((kind, MEMORY_SPACE, register));
     bound.extend(slots(2, &shader.root_cbvs));
-    bound.extend(slots(4, &shader.root_srvs));
     bound.extend((0..samplers as u32).map(|n| (1, SAMPLER_SPACE, n)));
+    bound.extend(slots(4, &shader.root_srvs));
+    bound.extend(memory(4, shader.memory, 0));
+    bound.extend(memory(4, shader.view_addresses, 1));
+    bound.extend(memory(4, shader.view_marks, VIEW_MARKS));
+    bound.extend(slots(7, &shader.root_uavs));
+    bound.extend(memory(7, shader.memory_writes, 0));
+    bound.extend(memory(7, shader.view_marks, VIEW_WRITES));
     if bindings != bound {
         return Err(format!(
             "PSV0 binds {bindings:?} (type, space, register), the host is told {bound:?}"
@@ -1801,6 +1834,22 @@ fn the_invariants_refuse_numbers_that_do_not_match() {
     refused("PSV0 binds", &|s| s.user_data.clear());
     refused("PSV0 binds", &|s| s.root_cbvs.push(3));
     refused("name a slot twice", &|s| s.root_srvs.extend([2, 2]));
+    refused("name a slot twice", &|s| s.root_uavs.extend([2, 2]));
+    refused("PSV0 binds", &|s| s.root_uavs.push(3));
+    // The title-memory buffers: each one the host would bind and the
+    // container does not declare, and the page table without its bitmap.
+    refused("PSV0 binds", &|s| s.view_addresses = true);
+    refused("PSV0 binds", &|s| s.view_marks = true);
+    refused("PSV0 binds", &|s| {
+        s.memory = true;
+        s.memory_writes = true;
+    });
+    refused("title memory: page table true, page bitmap false", &|s| {
+        s.memory = true
+    });
+    refused("writes through a heap it does not read", &|s| {
+        s.heap_writes = true
+    });
     refused("immediate samplers", &|s| s.samplers.push([0; 4]));
     refused("a translation of stage", &|s| s.stage = HwStage::Hs);
 
