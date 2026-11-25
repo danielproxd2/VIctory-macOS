@@ -33,6 +33,12 @@ pub(crate) struct Pending {
     /// whether a draw has used it yet.
     key: String,
     used: AtomicBool,
+    /// Makes [`Pending::make`] panic where the host pipeline would be made.
+    #[cfg(test)]
+    panics: AtomicBool,
+    /// The name of the thread that made it.
+    #[cfg(test)]
+    made_by: OnceLock<String>,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -62,12 +68,46 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            #[cfg(test)]
+            panics: AtomicBool::new(false),
+            #[cfg(test)]
+            made_by: OnceLock::new(),
         }
     }
 
+    /// Makes the host pipeline, once, and wakes who waits for it. A panic
+    /// on the way (shader translation and pipeline creation chew on title
+    /// data) is a refused pipeline, logged once: unwinding out of here
+    /// would end the worker with the pipeline never made and still counted
+    /// as waiting, and every later first use would wait out its budget.
+    ///
+    /// This relies on panics unwinding (no profile of the workspace sets
+    /// `panic = "abort"`; with it nothing here is contained).
     fn make(&self) {
-        self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        if self.made.get().is_none() {
+            let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                #[cfg(test)]
+                if self.panics.load(Ordering::Relaxed) {
+                    panic!("test: making a host pipeline panics");
+                }
+                HostPipeline::new(&self.shaders, self.graphics.as_deref())
+            }))
+            .unwrap_or_else(|_| {
+                tracing::warn!(
+                    key = %self.key,
+                    shaders = ?self.shaders,
+                    "making a host pipeline panicked; it has none and its draws are dropped"
+                );
+                None
+            });
+            // `OnceLock::get_or_init` would leave the cell empty after a
+            // panic; this fills it either way.
+            let _ = self.made.set(made);
+            #[cfg(test)]
+            let _ = self
+                .made_by
+                .set(std::thread::current().name().unwrap_or("").to_owned());
+        }
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -169,6 +209,42 @@ fn wait(p: &Pending, frame: u64) {
     WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
+/// One queued pipeline, counted in [`WAITING`] until it is dropped: also
+/// when what makes it unwinds.
+struct Counted;
+
+impl Counted {
+    /// The pipeline is made; whether it was the last one waiting.
+    fn made(self) -> bool {
+        std::mem::forget(self);
+        WAITING.fetch_sub(1, Ordering::Relaxed) == 1
+    }
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        WAITING.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// A worker's turn for one pipeline. Nothing in it ends the worker: a
+/// panic (which [`Pending::make`] already contains for the pipeline
+/// itself) is logged and the worker takes the next pipeline.
+fn work(p: &Pending) {
+    let turn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let counted = Counted;
+        p.make();
+        if counted.made() {
+            drained();
+        } else {
+            super::library::save(false);
+        }
+    }));
+    if turn.is_err() {
+        tracing::warn!(key = %p.key, "a pipeline worker's turn panicked; the worker goes on");
+    }
+}
+
 /// Hands `p` to the workers (half the logical processors, 2 to 8), started
 /// on first use.
 fn queue(p: Arc<Pending>) {
@@ -191,12 +267,7 @@ fn queue(p: Arc<Pending>) {
                     loop {
                         let next = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
                         let Ok(p) = next else { return };
-                        p.make();
-                        if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
-                            drained();
-                        } else {
-                            super::library::save(false);
-                        }
+                        work(&p);
                     }
                 });
             if let Err(e) = spawned {
@@ -207,8 +278,9 @@ fn queue(p: Arc<Pending>) {
     });
     if let Err(e) = sender.send(p) {
         // No worker: made here instead.
+        let counted = Counted;
         e.0.make();
-        WAITING.fetch_sub(1, Ordering::Relaxed);
+        drop(counted);
     }
 }
 
@@ -246,5 +318,61 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    /// Whether `p` is made within 10 s.
+    fn made_soon(p: &Pending) -> bool {
+        let started = Instant::now();
+        while p.made.get().is_none() && started.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        p.made.get().is_some()
+    }
+
+    fn panicking() -> Arc<Pending> {
+        let p = Pending::new(Vec::new(), None);
+        p.panics.store(true, Ordering::Relaxed);
+        Arc::new(p)
+    }
+
+    /// A panic while a host pipeline is made is a pipeline without one,
+    /// not one that is never made.
+    #[test]
+    fn a_panicking_make_is_a_refused_pipeline() {
+        let _serial = crate::test_support::serial();
+        let p = panicking();
+        assert!(ready(&p).is_none());
+        assert!(made_soon(&p), "the pipeline was never made");
+        assert!(matches!(p.made.get(), Some(None)));
+        assert!(ready(&p).is_none());
+    }
+
+    /// Panics do not end workers or leave pipelines counted as waiting:
+    /// after more panics than there are workers, an ordinary pipeline is
+    /// still made by a worker and nothing waits.
+    #[test]
+    fn workers_survive_panics() {
+        let _serial = crate::test_support::serial();
+        // 3 x the most workers there can be.
+        let bad: Vec<Arc<Pending>> = (0..24).map(|_| panicking()).collect();
+        for p in &bad {
+            start(p);
+        }
+        for (i, p) in bad.iter().enumerate() {
+            assert!(made_soon(p), "panicking pipeline {i} was never made");
+            assert!(matches!(p.made.get(), Some(None)));
+        }
+        let good = Arc::new(Pending::new(Vec::new(), None));
+        start(&good);
+        assert!(made_soon(&good), "no worker is left");
+        let by = good.made_by.get().map(String::as_str).unwrap_or("");
+        assert!(by.starts_with("victory-pipelines-"), "made by {by:?}");
+        // Other tests queue pipelines too (without the lock), so this
+        // waits for the count instead of reading it once.
+        let started = Instant::now();
+        while waiting() != 0 && started.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(waiting(), 0);
     }
 }

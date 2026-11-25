@@ -104,10 +104,21 @@ pub(crate) struct Translated {
 impl Shader {
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
+    ///
+    /// A panic in the translator is a shader that does not translate: this
+    /// is reached from the title's draw calls (`extern "system"`, where an
+    /// unwinding panic ends the process) and from the pipeline workers.
+    /// That relies on panics unwinding (no profile of the workspace sets
+    /// `panic = "abort"`).
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                let done = translate(&self.container);
+                let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    #[cfg(test)]
+                    tests::translating(&self.hash);
+                    translate(&self.container)
+                }))
+                .unwrap_or_else(|_| Err("the translator panicked".to_owned()));
                 match &done {
                     Ok(t) => tracing::info!(
                         stage = self.stage,
@@ -518,6 +529,43 @@ pub fn save_pipeline_cache() {
 
 #[cfg(test)]
 mod tests {
+    /// The hash of the one shader whose translation panics, and how often
+    /// it was asked for.
+    #[cfg(windows)]
+    static PANICS: Mutex<Option<(String, u32)>> = Mutex::new(None);
+
+    /// Called where a shader is translated.
+    #[cfg(windows)]
+    pub(super) fn translating(hash: &str) {
+        let mut panics = PANICS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((h, times)) = panics.as_mut()
+            && h == hash
+        {
+            *times += 1;
+            drop(panics);
+            panic!("test: translating {hash} panics");
+        }
+    }
+
+    /// A translator panic does not unwind into the caller (a title's draw
+    /// call): the shader is one that does not translate, asked once.
+    #[cfg(windows)]
+    #[test]
+    fn a_panicking_translation_is_an_untranslated_shader() {
+        let s = shader("vs", b"a container whose translation panics");
+        *PANICS.lock().unwrap_or_else(|e| e.into_inner()) = Some((s.hash.clone(), 0));
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (s.translated().is_none(), s.translated().is_none())
+        }));
+        let asked = PANICS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .map(|p| p.1);
+        assert_eq!(unwound.ok(), Some((true, true)), "the panic unwound");
+        assert_eq!(asked, Some(1));
+    }
+
     #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
