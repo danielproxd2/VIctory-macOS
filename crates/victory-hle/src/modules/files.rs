@@ -26,19 +26,52 @@ use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
 use self::paths::SEPARATORS;
 use crate::{HleExport, HleModule, hle_export};
 
-/// The host's own function: what the import would have been bound to.
-macro_rules! host {
-    ($dll:literal, $name:literal: $ty:ty) => {{
-        static ADDRESS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        let address = *ADDRESS.get_or_init(|| {
-            crate::host::function($dll, $name)
-                .unwrap_or_else(|| panic!("the host lacks {}!{}", $dll, $name))
-        });
-        // SAFETY: the host exports this function with this signature.
-        unsafe { std::mem::transmute::<usize, $ty>(address) }
-    }};
-}
-pub(crate) use host;
+pub(crate) use crate::host::host;
+
+/// Every host function this file binds with `host!`, sorted: checked
+/// against the host at start-up (`crate::host::missing_exports`) and
+/// against this file by a test.
+pub(crate) const HOST_IMPORTS: &[(&str, &str)] = &[
+    ("kernel32.dll", "CloseHandle"),
+    ("kernel32.dll", "CreateDirectoryW"),
+    ("kernel32.dll", "CreateFile2"),
+    ("kernel32.dll", "CreateFileA"),
+    ("kernel32.dll", "CreateFileW"),
+    ("kernel32.dll", "DeleteFileA"),
+    ("kernel32.dll", "DeleteFileW"),
+    ("kernel32.dll", "FindFirstFileExW"),
+    ("kernel32.dll", "FindFirstFileW"),
+    ("kernel32.dll", "GetDiskFreeSpaceExW"),
+    ("kernel32.dll", "GetDiskFreeSpaceW"),
+    ("kernel32.dll", "GetFileAttributesA"),
+    ("kernel32.dll", "GetFileAttributesExW"),
+    ("kernel32.dll", "GetFileAttributesW"),
+    ("kernel32.dll", "MoveFileExW"),
+    ("kernel32.dll", "ReadFile"),
+    ("kernel32.dll", "RemoveDirectoryW"),
+    ("kernel32.dll", "SetCurrentDirectoryA"),
+    ("kernel32.dll", "SetCurrentDirectoryW"),
+    ("kernel32.dll", "SetFileAttributesW"),
+    ("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEBDHH@Z"),
+    ("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z"),
+    ("ucrtbase.dll", "_close"),
+    ("ucrtbase.dll", "_open"),
+    ("ucrtbase.dll", "_stat64i32"),
+    ("ucrtbase.dll", "_wchmod"),
+    ("ucrtbase.dll", "_wfopen"),
+    ("ucrtbase.dll", "_wfopen_s"),
+    ("ucrtbase.dll", "_wfsopen"),
+    ("ucrtbase.dll", "_wopen"),
+    ("ucrtbase.dll", "_wremove"),
+    ("ucrtbase.dll", "_wstat64"),
+    ("ucrtbase.dll", "_wstat64i32"),
+    ("ucrtbase.dll", "_wutime64"),
+    ("ucrtbase.dll", "fclose"),
+    ("ucrtbase.dll", "fopen"),
+    ("ucrtbase.dll", "fopen_s"),
+    ("ucrtbase.dll", "fread"),
+    ("ucrtbase.dll", "remove"),
+];
 
 /// Mounted drives: upper-case letter and host root (UTF-16, no trailing
 /// separator, no NUL).
@@ -749,6 +782,12 @@ mod tests {
             tr(format!(r"{letter}:\a\..\b")),
             Some(format!(r"\\?\{root}\b"))
         );
+    }
+
+    /// The table lists what this file binds, and the host has all of it.
+    #[test]
+    fn every_host_import_exists_or_has_a_fallback() {
+        crate::host::check_bindings(include_str!("files.rs"), HOST_IMPORTS, &[]);
     }
 
     #[test]

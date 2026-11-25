@@ -24,13 +24,32 @@ use victory_loader::{ImportResolver, Provenance, Resolution};
 use victory_pe::ImportSymbol;
 
 /// Resolves a title's imports against our runtime and the host.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct HleResolver {
     pub host: HostPolicy,
 }
 
+impl Default for HleResolver {
+    fn default() -> Self {
+        HleResolver::new(HostPolicy::default())
+    }
+}
+
 impl HleResolver {
+    /// Also checks, once per process, that the host has every function our
+    /// overrides call through to, and names those it lacks: calls that
+    /// reach one fail with their API's error.
     pub fn new(host: HostPolicy) -> Self {
+        static CHECKED: std::sync::Once = std::sync::Once::new();
+        CHECKED.call_once(|| {
+            for (dll, name) in host::missing_exports() {
+                tracing::warn!(
+                    dll,
+                    name,
+                    "the host lacks a function we call; calls to it will fail"
+                );
+            }
+        });
         HleResolver { host }
     }
 

@@ -145,6 +145,16 @@ mod device_type {
     use crate::{HleModule, hle_export};
 
     type Key = *mut c_void;
+
+    /// Every host function this module binds with `host!`, sorted:
+    /// checked against the host at start-up
+    /// (`crate::host::missing_exports`) and against this file by a test.
+    pub(crate) const HOST_IMPORTS: &[(&str, &str)] = &[
+        ("advapi32.dll", "RegCloseKey"),
+        ("advapi32.dll", "RegOpenKeyExW"),
+        ("advapi32.dll", "RegOpenKeyW"),
+        ("advapi32.dll", "RegQueryValueExW"),
+    ];
     const LOCAL_MACHINE: Key = 0xffff_ffff_8000_0002_u64 as Key;
     const KEY: &str = r"Software\Microsoft\Windows NT\CurrentVersion\OEM";
     const VALUE: &str = "ConsoleMode";
@@ -288,6 +298,13 @@ mod device_type {
             s.encode_utf16().chain([0]).collect()
         }
 
+        /// The table lists what this module binds, and the host has all
+        /// of it.
+        #[test]
+        fn every_host_import_exists_or_has_a_fallback() {
+            crate::host::check_bindings(include_str!("xsystem.rs"), HOST_IMPORTS, &[]);
+        }
+
         #[test]
         fn titles_read_the_chosen_model() {
             assert_eq!(console_mode(Console::SeriesX), 0x64);
@@ -363,7 +380,7 @@ mod device_type {
     }
 }
 #[cfg(windows)]
-pub(crate) use device_type::module;
+pub(crate) use device_type::{HOST_IMPORTS, module};
 
 #[cfg(test)]
 mod tests {

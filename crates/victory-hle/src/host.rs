@@ -92,6 +92,233 @@ pub(crate) fn function(dll: &str, name: &str) -> Option<usize> {
     imp::resolve(dll, &name)
 }
 
+/// The host's own function behind a title import we override: what the
+/// import would have been bound to. Every binding is listed in its
+/// module's `HOST_IMPORTS`, which [`missing_exports`] checks at start-up.
+///
+/// A host that lacks the export (Wine lacks a few) must not take the
+/// process down on the first call, which arrives from title code across
+/// `extern "system"`: the binding then is a stand-in with the same
+/// signature that fails the call the way its family does ([`failure`]).
+#[cfg(windows)]
+macro_rules! host {
+    ($dll:literal, $name:literal: extern $abi:literal fn($($arg:ty),* $(,)?) $(-> $ret:ty)?) => {{
+        extern $abi fn lacking($(_: $arg),*) $(-> $ret)? {
+            crate::host::lacking($dll, $name)
+        }
+        static ADDRESS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let address = *ADDRESS.get_or_init(|| {
+            let lacking: extern $abi fn($($arg),*) $(-> $ret)? = lacking;
+            crate::host::function_or($dll, $name, lacking as usize)
+        });
+        // SAFETY: the host exports this function with this signature; the
+        // stand-in has it by construction.
+        unsafe { std::mem::transmute::<usize, extern $abi fn($($arg),*) $(-> $ret)?>(address) }
+    }};
+}
+#[cfg(windows)]
+pub(crate) use host;
+
+/// The host's `name` from `dll`, or `stand_in` with a line in the log.
+#[cfg(windows)]
+pub(crate) fn function_or(dll: &str, name: &str, stand_in: usize) -> usize {
+    function(dll, name).unwrap_or_else(|| {
+        tracing::error!(
+            dll,
+            name,
+            "the host lacks a function we call; calls to it fail"
+        );
+        stand_in
+    })
+}
+
+/// The bindings of [`host!`] the host cannot satisfy, as (DLL, name).
+pub(crate) fn missing_exports() -> Vec<(&'static str, &'static str)> {
+    #[cfg(windows)]
+    let tables = {
+        use crate::modules::{files, net, xsystem};
+        [
+            files::HOST_IMPORTS,
+            net::HOST_IMPORTS,
+            xsystem::HOST_IMPORTS,
+        ]
+    };
+    #[cfg(not(windows))]
+    let tables: [&[(&str, &str)]; 0] = [];
+    tables
+        .iter()
+        .flat_map(|table| table.iter().copied())
+        .filter(|(dll, name)| function(dll, name).is_none())
+        .collect()
+}
+
+/// The error a failed call leaves for its thread.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ThreadError {
+    /// `SetLastError`.
+    Win32(u32),
+    /// `WSASetLastError`.
+    Winsock(i32),
+    /// The C runtime's `errno`.
+    Errno(i32),
+}
+
+#[cfg(any(windows, test))]
+const ERROR_PROC_NOT_FOUND: u32 = 127;
+#[cfg(any(windows, test))]
+const WSAEOPNOTSUPP: i32 = 10045;
+/// What `getaddrinfo` returns for a failure that will not go away.
+#[cfg(any(windows, test))]
+const WSANO_RECOVERY: i32 = 11003;
+/// The C runtime's "function not implemented".
+#[cfg(any(windows, test))]
+const ENOSYS: i32 = 40;
+
+/// How a call to `dll!name` fails when the host has no such function: the
+/// error left for the thread and the return value, sign-extended. By the
+/// conventions of the public references: Win32 functions return `FALSE`
+/// or an invalid handle and set the last error, registry functions return
+/// the error, Winsock functions return `SOCKET_ERROR`, an invalid socket
+/// or null and set the Winsock error, name resolution returns its error
+/// code, and C runtime functions return -1, null or an `errno_t` and set
+/// `errno`. A stand-in does not write through the call's pointers.
+#[cfg(any(windows, test))]
+pub(crate) fn failure(dll: &str, name: &str) -> (ThreadError, i64) {
+    let starts = |prefix: &str| name.starts_with(prefix);
+    match dll {
+        "ws2_32.dll" => {
+            let value = match name {
+                _ if starts("getaddrinfo") || starts("GetAddrInfo") => WSANO_RECOVERY.into(),
+                _ if starts("getnameinfo") || starts("GetNameInfo") => WSANO_RECOVERY.into(),
+                _ if starts("gethostby") || starts("WSAAsyncGetHostBy") => 0,
+                "WSAGetLastError" => WSAEOPNOTSUPP.into(),
+                _ => -1,
+            };
+            (ThreadError::Winsock(WSAEOPNOTSUPP), value)
+        }
+        "advapi32.dll" => (
+            ThreadError::Win32(ERROR_PROC_NOT_FOUND),
+            ERROR_PROC_NOT_FOUND.into(),
+        ),
+        "ucrtbase.dll" | "msvcp140.dll" => {
+            let value = match name {
+                _ if name.ends_with("_s") => ENOSYS.into(),
+                "fopen" | "_wfopen" | "_wfsopen" | "fread" => 0,
+                _ if dll == "msvcp140.dll" => 0,
+                _ => -1,
+            };
+            (ThreadError::Errno(ENOSYS), value)
+        }
+        _ => {
+            let invalid = starts("CreateFile")
+                || starts("FindFirstFile")
+                || matches!(name, "GetFileAttributesW" | "GetFileAttributesA");
+            (
+                ThreadError::Win32(ERROR_PROC_NOT_FOUND),
+                if invalid { -1 } else { 0 },
+            )
+        }
+    }
+}
+
+/// A return type of a host function, made from [`failure`]'s value.
+#[cfg(windows)]
+pub(crate) trait Answer {
+    fn answer(value: i64) -> Self;
+}
+
+#[cfg(windows)]
+impl Answer for () {
+    fn answer(_: i64) {}
+}
+
+#[cfg(windows)]
+impl Answer for i32 {
+    fn answer(value: i64) -> i32 {
+        value as i32
+    }
+}
+
+#[cfg(windows)]
+impl Answer for u32 {
+    fn answer(value: i64) -> u32 {
+        value as u32
+    }
+}
+
+#[cfg(windows)]
+impl Answer for usize {
+    fn answer(value: i64) -> usize {
+        value as usize
+    }
+}
+
+#[cfg(windows)]
+impl<T> Answer for *mut T {
+    fn answer(value: i64) -> *mut T {
+        std::ptr::without_provenance_mut(value as usize)
+    }
+}
+
+/// A call to `dll!name`, which the host lacks: fails it as [`failure`]
+/// says.
+#[cfg(windows)]
+pub(crate) fn lacking<R: Answer>(dll: &str, name: &str) -> R {
+    let (error, value) = failure(dll, name);
+    imp::leave(error);
+    R::answer(value)
+}
+
+/// The (DLL, name) of every [`host!`] binding written in `source`.
+#[cfg(test)]
+pub(crate) fn bindings_in(source: &str) -> std::collections::BTreeSet<(String, String)> {
+    /// The text of a string literal at the start of `text`, and the rest.
+    fn literal(text: &str) -> Option<(&str, &str)> {
+        let text = text.trim_start().strip_prefix('"')?;
+        let end = text.find('"')?;
+        Some((&text[..end], &text[end + 1..]))
+    }
+    source
+        .split("host!(")
+        .skip(1)
+        .filter_map(|after| {
+            let (dll, rest) = literal(after)?;
+            let (name, _) = literal(rest.trim_start().strip_prefix(',')?)?;
+            Some((dll.to_owned(), name.to_owned()))
+        })
+        .collect()
+}
+
+/// Checks a module's `HOST_IMPORTS` against its `source` (every binding
+/// listed, in order, once) and against the host: every function exists,
+/// except exactly `wine_lacks` under Wine.
+#[cfg(all(test, windows))]
+pub(crate) fn check_bindings(source: &str, table: &[(&str, &str)], wine_lacks: &[(&str, &str)]) {
+    let written = bindings_in(source);
+    let listed: Vec<_> = table
+        .iter()
+        .map(|(dll, name)| (dll.to_string(), name.to_string()))
+        .collect();
+    assert!(listed.is_sorted(), "HOST_IMPORTS is kept sorted");
+    assert_eq!(
+        listed,
+        written.into_iter().collect::<Vec<_>>(),
+        "HOST_IMPORTS lists the bindings in the source"
+    );
+    let wine = function("ntdll.dll", "wine_get_version").is_some();
+    let lacking: Vec<_> = table
+        .iter()
+        .copied()
+        .filter(|(dll, name)| function(dll, name).is_none())
+        .collect();
+    let expected = if wine { wine_lacks } else { &[] };
+    assert_eq!(lacking, expected, "the host lacks exactly these");
+    for (dll, name) in lacking {
+        assert!(missing_exports().contains(&(dll, name)));
+    }
+}
+
 #[cfg(windows)]
 mod imp {
     use std::collections::HashMap;
@@ -120,6 +347,33 @@ mod imp {
         proc.map(|f| f as *const () as usize)
     }
 
+    /// Leaves `error` for the calling thread.
+    pub(super) fn leave(error: super::ThreadError) {
+        use windows_sys::Win32::Foundation::SetLastError;
+        match error {
+            // SAFETY: sets the thread's last error.
+            super::ThreadError::Win32(code) => unsafe { SetLastError(code) },
+            // The Winsock error is the thread's last error; through
+            // Winsock's own function where the host has it.
+            super::ThreadError::Winsock(code) => {
+                match super::function("ws2_32.dll", "WSASetLastError") {
+                    // SAFETY: the host's `void WSASetLastError(int)`.
+                    Some(set) => unsafe {
+                        std::mem::transmute::<usize, extern "system" fn(i32)>(set)(code)
+                    },
+                    // SAFETY: as above.
+                    None => unsafe { SetLastError(code as u32) },
+                }
+            }
+            super::ThreadError::Errno(code) => {
+                if let Some(set) = super::function("ucrtbase.dll", "_set_errno") {
+                    // SAFETY: the host's `errno_t _set_errno(int)`.
+                    unsafe { std::mem::transmute::<usize, extern "C" fn(i32) -> i32>(set)(code) };
+                }
+            }
+        }
+    }
+
     fn module(dll: &str) -> Option<usize> {
         let key = dll.to_ascii_lowercase();
         let mut cache = MODULES.lock().unwrap_or_else(|e| e.into_inner());
@@ -144,5 +398,116 @@ mod imp {
 mod imp {
     pub(super) fn resolve(_dll: &str, _symbol: &victory_pe::ImportSymbol) -> Option<usize> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bindings_are_read_from_source_text() {
+        let source = r#"
+            host!("a.dll", "One": extern "system" fn() -> i32)();
+            let f = host!(
+                "b.dll",
+                "Two": extern "C" fn(i32)
+            );
+            host!("a.dll", "One": extern "system" fn() -> i32)();
+            // The macro itself, `host!`, and host!(not a literal) are not bindings.
+        "#;
+        let found: Vec<_> = bindings_in(source).into_iter().collect();
+        let pair = |dll: &str, name: &str| (dll.to_owned(), name.to_owned());
+        assert_eq!(found, [pair("a.dll", "One"), pair("b.dll", "Two")]);
+    }
+
+    /// How a call fails when the host lacks the function, per family.
+    #[test]
+    fn a_lacking_function_fails_as_its_family_does() {
+        let win32 = ThreadError::Win32(127);
+        assert_eq!(failure("kernel32.dll", "DeleteFileW"), (win32, 0));
+        assert_eq!(failure("kernel32.dll", "CreateFile2"), (win32, -1));
+        assert_eq!(failure("kernel32.dll", "FindFirstFileExW"), (win32, -1));
+        assert_eq!(failure("kernel32.dll", "GetFileAttributesA"), (win32, -1));
+        assert_eq!(failure("kernel32.dll", "GetFileAttributesExW"), (win32, 0));
+        assert_eq!(failure("winhttp.dll", "WinHttpOpen"), (win32, 0));
+        assert_eq!(failure("advapi32.dll", "RegOpenKeyExW"), (win32, 127));
+
+        let winsock = ThreadError::Winsock(10045);
+        assert_eq!(failure("ws2_32.dll", "connect"), (winsock, -1));
+        assert_eq!(failure("ws2_32.dll", "WSAJoinLeaf"), (winsock, -1));
+        assert_eq!(failure("ws2_32.dll", "GetAddrInfoExA"), (winsock, 11003));
+        assert_eq!(failure("ws2_32.dll", "getnameinfo"), (winsock, 11003));
+        assert_eq!(failure("ws2_32.dll", "gethostbyname"), (winsock, 0));
+        assert_eq!(failure("ws2_32.dll", "WSAAsyncGetHostByAddr"), (winsock, 0));
+
+        let errno = ThreadError::Errno(40);
+        assert_eq!(failure("ucrtbase.dll", "_wopen"), (errno, -1));
+        assert_eq!(failure("ucrtbase.dll", "fclose"), (errno, -1));
+        assert_eq!(failure("ucrtbase.dll", "_wfopen"), (errno, 0));
+        assert_eq!(failure("ucrtbase.dll", "fread"), (errno, 0));
+        assert_eq!(failure("ucrtbase.dll", "_wfopen_s"), (errno, 40));
+        let fiopen = "?_Fiopen@std@@YAPEAU_iobuf@@PEBDHH@Z";
+        assert_eq!(failure("msvcp140.dll", fiopen), (errno, 0));
+    }
+
+    /// Nothing to bind on a host that is not Windows.
+    #[cfg(not(windows))]
+    #[test]
+    fn no_bindings_off_windows() {
+        assert_eq!(missing_exports(), []);
+    }
+
+    /// A binding the host cannot satisfy fails each call with its
+    /// family's error. It once panicked on the first call, inside a
+    /// function title code calls.
+    #[cfg(windows)]
+    #[test]
+    fn a_missing_host_export_fails_the_call_cleanly() {
+        use std::ffi::c_void;
+        use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+        let null = std::ptr::null::<u16>();
+
+        let delete =
+            host!("kernel32.dll", "VictoryLacksThisW": extern "system" fn(*const u16) -> i32);
+        // SAFETY: the thread's last error.
+        unsafe { SetLastError(0) };
+        assert_eq!(delete(null), 0);
+        // SAFETY: as above.
+        assert_eq!(unsafe { GetLastError() }, 127);
+        // Again: the stand-in is the binding now.
+        assert_eq!(delete(null), 0);
+
+        let create = host!("kernel32.dll", "CreateFileVictoryLacks": extern "system" fn(*const u16, u32) -> *mut c_void);
+        assert_eq!(create(null, 0) as isize, -1);
+
+        let last_error = function("ws2_32.dll", "WSAGetLastError").expect("WSAGetLastError");
+        // SAFETY: the host's `int WSAGetLastError(void)`.
+        let last_error =
+            unsafe { std::mem::transmute::<usize, extern "system" fn() -> i32>(last_error) };
+        let send = host!("ws2_32.dll", "VictoryLacksThis": extern "system" fn(usize, *const u8, i32) -> i32);
+        assert_eq!(send(0, std::ptr::null(), 0), -1);
+        assert_eq!(last_error(), 10045);
+        let join =
+            host!("ws2_32.dll", "VictoryLacksThisSocket": extern "system" fn(usize) -> usize);
+        assert_eq!(join(0), usize::MAX);
+        let resolve =
+            host!("ws2_32.dll", "GetAddrInfoVictoryLacks": extern "system" fn(*const u16) -> i32);
+        assert_eq!(resolve(null), 11003);
+        host!("ws2_32.dll", "VictoryLacksThisVoid": extern "system" fn(i32))(1);
+
+        let errno = function("ucrtbase.dll", "_errno").expect("_errno");
+        // SAFETY: the host's `int* _errno(void)`.
+        let errno = unsafe { std::mem::transmute::<usize, extern "C" fn() -> *mut i32>(errno) };
+        // SAFETY: the thread's `errno`.
+        unsafe { *errno() = 0 };
+        let open =
+            host!("ucrtbase.dll", "_victory_lacks_this": extern "C" fn(*const u16, i32) -> i32);
+        assert_eq!(open(null, 0), -1);
+        // SAFETY: as above.
+        assert_eq!(unsafe { *errno() }, 40);
+        let registry =
+            host!("advapi32.dll", "RegVictoryLacksThis": extern "system" fn(*mut c_void) -> u32);
+        assert_eq!(registry(std::ptr::null_mut()), 127);
     }
 }

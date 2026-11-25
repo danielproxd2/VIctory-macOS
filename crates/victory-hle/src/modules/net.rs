@@ -67,6 +67,41 @@ const WSAID_WSASENDMSG: Guid = Guid(
 type Socket = usize;
 type Handle = *mut c_void;
 
+/// Every host function this file binds with `host!`, sorted: checked
+/// against the host at start-up (`crate::host::missing_exports`) and
+/// against this file by a test.
+pub(crate) const HOST_IMPORTS: &[(&str, &str)] = &[
+    ("winhttp.dll", "WinHttpConnect"),
+    ("winhttp.dll", "WinHttpOpen"),
+    ("winhttp.dll", "WinHttpSetOption"),
+    ("ws2_32.dll", "GetAddrInfoExA"),
+    ("ws2_32.dll", "GetAddrInfoExW"),
+    ("ws2_32.dll", "GetAddrInfoW"),
+    ("ws2_32.dll", "GetNameInfoW"),
+    ("ws2_32.dll", "WSAAsyncGetHostByAddr"),
+    ("ws2_32.dll", "WSAAsyncGetHostByName"),
+    ("ws2_32.dll", "WSAConnect"),
+    ("ws2_32.dll", "WSAConnectByList"),
+    ("ws2_32.dll", "WSAConnectByNameA"),
+    ("ws2_32.dll", "WSAConnectByNameW"),
+    ("ws2_32.dll", "WSAGetLastError"),
+    ("ws2_32.dll", "WSAIoctl"),
+    ("ws2_32.dll", "WSAJoinLeaf"),
+    ("ws2_32.dll", "WSASendMsg"),
+    ("ws2_32.dll", "WSASendTo"),
+    ("ws2_32.dll", "WSASetLastError"),
+    ("ws2_32.dll", "bind"),
+    ("ws2_32.dll", "closesocket"),
+    ("ws2_32.dll", "connect"),
+    ("ws2_32.dll", "getaddrinfo"),
+    ("ws2_32.dll", "gethostbyaddr"),
+    ("ws2_32.dll", "gethostbyname"),
+    ("ws2_32.dll", "getnameinfo"),
+    ("ws2_32.dll", "getsockopt"),
+    ("ws2_32.dll", "sendto"),
+    ("ws2_32.dll", "socket"),
+];
+
 /// Logs `what` for `destination` the first time (no payload, ever).
 fn once(what: &'static str, destination: String) {
     static SEEN: Mutex<Vec<(&str, String)>> = Mutex::new(Vec::new());
@@ -866,6 +901,18 @@ mod tests {
     // TEST-NET-1 (192.0.2.0/24): never routed, and never tried here.
     const AWAY: [u8; 4] = [192, 0, 2, 1];
     const HOME: [u8; 4] = [127, 0, 0, 1];
+
+    /// The table lists what this file binds. Wine's ws2_32 lacks two of
+    /// the functions; `WSAConnectByList` and `GetAddrInfoExA` here answer
+    /// for themselves before they would reach the host's.
+    #[test]
+    fn every_host_import_exists_or_has_a_fallback() {
+        const WINE_LACKS: &[(&str, &str)] = &[
+            ("ws2_32.dll", "GetAddrInfoExA"),
+            ("ws2_32.dll", "WSAConnectByList"),
+        ];
+        crate::host::check_bindings(include_str!("net.rs"), HOST_IMPORTS, WINE_LACKS);
+    }
 
     #[test]
     fn only_loopback_is_reachable() {
