@@ -1755,3 +1755,49 @@ fn certificate_chains_never_fetch_urls() {
     );
     assert_eq!(free(context), 1);
 }
+
+/// Upstream's test, where upstream has it: with this module's others.
+#[test]
+fn blocked_name_lookups_clear_the_result() {
+    let ansi = c"blocked.invalid".as_ptr();
+    let wide: Vec<u16> = "blocked.invalid\0".encode_utf16().collect();
+    let wide = wide.as_ptr();
+    let null = std::ptr::null();
+    let null_mut = std::ptr::null_mut();
+    let check = |lookup: &dyn Fn(*mut *mut c_void) -> i32| {
+        let mut result = std::ptr::dangling_mut::<c_void>();
+        assert_eq!(lookup(&mut result), WSAHOST_NOT_FOUND);
+        assert!(result.is_null());
+        assert_eq!(lookup(std::ptr::null_mut()), WSAHOST_NOT_FOUND);
+    };
+    check(&|result| getaddrinfo(ansi, std::ptr::null(), null, result));
+    check(&|result| GetAddrInfoW(wide, std::ptr::null(), null, result));
+    check(&|result| {
+        GetAddrInfoExA(
+            ansi,
+            std::ptr::null(),
+            0,
+            null,
+            null,
+            result,
+            null,
+            null_mut,
+            null,
+            std::ptr::null_mut(),
+        )
+    });
+    check(&|result| {
+        GetAddrInfoExW(
+            wide,
+            std::ptr::null(),
+            0,
+            null,
+            null,
+            result,
+            null,
+            null_mut,
+            null,
+            std::ptr::null_mut(),
+        )
+    });
+}
