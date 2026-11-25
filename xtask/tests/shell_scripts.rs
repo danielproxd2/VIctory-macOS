@@ -375,6 +375,42 @@ fn victory_sh_keeps_saved_data_out_of_the_cache_folder() {
     );
 }
 
+/// No game is started by default: without arguments the launcher says
+/// what to pass and fails, and builds and starts nothing.
+#[test]
+fn victory_sh_without_arguments_says_what_to_pass_and_fails() {
+    let dir = scratch("victory-sh-no-arguments");
+    let log = dir.join("started.log");
+    fs::create_dir_all(dir.join("wine/lib/external/D3DMetal.framework")).unwrap();
+    for program in ["bin/cargo", "wine/bin/wine"] {
+        script(
+            &dir.join(program),
+            &format!(r#"echo "{program} $*" >> "$STAND_IN_LOG""#),
+        );
+    }
+    let out = Command::new(root().join("tools/macos/victory.sh"))
+        .env("CARGO", dir.join("bin/cargo"))
+        .env("WINE", dir.join("wine/bin/wine"))
+        .env("HOME", dir.join("home"))
+        .env("STAND_IN_LOG", &log)
+        .env_remove("VICTORY_CONFIG")
+        .env_remove("VICTORY_DATA_DIR")
+        .env_remove("WINEPREFIX")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "");
+    let said = text(&out.stderr);
+    assert!(said.contains("no game is started by default"), "{said}");
+    assert!(
+        said.contains("tools/macos/victory.sh run --execute <path to the game's executable>"),
+        "{said}"
+    );
+    assert!(said.contains("tools/macos/victory.sh config"), "{said}");
+    let started = fs::read_to_string(&log).unwrap_or_default();
+    assert_eq!(started, "", "nothing is built or started");
+}
+
 /// The variable the launcher sets is the one the configuration reads.
 #[test]
 fn victory_sh_sets_the_variable_the_config_reads() {

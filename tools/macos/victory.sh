@@ -13,9 +13,20 @@
 # file names a data_dir, VICTORY_DATA_DIR is set to
 # ~/Library/Application Support/victory/data, as Wine's Z: drive shows it.
 # CARGO names the cargo to build with (default: cargo on PATH).
+# No game is configured to start by default: without arguments the launcher
+# says what to pass and fails, before it builds or starts anything. (`run`
+# without an executable is refused by victory.exe, which names it.)
 set -e
 cd "$(dirname "$0")/../.."
 ROOT="$PWD"
+if [ $# -eq 0 ]; then
+    {
+        echo "victory.sh: no command given, and no game is started by default. Name the game's executable:"
+        echo "  tools/macos/victory.sh run --execute <path to the game's executable>"
+        echo "To check the setup instead: tools/macos/victory.sh config"
+    } >&2
+    exit 2
+fi
 export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
 WINE="${WINE:-$HOME/Library/Caches/victory-macos/target/wine-cx/bin/wine}"
 [ -x "$WINE" ] || { echo "no Wine at $WINE: run tools/macos/build-crossover-wine.sh first" >&2; exit 1; }
