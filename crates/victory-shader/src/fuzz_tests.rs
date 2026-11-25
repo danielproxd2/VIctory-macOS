@@ -11,7 +11,11 @@
 //! compiled shader.
 //!
 //! What these tests prove is the absence of panics and of hangs for the
-//! cases they run, not that an emitted module is right. A panic they find
+//! cases they run, and that every module they emit holds together (the
+//! sizes, counts and registers it declares are the ones it has; see
+//! `invariants`), not that an emitted module computes the right thing.
+//! The second half is what a build without overflow checks is judged by:
+//! there a wrapped size is no panic. A panic or a broken module they find
 //! is fixed with an error value and its input kept as a test of its own,
 //! named for what went wrong.
 //!
@@ -29,6 +33,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use crate::dxbc::{Container, FourCC};
+use crate::emit::HostShader;
 use crate::gfx10::Encoding;
 use crate::gfx10::asm::{self, Src};
 use crate::native::{
@@ -114,7 +119,8 @@ fn trace(line: &str) {
 
 /// Runs `case` for each seed of the run on one worker thread with a
 /// [`STACK`]-sized stack, each case inside `catch_unwind`. Fails, naming
-/// the seed, on the first case that panics or takes longer than `budget`.
+/// the seed, on the first case that panics (a translation that breaks an
+/// invariant is such a case) or takes longer than `budget`.
 fn drive(default_seed: u64, budget: Duration, case: Case) -> Tally {
     let cases = number("VICTORY_FUZZ_CASES");
     let seed = number("VICTORY_FUZZ_SEED");
@@ -914,16 +920,34 @@ fn stages(c: &Container, native: &NativeProgram) -> bool {
     );
     match (st, res, io) {
         (Ok(st), Ok(res), Ok(io)) if translates => {
-            emit::emit(c, native, &p, &st, &io, &res).is_ok()
+            match emit::emit(c, native, &p, &st, &io, &res) {
+                Ok(shader) => {
+                    hold(&shader, Some(native));
+                    true
+                }
+                Err(_) => false,
+            }
         }
         _ => false,
+    }
+}
+
+/// Fails the case (the driver names its seed) if `shader` breaks one of
+/// the [`invariants`].
+fn hold(shader: &HostShader, native: Option<&NativeProgram>) {
+    if let Err(broken) = invariants(shader, native) {
+        panic!("a translation that does not hold together: {broken}");
     }
 }
 
 /// A container's bytes through the parser and the translator, then each
 /// program the parser finds through [`stages`]. Whether anything translated.
 fn whole(container: &[u8]) -> bool {
-    let mut translated = emit::translate(container).is_ok();
+    let mut translated = false;
+    if let Ok(shader) = emit::translate(container) {
+        hold(&shader, None);
+        translated = true;
+    }
     let Ok(c) = Container::parse(container) else {
         return translated;
     };
@@ -981,6 +1005,364 @@ fn run_with(r: &mut Gen, native: &NativeProgram, signatures: &[Vec<Element>; 3])
     let container = parts_for(r, native.stage, signatures);
     let c = Container::parse(&container).expect("the builder's own container");
     stages(&c, native)
+}
+
+// What every translation must satisfy.
+//
+// "Never panics" proves little about arithmetic in a build without
+// overflow checks, which is the build that ships: a size, count or offset
+// of the title's that wraps is silent there. So every case that translates
+// is also checked by value. The checks below read the emitted container
+// the way a consumer does, with their own arithmetic in 64 bits, and hold
+// each declared size, count and register against what is really there; a
+// wrapped or truncated number in the translator shows up as a size that
+// does not match, in either build.
+
+/// The 32-bit word at `at` of `data`, which `what` names.
+fn word(data: &[u8], at: u64, what: &str) -> Result<u32, String> {
+    usize::try_from(at)
+        .ok()
+        .and_then(|at| data.get(at..at.checked_add(4)?))
+        .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")))
+        .ok_or_else(|| format!("{what}: no word at {at:#x} of {} bytes", data.len()))
+}
+
+fn byte_at(data: &[u8], at: u64, what: &str) -> Result<u8, String> {
+    usize::try_from(at)
+        .ok()
+        .and_then(|at| data.get(at).copied())
+        .ok_or_else(|| format!("{what}: no byte at {at:#x} of {} bytes", data.len()))
+}
+
+/// The parts of an emitted container. The size the header declares is the
+/// file's, the parts lie one after another from the end of the offset
+/// table to the end of the file, and the digest is that of the bytes.
+fn container_parts(file: &[u8]) -> Result<Vec<([u8; 4], &[u8])>, String> {
+    if file.get(..4) != Some(b"DXBC") {
+        return Err("the container does not start with DXBC".into());
+    }
+    let (total, len) = (word(file, 0x18, "container")?, file.len() as u64);
+    if u64::from(total) != len {
+        return Err(format!("the container says {total} bytes and has {len}"));
+    }
+    let count = word(file, 0x1C, "container")?;
+    if count > 16 {
+        return Err(format!("{count} parts"));
+    }
+    let mut parts = Vec::new();
+    let mut end = 0x20 + 4 * u64::from(count);
+    for i in 0..u64::from(count) {
+        let offset = u64::from(word(file, 0x20 + 4 * i, "part offsets")?);
+        if offset != end {
+            return Err(format!(
+                "part {i} starts at {offset:#x}, not where the one before it ends ({end:#x})"
+            ));
+        }
+        let fourcc = word(file, offset, "part header")?.to_le_bytes();
+        let size = u64::from(word(file, offset + 4, "part header")?);
+        end = offset + 8 + size;
+        if end > len {
+            return Err(format!(
+                "part {i} of {size} bytes at {offset:#x} runs past the file's {len}"
+            ));
+        }
+        parts.push((fourcc, &file[offset as usize + 8..end as usize]));
+    }
+    if end != len {
+        return Err(format!("the parts end at {end:#x}, the file at {len:#x}"));
+    }
+    if file[4..20] != emit::container_hash(&file[20..]) {
+        return Err("the container's digest is not that of its bytes".into());
+    }
+    Ok(parts)
+}
+
+/// The rows of an emitted signature part as (register, mask): the count
+/// fits the part, every name lies in the part behind the rows and ends
+/// there, and a register is one of D3D12's 32 or none.
+fn signature_rows(part: &[u8], name: &str) -> Result<Vec<(u32, u8)>, String> {
+    let (count, len) = (u64::from(word(part, 0, name)?), part.len() as u64);
+    if word(part, 4, name)? != 8 {
+        return Err(format!("{name}: rows not at 8"));
+    }
+    let names = 8 + 32 * count;
+    if names > len {
+        return Err(format!("{name}: {count} rows in {len} bytes"));
+    }
+    let mut rows = Vec::new();
+    for at in (0..count).map(|i| 8 + 32 * i) {
+        let text = u64::from(word(part, at + 4, name)?);
+        if text < names || text >= len || !part[text as usize..].contains(&0) {
+            return Err(format!("{name}: a name at {text:#x} of {len:#x} bytes"));
+        }
+        let register = word(part, at + 20, name)?;
+        if register != u32::MAX && register >= 32 {
+            return Err(format!("{name}: register {register}"));
+        }
+        let (mask, used) = (part[at as usize + 24], part[at as usize + 25]);
+        if mask > 0xF || used > 0xF {
+            return Err(format!("{name}: masks {mask:#x} and {used:#x}"));
+        }
+        rows.push((register, mask));
+    }
+    Ok(rows)
+}
+
+/// Registers the rows of a signature take: one past the highest.
+fn vectors(rows: &[(u32, u8)]) -> u64 {
+    let allocated = rows.iter().filter(|r| r.0 != u32::MAX);
+    allocated.map(|r| u64::from(r.0) + 1).max().unwrap_or(0)
+}
+
+/// An emitted `PSV0` part against the signatures beside it (input,
+/// output, per-primitive rows): its counts are theirs, its tables have
+/// the sizes its counts say, every reference lies inside its table, and
+/// the tables fill the part exactly. Its resource bindings are returned
+/// as (type, space, register).
+fn psv_holds(
+    psv: &[u8],
+    kind: u32,
+    rows: [&[(u32, u8)]; 3],
+    mesh: bool,
+) -> Result<Vec<(u32, u32, u32)>, String> {
+    let w = |at: u64| word(psv, at, "PSV0");
+    let b = |at: u64| byte_at(psv, at, "PSV0").map(u64::from);
+    if w(0)? != 48 {
+        return Err("PSV0: runtime info not of 48 bytes".into());
+    }
+    let info = 4;
+    if b(info + 24)? != u64::from(kind) {
+        return Err(format!("PSV0: stage {}, not {kind}", b(info + 24)?));
+    }
+    let counted = [b(info + 28)?, b(info + 29)?, b(info + 30)?];
+    let declared = [
+        rows[0].len() as u64,
+        rows[1].len() as u64,
+        if mesh { rows[2].len() as u64 } else { 0 },
+    ];
+    if counted != declared {
+        return Err(format!(
+            "PSV0 counts {counted:?} signature elements, the signatures have {declared:?}"
+        ));
+    }
+    let (ins, outs) = (vectors(rows[0]), vectors(rows[1]));
+    let prim_vectors = if mesh { vectors(rows[2]) } else { 0 };
+    let said = [b(info + 31)?, b(info + 32)?, b(info + 26)?];
+    // In a mesh program byte 26 is the per-primitive vectors; else unused.
+    if said[..2] != [ins, outs] || (mesh && said[2] != prim_vectors) {
+        return Err(format!(
+            "PSV0 says {said:?} vectors, the signatures take {ins}, {outs} and {prim_vectors}"
+        ));
+    }
+    if kind == 5 {
+        let t = [w(info + 36)?, w(info + 40)?, w(info + 44)?];
+        let each = t[0] <= 1024 && t[1] <= 1024 && t[2] <= 64 && !t.contains(&0);
+        if !each || t.iter().map(|&n| u64::from(n)).product::<u64>() > 1024 {
+            return Err(format!("PSV0: a thread group of {t:?}"));
+        }
+    }
+    let mut at = info + 48;
+    let bound = u64::from(w(at)?);
+    at += 4;
+    let mut bindings = Vec::new();
+    if bound > 0 {
+        if w(at)? != 24 {
+            return Err("PSV0: bindings not of 24 bytes".into());
+        }
+        at += 4;
+        for _ in 0..bound.min(1 << 16) {
+            if w(at + 8)? != w(at + 12)? {
+                return Err("PSV0: a binding of several registers".into());
+            }
+            bindings.push((w(at)?, w(at + 4)?, w(at + 8)?));
+            at += 24;
+        }
+    }
+    let strings = u64::from(w(at)?);
+    if !strings.is_multiple_of(4) {
+        return Err(format!("PSV0: {strings} bytes of names"));
+    }
+    at += 4 + strings;
+    let indices = u64::from(w(at)?);
+    at += 4 + 4 * indices;
+    let elements = declared.iter().sum::<u64>();
+    if elements > 0 {
+        if w(at)? != 16 {
+            return Err("PSV0: elements not of 16 bytes".into());
+        }
+        at += 4;
+        for _ in 0..elements {
+            let (name, index) = (u64::from(w(at)?), u64::from(w(at + 4)?));
+            if name >= strings.max(1) || index >= indices {
+                return Err(format!(
+                    "PSV0: an element's name {name} of {strings} bytes, index {index} of {indices}"
+                ));
+            }
+            if b(at + 9)? >= 32 {
+                return Err(format!("PSV0: an element at register {}", b(at + 9)?));
+            }
+            at += 16;
+        }
+    }
+    if ins > 0 && outs > 0 {
+        at += 4 * (ins * 4) * (outs * 4).div_ceil(32);
+    }
+    if at != psv.len() as u64 {
+        return Err(format!(
+            "PSV0: its tables end at {at:#x}, the part at {:#x}",
+            psv.len()
+        ));
+    }
+    Ok(bindings)
+}
+
+/// An emitted `DXIL` part: the program header's size is the part's, the
+/// bitcode it points at is the rest of the part, and the kind is `kind`.
+fn program_holds(part: &[u8], kind: u32) -> Result<(), String> {
+    let w = |at: u64| word(part, at, "DXIL");
+    let len = part.len() as u64;
+    if w(0)? != kind << 16 | 0x66 {
+        return Err(format!("DXIL: program version {:#x}", w(0)?));
+    }
+    if u64::from(w(4)?) * 4 != len {
+        return Err(format!(
+            "the DXIL part says {} dwords and has {len} bytes",
+            w(4)?
+        ));
+    }
+    if part.get(8..12) != Some(b"DXIL") || w(16)? != 16 {
+        return Err("DXIL: no bitcode header".into());
+    }
+    if u64::from(w(20)?) != len - 24 {
+        return Err(format!(
+            "DXIL: {} bytes of bitcode in a part with room for {}",
+            w(20)?,
+            len - 24
+        ));
+    }
+    if part.get(24..28) != Some(&[b'B', b'C', 0xC0, 0xDE]) {
+        return Err("DXIL: the bitcode does not start as bitcode".into());
+    }
+    Ok(())
+}
+
+/// What a translation must satisfy whatever its input was:
+///
+/// * the container is laid out as its header says ([`container_parts`])
+///   and has the parts of its stage, each once and in the emitter's order;
+/// * the signatures, `PSV0` and the program agree with each other and
+///   with their own sizes ([`signature_rows`], [`psv_holds`],
+///   [`program_holds`]);
+/// * what the host is told to bind is what the container declares: a
+///   static sampler per immediate sampler, at most the 64 the comparison
+///   mask has bits for, each bound as its own register; every root CBV
+///   and SRV once and bound at its slot's register; the user-data buffer
+///   bound exactly when user data is read;
+/// * each user-data dword is listed once, at the index of an SGPR (so
+///   the buffer's size cannot wrap) which the buffer's size covers, and
+///   (with the program at hand) comes from a root parameter of the
+///   program's layout, at that parameter's own dword.
+fn invariants(shader: &HostShader, native: Option<&NativeProgram>) -> Result<(), String> {
+    use crate::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+    let (kind, mesh) = match shader.stage {
+        HwStage::Ps => (0, false),
+        HwStage::Vs => (1, false),
+        HwStage::Cs => (5, false),
+        HwStage::Ms => (13, true),
+        other => return Err(format!("a translation of stage {other:?}")),
+    };
+    if native.is_some_and(|n| n.stage != shader.stage) {
+        return Err(format!("stage {:?} of another program", shader.stage));
+    }
+    let parts = container_parts(&shader.dxil)?;
+    let names: Vec<&[u8; 4]> = parts.iter().map(|p| &p.0).collect();
+    let mut expected: Vec<&[u8; 4]> = vec![b"SFI0", b"ISG1", b"OSG1"];
+    if mesh {
+        expected.push(b"PSG1");
+    }
+    expected.extend([b"PSV0", b"HASH", b"DXIL"]);
+    if names != expected {
+        let names: Vec<String> = names.iter().map(|n| n.escape_ascii().to_string()).collect();
+        return Err(format!("parts {names:?}"));
+    }
+    let part = |name: &[u8; 4]| {
+        let found = parts.iter().find(|p| &p.0 == name);
+        found.map(|p| p.1).unwrap_or_default()
+    };
+    if part(b"SFI0").len() != 8 || part(b"HASH").len() != 20 {
+        return Err("SFI0 or HASH of another size".into());
+    }
+    let inputs = signature_rows(part(b"ISG1"), "ISG1")?;
+    let outputs = signature_rows(part(b"OSG1"), "OSG1")?;
+    let prims = if mesh {
+        signature_rows(part(b"PSG1"), "PSG1")?
+    } else {
+        Vec::new()
+    };
+    let bindings = psv_holds(part(b"PSV0"), kind, [&inputs, &outputs, &prims], mesh)?;
+    program_holds(part(b"DXIL"), kind)?;
+
+    // What the host binds.
+    let samplers = shader.samplers.len();
+    if shader.static_samplers.len() != samplers || samplers > 64 {
+        return Err(format!(
+            "{samplers} immediate samplers, {} static ones",
+            shader.static_samplers.len()
+        ));
+    }
+    for (what, slots) in [("CBV", &shader.root_cbvs), ("SRV", &shader.root_srvs)] {
+        let once: std::collections::HashSet<u8> = slots.iter().copied().collect();
+        if once.len() != slots.len() {
+            return Err(format!("root {what}s {slots:?} name a slot twice"));
+        }
+    }
+    let mut bound: Vec<(u32, u32, u32)> = Vec::new();
+    if !shader.user_data.is_empty() {
+        bound.push((2, USER_DATA_SPACE, 0));
+    }
+    let slots = |kind, slots: &[u8]| {
+        let registers = slots.iter().map(|&s| (kind, ROOT_CBV_SPACE, u32::from(s)));
+        registers.collect::<Vec<_>>()
+    };
+    bound.extend(slots(2, &shader.root_cbvs));
+    bound.extend(slots(4, &shader.root_srvs));
+    bound.extend((0..samplers as u32).map(|n| (1, SAMPLER_SPACE, n)));
+    if bindings != bound {
+        return Err(format!(
+            "PSV0 binds {bindings:?} (type, space, register), the host is told {bound:?}"
+        ));
+    }
+
+    // User data.
+    let mut seen = std::collections::HashSet::new();
+    let mut dwords = 0u64;
+    for u in &shader.user_data {
+        if !seen.insert(u.index) {
+            return Err(format!("user-data dword {} is listed twice", u.index));
+        }
+        // A user-data dword arrives in an SGPR, and there are s0 to s105.
+        if u.index >= u32::from(ir::VCC) {
+            return Err(format!("user-data dword {} is no SGPR", u.index));
+        }
+        dwords = dwords.max(u64::from(u.index) + 1);
+        let Some(native) = native else { continue };
+        let from_layout = native.layout.iter().any(|rp| {
+            rp.slot == u.slot
+                && rp.root == u.root
+                && u64::from(rp.user_data) + u64::from(u.dword) == u64::from(u.index)
+        });
+        if !from_layout || !matches!(u.root, RootType::Constants | RootType::Table) {
+            return Err(format!("{u:?} is of no root parameter of the layout"));
+        }
+    }
+    let dwords = dwords.next_multiple_of(4);
+    if u64::from(shader.user_data_dwords()) != dwords {
+        return Err(format!(
+            "a user-data buffer of {} dwords for {dwords} dwords read",
+            shader.user_data_dwords()
+        ));
+    }
+    Ok(())
 }
 
 // The cases.
@@ -1279,12 +1661,159 @@ fn mutated_containers_never_panic() {
     }
 }
 
-/// No input makes the translator loop for long: every case of every kind
-/// is done within two seconds (cases take milliseconds; the rest is for a
-/// loaded or emulated machine).
+/// No input makes the translator loop without end: every case of every
+/// kind finishes, and with the default cases some translate and some are
+/// refused.
+///
+/// The limit per case is [`HANG`], as for the other tests. It was two
+/// seconds of wall-clock time, measured across a channel while the rest
+/// of the test binary (and, under Wine, device tests) runs in parallel: a
+/// case takes milliseconds, but a worker thread the system did not
+/// schedule for two seconds on a loaded or emulated machine failed the
+/// test with nothing wrong in the translator. A short limit measures the
+/// machine. The translator has no counter of work done that a test could
+/// bound instead, so what this proves is the weaker thing that can be
+/// proven reliably: no case runs away. An endless loop still fails, by
+/// its seed, after [`HANG`]; a translation that is merely slow does not,
+/// and no test here claims otherwise.
 #[test]
 fn every_case_finishes_within_its_time_budget() {
-    drive(0x5348_0504_0000_0000, Duration::from_secs(2), any_case);
+    let tally = drive(0x5348_0504_0000_0000, HANG, any_case);
+    if tally.defaults {
+        assert!(tally.translated > 0, "nothing translated: {tally:?}");
+        assert!(tally.translated < tally.cases, "nothing refused: {tally:?}");
+    }
+}
+
+/// The testkit's own programs translate to modules that hold together,
+/// so the [`invariants`] refuse nothing a sound translation has.
+#[test]
+fn the_testkit_programs_hold_together() {
+    for (name, container) in sound() {
+        let shader = emit::translate(&container).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(invariants(&shader, None), Ok(()), "{name}");
+        let c = Container::parse(&container).expect("a testkit container");
+        let part = c.part(FourCC::DXIL).expect("a program");
+        let programs = native_programs(part.data).expect("its programs");
+        let native = programs.iter().find(|p| p.stage == shader.stage);
+        assert!(native.is_some(), "{name}");
+        assert_eq!(invariants(&shader, native), Ok(()), "{name}");
+    }
+}
+
+/// The testkit's named programs.
+fn sound() -> Vec<(&'static str, Vec<u8>)> {
+    vec![
+        ("vs_fullscreen_triangle", testkit::vs_fullscreen_triangle()),
+        ("vs_position_buffer", testkit::vs_position_buffer()),
+        ("ps_constant", testkit::ps_constant([1.0, 0.5, 0.25, 1.0])),
+        ("ps_root_constants", testkit::ps_root_constants()),
+        ("cs_store_root_constant", testkit::cs_store_root_constant()),
+        ("cs_store_words", testkit::cs_store_words(&[7, 9])),
+    ]
+}
+
+/// Where the body of part `name` starts in an emitted container.
+fn part_at(file: &[u8], name: &[u8; 4]) -> usize {
+    let count = u32::from_le_bytes(file[0x1C..0x20].try_into().expect("4 bytes")) as usize;
+    (0..count)
+        .map(|i| {
+            let at = 0x20 + 4 * i;
+            u32::from_le_bytes(file[at..at + 4].try_into().expect("4 bytes")) as usize
+        })
+        .find(|&offset| &file[offset..offset + 4] == name)
+        .expect("the part")
+        + 8
+}
+
+/// The [`invariants`] catch what a wrapped or truncated number in the
+/// translator would leave behind, by value and so in a build without
+/// overflow checks too: each edit below is one such number in an
+/// otherwise sound translation, and each is refused for its own reason.
+/// (Edits inside the container are hashed again, as the emitter hashes
+/// last: a wrong number is not given away by the digest.)
+#[test]
+fn the_invariants_refuse_numbers_that_do_not_match() {
+    let pixel = emit::translate(&testkit::ps_root_constants()).expect("a pixel program");
+    assert_eq!(invariants(&pixel, None), Ok(()));
+    assert!(
+        !pixel.user_data.is_empty(),
+        "a program that reads user data"
+    );
+    let add = |file: &mut Vec<u8>, at: usize, n: u32| {
+        let old = u32::from_le_bytes(file[at..at + 4].try_into().expect("4 bytes"));
+        file[at..at + 4].copy_from_slice(&old.wrapping_add(n).to_le_bytes());
+    };
+    let refused = |what: &str, edit: &dyn Fn(&mut HostShader)| {
+        let mut shader = pixel.clone();
+        edit(&mut shader);
+        if shader.dxil.len() >= 20 {
+            let digest = emit::container_hash(&shader.dxil[20..]);
+            shader.dxil[4..20].copy_from_slice(&digest);
+        }
+        let broken = invariants(&shader, None).expect_err(what);
+        assert!(broken.contains(what), "{what:?} expected, got {broken:?}");
+    };
+    let at = |name: &[u8; 4]| part_at(&pixel.dxil, name);
+    let (psv, program, isg, osg) = (at(b"PSV0"), at(b"DXIL"), at(b"ISG1"), at(b"OSG1"));
+    // The container: a total, a part size and a part offset 4 off, and a
+    // file cut short.
+    refused("the container says", &|s| add(&mut s.dxil, 0x18, 4));
+    refused("the container says", &|s| s.dxil.truncate(s.dxil.len() - 4));
+    refused("not where the one before it ends", &|s| {
+        add(&mut s.dxil, psv - 4, 4)
+    });
+    refused("runs past the file", &|s| add(&mut s.dxil, program - 4, 4));
+    refused("not where the one before it ends", &|s| {
+        add(&mut s.dxil, 0x20 + 4, 4)
+    });
+    // A size that wrapped to a small number, as 2^32 + 8 bytes would.
+    refused("the parts end at", &|s| {
+        let at = program - 4;
+        s.dxil[at..at + 4].copy_from_slice(&8u32.to_le_bytes());
+    });
+    // The program: its size in dwords and its bitcode size.
+    refused("the DXIL part says", &|s| add(&mut s.dxil, program + 4, 1));
+    refused("bytes of bitcode", &|s| {
+        add(&mut s.dxil, program + 20, u32::MAX - 3)
+    });
+    // The signatures: a row count, a register, a name outside the part.
+    refused("ISG1: ", &|s| add(&mut s.dxil, isg, 1 << 27));
+    refused("OSG1: register 32", &|s| add(&mut s.dxil, osg + 8 + 20, 32));
+    refused("OSG1: a name at", &|s| {
+        add(&mut s.dxil, osg + 8 + 4, 0x1000)
+    });
+    // PSV0: an element count cut to a byte, a binding count, a register.
+    refused("PSV0 counts", &|s| s.dxil[psv + 4 + 28] ^= 1);
+    refused("PSV0", &|s| add(&mut s.dxil, psv + 52, 1));
+    refused("PSV0: a binding of several registers", &|s| {
+        add(&mut s.dxil, psv + 60 + 8, 1)
+    });
+    refused("PSV0 binds", &|s| {
+        add(&mut s.dxil, psv + 60 + 8, 1);
+        add(&mut s.dxil, psv + 60 + 12, 1);
+    });
+    // What the host binds.
+    refused("user-data dword", &|s| s.user_data.push(s.user_data[0]));
+    refused("user-data dword 4294967295 is no SGPR", &|s| {
+        s.user_data[0].index = u32::MAX
+    });
+    refused("PSV0 binds", &|s| s.user_data.clear());
+    refused("PSV0 binds", &|s| s.root_cbvs.push(3));
+    refused("name a slot twice", &|s| s.root_srvs.extend([2, 2]));
+    refused("immediate samplers", &|s| s.samplers.push([0; 4]));
+    refused("a translation of stage", &|s| s.stage = HwStage::Hs);
+
+    // With the program at hand: user data of no root parameter.
+    let container = testkit::ps_root_constants();
+    let c = Container::parse(&container).expect("a testkit container");
+    let programs = native_programs(c.part(FourCC::DXIL).expect("a program").data);
+    let native = &programs.expect("its programs")[0];
+    assert_eq!(invariants(&pixel, Some(native)), Ok(()));
+    let mut other = pixel.clone();
+    other.user_data[0].slot ^= 0x40;
+    let broken = invariants(&other, Some(native)).expect_err("a slot of no parameter");
+    assert!(broken.contains("of no root parameter"), "{broken}");
 }
 
 /// The driver reports a panicking case by its seed and how to run it

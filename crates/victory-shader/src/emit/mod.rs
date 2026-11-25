@@ -96,6 +96,10 @@ use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
+/// The container hash, for the tests that check an emitted container
+/// against its own header (`crate::fuzz_tests`).
+#[cfg(test)]
+pub(crate) use container::hash as container_hash;
 pub use sampler::StaticSampler;
 pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 
