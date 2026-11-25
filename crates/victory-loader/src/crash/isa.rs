@@ -238,11 +238,14 @@ fn run(probe: &Probe) -> u32 {
 /// VIctory's handlers and the crash log at `VICTORY_ISA_LOG`. It returns
 /// if the instruction ran or was emulated; else the process ends with the
 /// report.
+///
+/// Ignored in a plain run, so that it is not counted as a test that
+/// passed: it asserts nothing by itself. The parent runs it with
+/// `--ignored`.
 #[test]
+#[ignore = "child process of zen2_instruction_inventory"]
 fn isa_child() {
-    let Ok(which) = std::env::var("VICTORY_ISA") else {
-        return;
-    };
+    let which = std::env::var("VICTORY_ISA").expect("VICTORY_ISA: run by the parent test only");
     if which == "all" {
         // SAFETY: the handler only reads the exception it is given.
         unsafe { AddVectoredExceptionHandler(1, Some(note_and_skip)) };
@@ -279,7 +282,12 @@ enum Outcome {
 
 fn child(envs: &[(&str, &std::ffi::OsStr)]) -> std::process::Output {
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-    command.args(["--exact", "crash::isa::isa_child", "--nocapture"]);
+    command.args([
+        "--ignored",
+        "--exact",
+        "crash::isa::isa_child",
+        "--nocapture",
+    ]);
     for (name, value) in envs {
         command.env(name, value);
     }
