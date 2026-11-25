@@ -193,12 +193,12 @@ impl ImportResolver for HostOnly {
     }
 }
 
-/// title_a.dll's `DllMain` writes the notices it gets to the file
-/// `VICTORY_FIXTURE_LOG` names, which is how tests see initialisation order.
+/// title_a.dll's `DllMain` writes the notices it gets to the log beside
+/// the mapped DLL, which is how tests see initialisation order.
 #[test]
 fn a_title_dll_fixture_logs_its_notices() {
     let folder = tempfile::tempdir().unwrap();
-    let log = folder.path().join("notices.log");
+    let log = notices_in(folder.path());
     let title = tempfile::tempdir().unwrap();
     std::fs::copy(fixture("title_a.dll"), title.path().join("title_a.dll")).unwrap();
     let dlls =
@@ -210,7 +210,6 @@ fn a_title_dll_fixture_logs_its_notices() {
         .unwrap();
     assert_eq!(report.missing, []);
 
-    let _one_log = fixture_log(&log);
     let lines = || -> Vec<String> {
         let text = std::fs::read_to_string(&log).unwrap_or_default();
         text.lines().map(str::to_owned).collect()
@@ -224,23 +223,32 @@ fn a_title_dll_fixture_logs_its_notices() {
     assert_eq!(lines().last().map(String::as_str), Some("title_a 0"));
 }
 
-/// Points `VICTORY_FIXTURE_LOG` at `log` until the guard is dropped. The
-/// variable is the process's, so the tests that log hold this one at a time.
-fn fixture_log(log: &std::path::Path) -> impl Drop {
-    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    struct Guard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            // SAFETY: as for `set_var` below.
-            unsafe { std::env::remove_var("VICTORY_FIXTURE_LOG") };
-        }
+/// The log of the title DLLs mapped from the cache folder `cache`: the
+/// fixtures write their notices to this file beside themselves where it
+/// exists (tests/fixtures/notice_log.rs). The folder is the test's own, so
+/// no other test's DLLs write to it, and nothing the tests share is changed.
+fn notices_in(cache: &std::path::Path) -> std::path::PathBuf {
+    let log = cache.join("fixture-notices.log");
+    std::fs::write(&log, "").unwrap();
+    log
+}
+
+/// The notices of process attach (1) and detach (0) in `log`, in order.
+/// Threads of other tests start and end meanwhile, and the fixtures log
+/// those notices (2 and 3) too. Every line must be a whole notice.
+fn process_notices(log: &std::path::Path) -> Vec<String> {
+    let text = std::fs::read_to_string(log).unwrap();
+    assert!(text.is_empty() || text.ends_with('\n'), "{text:?}");
+    for line in text.lines() {
+        let whole = line
+            .split_once(' ')
+            .is_some_and(|(name, reason)| name.starts_with("title_") && reason.len() == 1);
+        assert!(whole && line.ends_with(['0', '1', '2', '3']), "{text:?}");
     }
-    let guard = Guard(ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner()));
-    // SAFETY: Windows serialises changes to the environment against reads
-    // of it, and only the holders of the lock read this variable: the
-    // fixtures' `DllMain`s, attached by the test that holds it.
-    unsafe { std::env::set_var("VICTORY_FIXTURE_LOG", log) };
-    guard
+    text.lines()
+        .filter(|l| l.ends_with(" 1") || l.ends_with(" 0"))
+        .map(str::to_owned)
+        .collect()
 }
 
 /// A title DLL that cannot be loaded is named in the error.
@@ -399,9 +407,7 @@ fn chain_loads_dependencies_first() {
         inner: &HostOnly,
         dlls: &dlls,
     };
-    let folder = tempfile::tempdir().unwrap();
-    let log = folder.path().join("notices.log");
-    let one_log = fixture_log(&log);
+    let log = notices_in(cache.path());
     for (name, dll) in &dlls {
         let report = dll
             .bind_imports(&resolver, UnimplementedPolicy::Trap)
@@ -421,18 +427,9 @@ fn chain_loads_dependencies_first() {
         // SAFETY: attached above; nothing else uses them.
         unsafe { dll.detach() };
     }
-    drop(one_log);
-    // Process attaches and detaches only: threads of other tests start and
-    // end meanwhile, and the fixtures log those notices too.
-    let text = std::fs::read_to_string(&log).unwrap();
-    let process: Vec<_> = text
-        .lines()
-        .filter(|l| l.ends_with(" 1") || l.ends_with(" 0"))
-        .collect();
     assert_eq!(
-        process,
-        ["title_a 1", "title_b 1", "title_b 0", "title_a 0"],
-        "{text}"
+        process_notices(&log),
+        ["title_a 1", "title_b 1", "title_b 0", "title_a 0"]
     );
 }
 
@@ -674,9 +671,7 @@ fn identical_bytes_under_two_names_are_two_modules() {
     assert!((two.base()..two.base() + size).contains(&address("two.dll")));
 
     // Each is initialised once and told of its end once.
-    let folder = tempfile::tempdir().unwrap();
-    let log = folder.path().join("notices.log");
-    let one_log = fixture_log(&log);
+    let log = notices_in(cache.path());
     for (name, dll) in &dlls {
         let report = dll
             .bind_imports(&resolver, UnimplementedPolicy::Trap)
@@ -689,16 +684,9 @@ fn identical_bytes_under_two_names_are_two_modules() {
         // SAFETY: attached above; nothing else uses it.
         unsafe { dll.detach() };
     }
-    drop(one_log);
-    let text = std::fs::read_to_string(&log).unwrap();
-    let process: Vec<_> = text
-        .lines()
-        .filter(|l| l.ends_with(" 1") || l.ends_with(" 0"))
-        .collect();
     assert_eq!(
-        process,
-        ["title_a 1", "title_a 1", "title_a 0", "title_a 0"],
-        "{text}"
+        process_notices(&log),
+        ["title_a 1", "title_a 1", "title_a 0", "title_a 0"]
     );
 
     // The same name again is the copy that is already mapped.
@@ -706,6 +694,70 @@ fn identical_bytes_under_two_names_are_two_modules() {
         victory_loader::load_title_dll("ONE.DLL", title.path(), cache.path(), &|_| true).unwrap();
     assert_eq!(names(&again), ["one.dll"]);
     assert_eq!(again[0].1.base(), one.base());
+}
+
+/// Two title DLLs with one log are attached and detached while threads
+/// start and end, which they hear of on those threads. Every notice is a
+/// line of its own: a line is written whole or not at all.
+#[test]
+fn notices_from_many_threads_are_whole_lines() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    const STARTERS: usize = 4;
+    const ROUNDS: usize = 40;
+    let title = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let mut dlls = Vec::new();
+    for name in ["one.dll", "two.dll"] {
+        std::fs::copy(fixture("title_a.dll"), title.path().join(name)).unwrap();
+        dlls.extend(
+            victory_loader::load_title_dll(name, title.path(), cache.path(), &|_| true).unwrap(),
+        );
+    }
+    assert_eq!(names(&dlls), ["one.dll", "two.dll"]);
+    for (name, dll) in &dlls {
+        let report = dll
+            .bind_imports(&HostOnly, UnimplementedPolicy::Trap)
+            .unwrap();
+        assert_eq!(report.missing, [], "{name}");
+    }
+    let log = notices_in(cache.path());
+
+    static DONE: AtomicBool = AtomicBool::new(false);
+    let starters: Vec<_> = (0..STARTERS)
+        .map(|_| {
+            std::thread::spawn(|| {
+                let mut started = 0usize;
+                while !DONE.load(Ordering::Relaxed) {
+                    std::thread::spawn(|| ()).join().unwrap();
+                    started += 1;
+                }
+                started
+            })
+        })
+        .collect();
+    for _ in 0..ROUNDS {
+        for (_, dll) in &dlls {
+            // SAFETY: bound, and it depends on no other title DLL.
+            unsafe { dll.attach() }.unwrap();
+        }
+        // Long enough for threads to start and end while both are attached.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        for (_, dll) in dlls.iter().rev() {
+            // SAFETY: attached above; nothing else calls into it.
+            unsafe { dll.detach() };
+        }
+    }
+    DONE.store(true, Ordering::Relaxed);
+    let started: usize = starters.into_iter().map(|s| s.join().unwrap()).sum();
+    assert!(started > 0);
+
+    // Checks every line, the threads' too.
+    let process = process_notices(&log);
+    let round = ["title_a 1", "title_a 1", "title_a 0", "title_a 0"];
+    assert_eq!(process.len(), ROUNDS * round.len(), "{process:?}");
+    for (i, notices) in process.chunks(round.len()).enumerate() {
+        assert_eq!(notices, round, "round {i}");
+    }
 }
 
 /// What the module-handle slot of `image`'s delay-load descriptor for

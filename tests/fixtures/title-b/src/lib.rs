@@ -2,10 +2,13 @@
 //! `title_a.dll`, so the two form a chain, and it forwards exports: to
 //! `title_a.dll` by name and by ordinal, and to a DLL of the host. It
 //! delay-loads `title_quiet.dll` (see build.rs). Its `DllMain` writes every
-//! notice it gets to the file `VICTORY_FIXTURE_LOG` names.
+//! notice it gets to a log (see notice_log.rs: a file beside the DLL, or the
+//! one `VICTORY_FIXTURE_LOG` names).
 
 use std::ffi::c_void;
-use std::io::Write;
+
+#[path = "../../notice_log.rs"]
+mod notice_log;
 
 /// What `title_b_chain` adds to the value it gets from `title_a.dll`.
 const CHAIN: u32 = 0x0B00_0000;
@@ -57,21 +60,7 @@ std::arch::global_asm!(
 );
 
 #[unsafe(no_mangle)]
-pub extern "system" fn DllMain(_: *mut c_void, reason: u32, _: *mut c_void) -> i32 {
-    log("title_b", reason);
+pub extern "system" fn DllMain(module: *mut c_void, reason: u32, _: *mut c_void) -> i32 {
+    notice_log::log(module, "title_b", reason);
     1
-}
-
-/// Appends "<name> <reason>" to the file `VICTORY_FIXTURE_LOG` names.
-fn log(name: &str, reason: u32) {
-    let Some(path) = std::env::var_os("VICTORY_FIXTURE_LOG") else {
-        return;
-    };
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path);
-    if let Ok(mut file) = file {
-        let _ = writeln!(file, "{name} {reason}");
-    }
 }

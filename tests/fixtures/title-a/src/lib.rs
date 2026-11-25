@@ -1,11 +1,14 @@
 //! A DLL a stand-in title ships (`title_a.dll`), written by us. It exports a
 //! function by name, a function by ordinal only and a data symbol, and its
-//! `DllMain` writes every notice it gets to the file `VICTORY_FIXTURE_LOG`
-//! names. With `VICTORY_FIXTURE_STUCK` set, it does not return from the
-//! notice that the process ends.
+//! `DllMain` writes every notice it gets to a log (see notice_log.rs: a file
+//! beside the DLL, or the one `VICTORY_FIXTURE_LOG` names). With
+//! `VICTORY_FIXTURE_STUCK` set, it does not return from the notice that the
+//! process ends.
 
 use std::ffi::c_void;
-use std::io::Write;
+
+#[path = "../../notice_log.rs"]
+mod notice_log;
 
 /// What `title_a_named` returns.
 const NAMED: u32 = 0x0A00_0001;
@@ -38,8 +41,8 @@ std::arch::global_asm!(
 );
 
 #[unsafe(no_mangle)]
-pub extern "system" fn DllMain(_: *mut c_void, reason: u32, _: *mut c_void) -> i32 {
-    log("title_a", reason);
+pub extern "system" fn DllMain(module: *mut c_void, reason: u32, _: *mut c_void) -> i32 {
+    notice_log::log(module, "title_a", reason);
     // Told to, it never comes back from the notice of the process's end,
     // as detach code does that waits for a lock a thread held when it was
     // ended.
@@ -52,17 +55,3 @@ pub extern "system" fn DllMain(_: *mut c_void, reason: u32, _: *mut c_void) -> i
 }
 
 const DLL_PROCESS_DETACH: u32 = 0;
-
-/// Appends "<name> <reason>" to the file `VICTORY_FIXTURE_LOG` names.
-fn log(name: &str, reason: u32) {
-    let Some(path) = std::env::var_os("VICTORY_FIXTURE_LOG") else {
-        return;
-    };
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path);
-    if let Ok(mut file) = file {
-        let _ = writeln!(file, "{name} {reason}");
-    }
-}
