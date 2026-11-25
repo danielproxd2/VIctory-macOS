@@ -45,7 +45,7 @@ title's), so a run finds them under the names it gives them itself.
 | `victory-game` | Grand Theft Auto VI-specific formats, build identities, hooks |
 | `apps/victory` | command-line front end |
 | `xtask` | asset-policy check, git hooks |
-| `tests/fixtures` | a workspace of its own: `hle-probe`, a stand-in "title" (our own code) for loader tests, `hle-probe-exe`, the same as an executable with its own entry point and static TLS, and the DLLs a title ships (`title-a`, `title-b`, `title-quiet`, and `title-loop-a` and `title-loop-b`, which import each other), and `title-unwind`, a DLL that panics, faults and throws, built with a profile of its own (`unwind`) |
+| `tests/fixtures` | a workspace of its own: `hle-probe`, a stand-in "title" (our own code) for loader tests, `hle-probe-exe`, the same as an executable with its own entry point and static TLS, and the DLLs a title ships (`title-a`, `title-b`, `title-quiet`, and `title-loop-a` and `title-loop-b`, which import each other), `title-unwind`, a DLL that panics, faults and throws, built with a profile of its own (`unwind`), and `title-draw`, a title that imports the graphics runtime and draws a triangle (its source, `draw_title.rs`, is also run by the tests of `victory-gpu` and `victory-hle` directly) |
 
 Everything except `victory-game` is platform-level and can be tested with
 any Xbox Series title.
