@@ -691,6 +691,9 @@ void main(uint3 id : SV_DispatchThreadID) {
             use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
             (0..256u64)
                 .map(|k| 0x40_0000_0000 + (k << 28))
+                // Wine on macOS gives nothing between 0xf_c000_0000 and
+                // 0x70_0000_0000 (measured); there, further up, below 2^40.
+                .chain((0..256u64).map(|k| 0x80_0000_0000 + (k << 28)))
                 // SAFETY: a fresh allocation where nothing is mapped, or none.
                 .map(|hint| unsafe { VirtualAlloc(hint as *const _, pages * PAGE, MEM_RESERVE | MEM_COMMIT | crate::watch::tests::MEM_WRITE_WATCH, PAGE_READWRITE) } as usize)
                 .find(|&p| p != 0)
@@ -821,6 +824,8 @@ void main() {
         // A page of title memory below 2^40, write-watched as the pools.
         let p = (0..256u64)
             .map(|k| 0x50_0000_0000 + (k << 28))
+            // As in the test above: where Wine on macOS has room.
+            .chain((0..256u64).map(|k| 0x90_0000_0000 + (k << 28)))
             // SAFETY: a fresh allocation where nothing is mapped, or none.
             .map(|hint| unsafe { VirtualAlloc(hint as *const _, PAGE, MEM_RESERVE | MEM_COMMIT | crate::watch::tests::MEM_WRITE_WATCH, PAGE_READWRITE) } as usize)
             .find(|&p| p != 0)
