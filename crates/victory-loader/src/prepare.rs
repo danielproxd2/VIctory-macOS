@@ -162,7 +162,7 @@ const CALLBACKS_FIELD_ODD_RELOCATION: &str =
 const RELOCATIONS_OUTSIDE_SECTIONS: &str = "base relocation directory is outside the sections";
 const RELOCATION_BLOCK_MALFORMED: &str = "malformed base relocation block";
 const RELOCATION_BLOCK_ZERO_NOT_LAST: &str =
-    "a base relocation block of size 0 is followed by more of the table";
+    "a base relocation block of size 0 is followed by bytes that are not zero";
 
 /// One entry of the base relocation table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,12 +217,17 @@ fn base_relocations(bytes: &[u8], info: &ImageInfo) -> Result<Vec<BaseRelocation
         at.checked_add(4).and_then(|at| layout::read_u32(table, at)),
     ) {
         // A block of size 0 ends the table for Wine's loader. Whether the
-        // Windows loader stops there too is not established, so only the
-        // case where it cannot matter is accepted: nothing follows the
-        // block. Bytes after it may be entries one loader applies and
-        // another never sees, and those could not be disarmed.
+        // Windows loader stops there too is not established, so only what
+        // cannot matter is accepted behind it: zero bytes up to the end of
+        // the directory, which arm nothing however a loader reads them (a
+        // header of zeros is again a block of size 0, and fewer than 8
+        // bytes hold no header). Anything else behind the block may be
+        // entries one loader applies and another never sees, and those
+        // could not be disarmed. (Neither half of this rule has been
+        // checked against what a real linker writes.)
         if block == 0 {
-            if at + 8 != table.len() {
+            // Both fields were read, so the header's 8 bytes are there.
+            if table[at + 8..].iter().any(|&b| b != 0) {
                 return Err(PrepareError::Patch(RELOCATION_BLOCK_ZERO_NOT_LAST));
             }
             break;
@@ -783,7 +788,7 @@ mod tests {
                 "block size {size}"
             );
         }
-        // A block of size 0 with the rest of the table behind it: see
+        // A block of size 0 with an entry behind it: see
         // `a_zero_sized_relocation_block_must_be_the_last`.
         let mut bytes = built.bytes.clone();
         write_u32(&mut bytes, block_size, 0).unwrap();
@@ -856,6 +861,89 @@ mod tests {
         // The 12-byte block's entry and its padding; nothing from the end.
         assert_eq!(relocations.len(), 2);
         assert!(relocations.iter().all(|r| r.kind == REL_BASED_ABSOLUTE));
+    }
+
+    /// What follows a block of size 0 inside the directory may be zero
+    /// bytes (padding, which arms nothing) and nothing else. The image has
+    /// the DIR64 block on the callbacks field (12 bytes), the zero block
+    /// (8) and 12 more bytes; the directory is cut to each length from the
+    /// zero block's end onwards, with each one of the bytes behind the
+    /// block set in turn.
+    #[test]
+    fn only_zero_bytes_may_follow_a_zero_sized_relocation_block() {
+        const BEFORE: u32 = 12 + 8;
+        const BEHIND: usize = 12;
+        let page = tls_directory_page();
+        let field = [(reloc::DIR64, layout::TLS64_ADDRESS_OF_CALLBACKS as u16)];
+        let built = title()
+            .tls_without_callbacks()
+            .reloc_block(page, &field)
+            .reloc_block(0, &[])
+            .reloc_block(0, &[(reloc::ABSOLUTE, 0)])
+            .build()
+            .unwrap();
+        let mut bytes = built.bytes;
+        let directory = layout::data_directory_offset(&bytes, dir::BASERELOC).unwrap();
+        let size = directory + 4;
+        assert_eq!(
+            layout::read_u32(&bytes, size),
+            Some(BEFORE + BEHIND as u32),
+            "the three blocks"
+        );
+        let entry = first_relocation_entry(&bytes);
+        let zero = entry - 8 + 12;
+        let behind = zero + 8;
+        assert_eq!(layout::read_u32(&bytes, zero + 4), Some(8));
+        write_u32(&mut bytes, zero + 4, 0).unwrap();
+        // The third block as the linker-style builder wrote it is not
+        // padding: its size field says 12.
+        assert_eq!(patch_error(prepare(&bytes)), RELOCATION_BLOCK_ZERO_NOT_LAST);
+        bytes[behind..behind + BEHIND].fill(0);
+
+        for kept in 0..=BEHIND {
+            write_u32(&mut bytes, size, BEFORE + kept as u32).unwrap();
+            // Zeros only: prepared, with the entry on the field disarmed
+            // and nothing read from behind the zero block.
+            let prepared = prepare(&bytes).unwrap_or_else(|e| panic!("{kept} zero bytes: {e}"));
+            assert_eq!(
+                prepared.bytes[entry..entry + 2],
+                [0, 0],
+                "{kept} zero bytes"
+            );
+            let info = ImageInfo::parse(&prepared.bytes).unwrap();
+            let relocations = base_relocations(&prepared.bytes, &info).unwrap();
+            assert_eq!(relocations.len(), 2, "{kept} zero bytes");
+            assert!(relocations.iter().all(|r| r.kind == REL_BASED_ABSOLUTE));
+
+            for set in 0..BEHIND {
+                for value in [1u8, 0x80] {
+                    let mut bytes = bytes.clone();
+                    bytes[behind + set] = value;
+                    let result = prepare(&bytes);
+                    let told = format!("byte {set} of {kept} behind the block is {value:#x}");
+                    if set < kept {
+                        // In the directory: refused, one byte or many,
+                        // whether or not a block header fits there.
+                        assert_eq!(
+                            patch_error(result),
+                            RELOCATION_BLOCK_ZERO_NOT_LAST,
+                            "{told}"
+                        );
+                        let info = ImageInfo::parse(&bytes).unwrap();
+                        assert!(
+                            matches!(
+                                base_relocations(&bytes, &info),
+                                Err(PrepareError::Patch(RELOCATION_BLOCK_ZERO_NOT_LAST))
+                            ),
+                            "{told}"
+                        );
+                    } else {
+                        // Past the directory's end: not part of the table.
+                        assert!(result.is_ok(), "{told}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
