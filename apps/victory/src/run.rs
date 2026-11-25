@@ -1,9 +1,13 @@
+use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 
 use crate::{Console, Unimplemented};
 
+/// Prepares, maps and binds the title `exe`, and with `execute` starts it
+/// and waits for its entry point to return. What is known before the title
+/// runs, and how it ended, goes to `out`.
 #[cfg(windows)]
 pub fn run(
     exe: &Path,
@@ -11,10 +15,11 @@ pub fn run(
     strict: bool,
     execute: bool,
     console: Console,
+    out: &mut dyn Write,
 ) -> Result<()> {
     use std::sync::Arc;
     use victory_hle::{HleResolver, HostPolicy};
-    use victory_loader::{BindReport, UnimplementedPolicy, WithTitleDlls};
+    use victory_loader::{UnimplementedPolicy, WithTitleDlls};
 
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
@@ -23,8 +28,8 @@ pub fn run(
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
     match victory_game::identify(&hash) {
-        Some(build) => println!("build          {} ({hash})", build.label),
-        None => println!("build          unknown ({hash})"),
+        Some(build) => writeln!(out, "build          {} ({hash})", build.label)?,
+        None => writeln!(out, "build          unknown ({hash})")?,
     }
 
     let images = cfg.cache_subdir("images")?;
@@ -32,11 +37,12 @@ pub fn run(
     let image = victory_loader::load(&prepared, &images)?;
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
-    println!(
+    writeln!(
+        out,
         "mapped at      {:#x} (preferred {:#x})",
         image.base(),
         image.info().image_base
-    );
+    )?;
     let resolver = HleResolver::new(if strict {
         HostPolicy::none()
     } else {
@@ -50,16 +56,17 @@ pub fn run(
     let manifest = std::fs::read(title_dir.join("MicrosoftGame.config")).unwrap_or_default();
     let manifest = victory_hle::runtime::Title::read_manifest(&manifest);
     for refused in &manifest.refused {
-        println!("manifest       not taken as it stands: {refused}");
+        writeln!(out, "manifest       not taken as it stands: {refused}")?;
     }
     let title = manifest.title;
     let storage = cfg.data_subdir(&format!("{:08X}/storage", title.id))?;
-    println!(
+    writeln!(
+        out,
         "title          {:08X}, storage {} ({} MB)",
         title.id,
         storage.display(),
         title.storage_bytes >> 20
-    );
+    )?;
     // The console's fixed drives: the package as `G:`, temporary files `T:`.
     victory_hle::modules::files::mount_at('G', title_dir);
     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
@@ -69,10 +76,14 @@ pub fn run(
         Console::SeriesX => victory_hle::console::Console::SeriesX,
         Console::SeriesS => victory_hle::console::Console::SeriesS,
     });
-    println!("console        {}", victory_hle::console::current().name());
+    writeln!(
+        out,
+        "console        {}",
+        victory_hle::console::current().name()
+    )?;
     let dlls = victory_loader::load_title_dlls(image.info(), title_dir, &images, &wanted)?;
     for (name, dll) in &dlls {
-        println!("title dll      {name} at {:#x}", dll.base());
+        writeln!(out, "title dll      {name} at {:#x}", dll.base())?;
         victory_hle::runtime::set_image_path(dll.base(), &title_dir.join(name));
     }
 
@@ -84,27 +95,19 @@ pub fn run(
         inner: &resolver,
         dlls: &dlls,
     };
-    let show = |name: &str, report: BindReport| {
-        println!(
-            "bound          {name}: {} hle, {} host, {} title, {} missing",
-            report.hle,
-            report.host,
-            report.title,
-            report.missing.len()
-        );
-        for m in &report.missing {
-            println!("  missing      {}!{}", m.dll, m.symbol);
-        }
-    };
     for (name, dll) in &dlls {
-        show(name, dll.bind_imports(&with_dlls, policy)?);
+        let report = dll.bind_imports(&with_dlls, policy)?;
+        out.write_all(bound(name, &report).as_bytes())?;
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
-    show(&exe_name, image.bind_imports(&with_dlls, policy)?);
+    let report = image.bind_imports(&with_dlls, policy)?;
+    out.write_all(bound(&exe_name, &report).as_bytes())?;
     if !execute {
-        println!("not executing (pass --execute to start the title)");
+        writeln!(out, "not executing (pass --execute to start the title)")?;
         return Ok(());
     }
+    // Whoever reads the report sees it before the title says anything.
+    out.flush()?;
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
@@ -119,15 +122,32 @@ pub fn run(
         lock: LoaderLock::default(),
     };
     victory_hle::runtime::set_title_dll_loader(Box::new(move |file| {
-        late.load(file, show).map_err(|e| format!("{e:#}"))
+        late.load(file).map_err(|e| format!("{e:#}"))
     }));
     // SAFETY: imports are bound; from here on we run title code.
     let main = unsafe { Arc::new(image).spawn_main(dlls)? };
     let code = main
         .join()
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
-    println!("title exited with {code}");
+    writeln!(out, "title exited with {code}")?;
     Ok(())
+}
+
+/// The lines of the report about one image's imports: who provides how
+/// many, and each one nobody provides, by name.
+#[cfg(windows)]
+fn bound(name: &str, report: &victory_loader::BindReport) -> String {
+    let mut text = format!(
+        "bound          {name}: {} hle, {} host, {} title, {} missing\n",
+        report.hle,
+        report.host,
+        report.title,
+        report.missing.len()
+    );
+    for m in &report.missing {
+        text.push_str(&format!("  missing      {}!{}\n", m.dll, m.symbol));
+    }
+    text
 }
 
 /// The debugging aids (README): scheduled stack dumps, watched values and
@@ -209,11 +229,10 @@ impl LateDlls {
     /// image called `file`, mapping it and the title DLLs it needs first,
     /// binding them and running their `DllMain` on the calling thread, as
     /// the Windows loader would; `None` if `file` is no title image.
-    fn load(
-        &self,
-        file: &str,
-        show: impl Fn(&str, victory_loader::BindReport),
-    ) -> Result<Option<usize>> {
+    ///
+    /// What it maps is reported on standard output, not to the writer
+    /// `run` was given: this runs later, on the title's threads.
+    fn load(&self, file: &str) -> Result<Option<usize>> {
         use victory_hle::runtime::{forget_image, image_named, set_image_path};
         // Waits while another thread initialises a DLL; a `DllMain` that
         // loads another DLL re-enters.
@@ -244,7 +263,8 @@ impl LateDlls {
                         "title dll      {name} at {:#x} (loaded by the title)",
                         dll.base()
                     );
-                    show(name, dll.bind_imports(&resolver, self.policy)?);
+                    let report = dll.bind_imports(&resolver, self.policy)?;
+                    print!("{}", bound(name, &report));
                     set_image_path(dll.base(), &self.title_dir.join(name));
                 }
                 // Visible before their `DllMain`s run, which may load more.
@@ -318,6 +338,31 @@ impl LoaderLock {
 mod tests {
     use std::sync::{Arc, Mutex};
 
+    use victory_loader::{BindReport, MissingImport};
+
+    #[test]
+    fn the_bind_report_names_each_missing_import() {
+        let mut report = BindReport {
+            hle: 2,
+            host: 12,
+            title: 1,
+            missing: Vec::new(),
+        };
+        assert_eq!(
+            super::bound("title.exe", &report),
+            "bound          title.exe: 2 hle, 12 host, 1 title, 0 missing\n"
+        );
+        report.missing.push(MissingImport {
+            dll: "nobody.dll".into(),
+            symbol: "Nothing".into(),
+        });
+        assert_eq!(
+            super::bound("a.dll", &report),
+            "bound          a.dll: 2 hle, 12 host, 1 title, 1 missing\n  \
+             missing      nobody.dll!Nothing\n"
+        );
+    }
+
     #[test]
     fn loader_lock_is_reentrant_and_exclusive() {
         let lock = Arc::new(super::LoaderLock::default());
@@ -338,6 +383,43 @@ mod tests {
 }
 
 #[cfg(not(windows))]
-pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<()> {
+pub fn run(
+    _: &Path,
+    _: Unimplemented,
+    _: bool,
+    _: bool,
+    _: Console,
+    _: &mut dyn Write,
+) -> Result<()> {
     anyhow::bail!("running titles requires Windows")
+}
+
+#[cfg(all(test, not(windows)))]
+mod tests {
+    use std::path::Path;
+
+    use crate::testing::report;
+    use crate::{Console, Unimplemented};
+
+    /// The loader is the Windows loader: on another host `run` says so,
+    /// with or without `--execute`, and reports nothing.
+    #[test]
+    fn run_needs_windows() {
+        for execute in [false, true] {
+            let (text, result) = report(|out| {
+                let exe = Path::new("title.exe");
+                super::run(
+                    exe,
+                    Unimplemented::Trap,
+                    false,
+                    execute,
+                    Console::SeriesX,
+                    out,
+                )
+            });
+            let error = result.expect_err("no loader here").to_string();
+            assert_eq!(error, "running titles requires Windows");
+            assert_eq!(text, "");
+        }
+    }
 }

@@ -180,7 +180,7 @@ fn dispatch(cli: Cli, out: &mut dyn Write) -> Result<()> {
             execute,
             console,
             title_args: _,
-        } => run::run(&exe, unimplemented, strict, execute, console),
+        } => run::run(&exe, unimplemented, strict, execute, console, out),
         Command::Config => show_config(
             &victory_core::Config::load()?,
             &|path| victory_core::ensure_outside_repo(path).map_err(|e| e.to_string()),
