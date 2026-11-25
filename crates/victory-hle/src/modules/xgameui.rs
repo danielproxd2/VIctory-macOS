@@ -273,15 +273,44 @@ mod dialog {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
     use windows_sys::Win32::UI::WindowsAndMessaging::{self as wm, DLGTEMPLATE};
 
-    const EDIT: i32 = 100;
+    pub(super) const EDIT: i32 = 100;
     // Edit control messages (the controls headers).
     const EM_SETSEL: u32 = 0xb1;
     const EM_LIMITTEXT: u32 = 0xc5;
 
-    /// The dialog's state, behind its user data while it runs.
-    struct Entry {
+    /// A text entry dialog's state, behind its user data while it runs.
+    pub(super) struct Entry {
         max: u32,
-        typed: Option<String>,
+        /// What the edit box held when OK was pressed.
+        pub(super) typed: Option<String>,
+        /// A command has ended the dialog.
+        pub(super) ended: bool,
+        /// Run by `Template::run`, which a procedure leaves with
+        /// `EndDialog`; a dialog a test created without showing it is not,
+        /// and its creator destroys it.
+        modal: bool,
+    }
+
+    /// A message dialog's state, behind its user data while it runs.
+    pub(super) struct Shown {
+        /// Index of the button that has the focus first.
+        default: u32,
+        /// Index of the button pressed.
+        pub(super) pressed: Option<u32>,
+        pub(super) ended: bool,
+        modal: bool,
+    }
+
+    /// Ends a dialog from its procedure. `EndDialog` is for modal dialogs
+    /// only; any other is left to whoever created it.
+    ///
+    /// # Safety
+    /// `dialog` is the dialog whose procedure is running.
+    unsafe fn end(dialog: HWND, modal: bool) {
+        if modal {
+            // SAFETY: the caller's.
+            unsafe { wm::EndDialog(dialog, 1) };
+        }
     }
 
     /// An in-memory dialog template (dialog units, the system font): a
@@ -328,23 +357,45 @@ mod dialog {
             self.0.push(0); // no creation data
         }
 
-        /// Runs the dialog modally; what its procedure ended it with, 0 or
-        /// less if it could not be shown.
-        fn run(
-            &self,
-            procedure: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> isize,
-            parameter: LPARAM,
-        ) -> isize {
-            // The template must start on a DWORD.
-            let template: Vec<u32> = self
-                .0
+        /// The template as the system takes it: it must start on a DWORD.
+        fn aligned(&self) -> Vec<u32> {
+            self.0
                 .chunks(2)
                 .map(|c| u32::from(c[0]) | u32::from(c.get(1).copied().unwrap_or(0)) << 16)
-                .collect();
+                .collect()
+        }
+
+        /// Runs the dialog modally until its procedure ends it (with 1);
+        /// false if it could not be shown (the call then returns 0 or -1).
+        fn run(&self, procedure: Procedure, parameter: LPARAM) -> bool {
+            let template = self.aligned();
             // SAFETY: a complete template and one of our dialog procedures;
             // the caller keeps what `parameter` points at alive meanwhile.
-            unsafe {
+            let ended = unsafe {
                 wm::DialogBoxIndirectParamW(
+                    GetModuleHandleW(std::ptr::null()),
+                    template.as_ptr().cast::<DLGTEMPLATE>(),
+                    std::ptr::null_mut(),
+                    Some(procedure),
+                    parameter,
+                )
+            };
+            ended > 0
+        }
+
+        /// Creates the dialog and its controls without showing anything:
+        /// the same template and procedure, but never visible, never
+        /// topmost or in the foreground, and disabled, so that it takes
+        /// neither the focus nor the activation from what the user is
+        /// doing. Null if no window can be created.
+        #[cfg(test)]
+        fn create_hidden(&self, procedure: Procedure, parameter: LPARAM) -> HWND {
+            let mut template = self.aligned();
+            template[0] = template[0] & !(wm::DS_SETFOREGROUND as u32) | wm::WS_DISABLED;
+            template[1] = wm::WS_EX_NOACTIVATE;
+            // SAFETY: as in `run`.
+            unsafe {
+                wm::CreateDialogIndirectParamW(
                     GetModuleHandleW(std::ptr::null()),
                     template.as_ptr().cast::<DLGTEMPLATE>(),
                     std::ptr::null_mut(),
@@ -355,10 +406,11 @@ mod dialog {
         }
     }
 
+    type Procedure = unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> isize;
+
     /// The description, an edit box with the default text, OK and Cancel;
     /// Enter accepts, Esc cancels.
-    #[allow(dead_code)] // unused in test builds
-    pub(super) fn ask(title: &str, description: &str, default: &str, max: u32) -> Option<String> {
+    fn ask_template(title: &str, description: &str, default: &str) -> Template {
         let mut t = Template::new(title, 4, 240, 62);
         let tab = wm::WS_TABSTOP;
         t.item(0, [7, 7, 226, 10], 0xffff, LABEL, description);
@@ -374,9 +426,21 @@ mod dialog {
             BUTTON,
             "Cancel",
         );
-        let mut entry = Entry { max, typed: None };
+        t
+    }
+
+    /// Asks for a text in a modal dialog; `None` if it is cancelled, closed
+    /// or cannot be shown.
+    #[allow(dead_code)] // unused in most test builds
+    pub(super) fn ask(title: &str, description: &str, default: &str, max: u32) -> Option<String> {
+        let mut entry = Entry {
+            max,
+            typed: None,
+            ended: false,
+            modal: true,
+        };
         // `entry` outlives the modal dialog.
-        t.run(procedure, (&raw mut entry) as LPARAM);
+        ask_template(title, description, default).run(procedure, (&raw mut entry) as LPARAM);
         entry.typed
     }
 
@@ -384,15 +448,13 @@ mod dialog {
     pub(super) const FIRST_BUTTON: i32 = 200;
 
     /// The text and a button for each label given, right-aligned in their
-    /// order; `default` has the focus and takes Enter. The index of the
-    /// button pressed; `None` for Esc, the close box, or no dialog.
-    #[allow(dead_code)] // unused in test builds
-    pub(super) fn message(
+    /// order; `default` takes Enter.
+    fn message_template(
         title: &str,
         content: &str,
         buttons: &[Option<String>; 3],
         default: u32,
-    ) -> Option<u32> {
+    ) -> Template {
         // Room for the text: about 55 characters a line, at most 12 lines.
         let lines: usize = content.lines().map(|l| l.chars().count() / 55 + 1).sum();
         let text_height = 8 * lines.clamp(1, 12) as u16 + 2;
@@ -415,11 +477,28 @@ mod dialog {
             t.item(kind as u32 | wm::WS_TABSTOP, rect, id, BUTTON, label);
             x += 74;
         }
-        match t.run(message_procedure, default as LPARAM) {
-            // The procedure ends the dialog with the button's index + 1.
-            pressed @ 1..=3 => Some(pressed as u32 - 1),
-            _ => None,
-        }
+        t
+    }
+
+    /// Shows the message modally, `default` focused. The index of the
+    /// button pressed; `None` for Esc, the close box, or no dialog.
+    #[allow(dead_code)] // unused in most test builds
+    pub(super) fn message(
+        title: &str,
+        content: &str,
+        buttons: &[Option<String>; 3],
+        default: u32,
+    ) -> Option<u32> {
+        let mut shown = Shown {
+            default,
+            pressed: None,
+            ended: false,
+            modal: true,
+        };
+        // `shown` outlives the modal dialog.
+        let template = message_template(title, content, buttons, default);
+        template.run(message_procedure, (&raw mut shown) as LPARAM);
+        shown.pressed
     }
 
     extern "system" fn message_procedure(
@@ -428,30 +507,39 @@ mod dialog {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> isize {
-        // SAFETY: our dialog; plain window calls on it and its controls.
+        // SAFETY: our dialog; its user data is the `Shown` from `message`,
+        // stored at WM_INITDIALOG; plain window calls on it and its
+        // controls.
         unsafe {
             match message {
                 wm::WM_INITDIALOG => {
-                    // `lparam` is the default button's index.
-                    let button = wm::GetDlgItem(dialog, FIRST_BUTTON + lparam as i32);
+                    wm::SetWindowLongPtrW(dialog, wm::GWLP_USERDATA, lparam);
+                    let shown = &*(lparam as *const Shown);
+                    let button = wm::GetDlgItem(dialog, FIRST_BUTTON + shown.default as i32);
                     if button.is_null() {
                         return 1; // none such: the system picks the focus
                     }
                     SetFocus(button);
                     0 // focus set here
                 }
-                wm::WM_COMMAND => match (wparam & 0xffff) as i32 {
-                    // Only a button the dialog has can be pressed.
-                    id @ FIRST_BUTTON..=202 if !wm::GetDlgItem(dialog, id).is_null() => {
-                        wm::EndDialog(dialog, (id - FIRST_BUTTON + 1) as isize);
-                        1
+                wm::WM_COMMAND => {
+                    let shown = wm::GetWindowLongPtrW(dialog, wm::GWLP_USERDATA) as *mut Shown;
+                    let Some(shown) = shown.as_mut() else {
+                        return 0; // before WM_INITDIALOG
+                    };
+                    match (wparam & 0xffff) as i32 {
+                        // Only a button the dialog has can be pressed.
+                        id @ FIRST_BUTTON..=202 if !wm::GetDlgItem(dialog, id).is_null() => {
+                            shown.pressed = Some((id - FIRST_BUTTON) as u32);
+                        }
+                        // Esc and the close box.
+                        wm::IDCANCEL => {}
+                        _ => return 0,
                     }
-                    wm::IDCANCEL => {
-                        wm::EndDialog(dialog, 0);
-                        1
-                    }
-                    _ => 0,
-                },
+                    shown.ended = true;
+                    end(dialog, shown.modal);
+                    1
+                }
                 _ => 0,
             }
         }
@@ -477,8 +565,10 @@ mod dialog {
                     0 // focus set here
                 }
                 wm::WM_COMMAND => {
-                    let entry =
-                        &mut *(wm::GetWindowLongPtrW(dialog, wm::GWLP_USERDATA) as *mut Entry);
+                    let entry = wm::GetWindowLongPtrW(dialog, wm::GWLP_USERDATA) as *mut Entry;
+                    let Some(entry) = entry.as_mut() else {
+                        return 0; // before WM_INITDIALOG
+                    };
                     match (wparam & 0xffff) as i32 {
                         wm::IDOK => {
                             let mut buffer =
@@ -487,18 +577,145 @@ mod dialog {
                                 wm::GetWindowTextW(edit, buffer.as_mut_ptr(), buffer.len() as i32);
                             entry.typed =
                                 Some(String::from_utf16_lossy(&buffer[..n.max(0) as usize]));
-                            wm::EndDialog(dialog, 1);
                         }
-                        wm::IDCANCEL => {
-                            wm::EndDialog(dialog, 0);
-                        }
+                        wm::IDCANCEL => {}
                         _ => return 0,
                     }
+                    entry.ended = true;
+                    end(dialog, entry.modal);
                     1
                 }
                 _ => 0,
             }
         }
+    }
+
+    /// A dialog of ours that exists without being shown, for tests: its
+    /// controls take commands as a shown dialog's do, and nothing appears
+    /// on the desktop. Destroyed when dropped.
+    #[cfg(test)]
+    pub(super) struct Hidden<T> {
+        window: HWND,
+        state: *mut T,
+    }
+
+    #[cfg(test)]
+    impl<T> Hidden<T> {
+        fn create(template: &Template, procedure: Procedure, state: T) -> Option<Hidden<T>> {
+            let state = Box::into_raw(Box::new(state));
+            let window = template.create_hidden(procedure, state as LPARAM);
+            let hidden = Hidden { window, state };
+            (!window.is_null()).then_some(hidden)
+        }
+
+        /// The dialog's state as its procedure left it.
+        pub(super) fn state(&self) -> &T {
+            // SAFETY: ours until dropped; the procedure runs only inside
+            // the calls below.
+            unsafe { &*self.state }
+        }
+
+        /// Sends the dialog what pressing its control `id` sends.
+        pub(super) fn command(&self, id: i32) {
+            // SAFETY: our dialog, on the thread that created it, so its
+            // procedure has run when the call returns.
+            unsafe { wm::SendMessageW(self.window, wm::WM_COMMAND, id as WPARAM, 0) };
+        }
+
+        fn control(&self, id: i32) -> HWND {
+            // SAFETY: our dialog.
+            unsafe { wm::GetDlgItem(self.window, id) }
+        }
+
+        /// Whether the dialog has a control `id`.
+        pub(super) fn has(&self, id: i32) -> bool {
+            !self.control(id).is_null()
+        }
+
+        /// The text of the control `id`.
+        pub(super) fn text(&self, id: i32) -> String {
+            let mut buffer = [0u16; 256];
+            // SAFETY: our control; the buffer's length is passed.
+            let n = unsafe { wm::GetWindowTextW(self.control(id), buffer.as_mut_ptr(), 256) };
+            String::from_utf16_lossy(&buffer[..n.max(0) as usize])
+        }
+
+        /// Whether the control `id` is the button Enter presses.
+        pub(super) fn is_default(&self, id: i32) -> bool {
+            // SAFETY: our control.
+            let style = unsafe { wm::GetWindowLongW(self.control(id), wm::GWL_STYLE) };
+            style & 0xf == wm::BS_DEFPUSHBUTTON
+        }
+
+        /// Whether anything of the dialog can be seen.
+        pub(super) fn visible(&self) -> bool {
+            // SAFETY: our dialog.
+            unsafe { wm::IsWindowVisible(self.window) != 0 }
+        }
+
+        /// Puts `text` into the edit box, as typing does.
+        pub(super) fn type_text(&self, text: &str) {
+            let text: Vec<u16> = text.encode_utf16().chain([0]).collect();
+            // SAFETY: our control; a NUL-terminated text.
+            unsafe { wm::SetWindowTextW(self.control(EDIT), text.as_ptr()) };
+        }
+
+        /// How many characters the edit box lets the user type.
+        pub(super) fn text_limit(&self) -> usize {
+            const EM_GETLIMITTEXT: u32 = 0xd5;
+            // SAFETY: our control.
+            unsafe { wm::SendMessageW(self.control(EDIT), EM_GETLIMITTEXT, 0, 0) as usize }
+        }
+    }
+
+    #[cfg(test)]
+    impl<T> Drop for Hidden<T> {
+        fn drop(&mut self) {
+            // SAFETY: our dialog; its state was boxed in `create` and the
+            // procedure does not run once the window is gone.
+            unsafe {
+                if !self.window.is_null() {
+                    wm::DestroyWindow(self.window);
+                }
+                drop(Box::from_raw(self.state));
+            }
+        }
+    }
+
+    /// The message dialog of [`message`], not shown.
+    #[cfg(test)]
+    pub(super) fn hidden_message(
+        title: &str,
+        content: &str,
+        buttons: &[Option<String>; 3],
+        default: u32,
+    ) -> Option<Hidden<Shown>> {
+        let shown = Shown {
+            default,
+            pressed: None,
+            ended: false,
+            modal: false,
+        };
+        let template = message_template(title, content, buttons, default);
+        Hidden::create(&template, message_procedure, shown)
+    }
+
+    /// The text entry dialog of [`ask`], not shown.
+    #[cfg(test)]
+    pub(super) fn hidden_ask(
+        title: &str,
+        description: &str,
+        default: &str,
+        max: u32,
+    ) -> Option<Hidden<Entry>> {
+        let entry = Entry {
+            max,
+            typed: None,
+            ended: false,
+            modal: false,
+        };
+        let template = ask_template(title, description, default);
+        Hidden::create(&template, procedure, entry)
     }
 }
 
@@ -818,14 +1035,125 @@ mod tests {
         assert_eq!((count, picked, used), (0x55, [0xa5a5; 2], 0x55));
     }
 
-    /// The real host dialogs, driven the way a click drives them: the
-    /// command of a control is posted to the dialog once it is up.
+    /// The host dialogs without showing them: each is created with its
+    /// controls, as it would be shown, and sent what pressing a control
+    /// sends. Nothing appears on the desktop and nothing takes the focus.
     #[cfg(windows)]
     #[test]
-    fn host_dialogs_end_with_the_command_they_are_sent() {
+    fn hidden_host_dialogs_end_with_the_command_they_are_sent() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{IDCANCEL, IDOK};
+        const FIRST: i32 = dialog::FIRST_BUTTON;
+        let buttons = [Some("Yes".to_owned()), None, Some("No".to_owned())];
+        let message =
+            |default| dialog::hidden_message("Title", "Two lines\nof text", &buttons, default);
+        let Some(shown) = message(2) else {
+            return crate::testing::skip("no window can be created in this session");
+        };
+        // A button for each text given, the default one taking Enter.
+        assert!(!shown.visible());
+        assert_eq!(
+            [FIRST, FIRST + 1, FIRST + 2].map(|id| shown.has(id)),
+            [true, false, true]
+        );
+        assert_eq!(
+            (shown.text(FIRST), shown.text(FIRST + 2)),
+            ("Yes".into(), "No".into())
+        );
+        assert_eq!(
+            (shown.is_default(FIRST), shown.is_default(FIRST + 2)),
+            (false, true)
+        );
+        assert_eq!((shown.state().pressed, shown.state().ended), (None, false));
+        // A command of a button that does not exist ends nothing, nor does
+        // any other command that is none of the dialog's; a button does.
+        for other in [FIRST + 1, FIRST + 3, IDOK, 0] {
+            shown.command(other);
+            assert_eq!(
+                (shown.state().pressed, shown.state().ended),
+                (None, false),
+                "command {other}"
+            );
+        }
+        shown.command(FIRST + 2);
+        assert_eq!(
+            (shown.state().pressed, shown.state().ended),
+            (Some(2), true)
+        );
+        drop(shown);
+
+        let shown = message(0).expect("a second dialog");
+        assert_eq!(
+            (shown.is_default(FIRST), shown.is_default(FIRST + 2)),
+            (true, false)
+        );
+        shown.command(FIRST);
+        assert_eq!(
+            (shown.state().pressed, shown.state().ended),
+            (Some(0), true)
+        );
+        // Esc and the close box send the cancel command: no button.
+        let shown = message(0).expect("a third dialog");
+        shown.command(IDCANCEL);
+        assert_eq!((shown.state().pressed, shown.state().ended), (None, true));
+        // A default button that has no text: nothing is the default.
+        let shown = message(1).expect("a fourth dialog");
+        assert_eq!(
+            (shown.is_default(FIRST), shown.is_default(FIRST + 2)),
+            (false, false)
+        );
+
+        // Text entry, over the same template code: OK takes what the edit
+        // box holds, which starts as the default text and is limited to
+        // the title's maximum.
+        let ask = || dialog::hidden_ask("Title", "Description", "default", 16);
+        let entry = ask().expect("a text entry dialog");
+        assert!(!entry.visible());
+        assert_eq!(entry.text(dialog::EDIT), "default");
+        assert_eq!(entry.text_limit(), 16);
+        entry.command(0x1234);
+        assert_eq!(
+            (entry.state().typed.as_deref(), entry.state().ended),
+            (None, false)
+        );
+        entry.command(IDOK);
+        assert_eq!(
+            (entry.state().typed.as_deref(), entry.state().ended),
+            (Some("default"), true)
+        );
+        let entry = ask().expect("a text entry dialog");
+        entry.type_text("typed by hand");
+        entry.command(IDOK);
+        assert_eq!(entry.state().typed.as_deref(), Some("typed by hand"));
+        let entry = ask().expect("a text entry dialog");
+        entry.type_text("typed, then cancelled");
+        entry.command(IDCANCEL);
+        assert_eq!(
+            (entry.state().typed.as_deref(), entry.state().ended),
+            (None, true)
+        );
+    }
+
+    /// Set to 1 to run `visible_host_dialogs_end_with_the_command_they_are_sent`.
+    #[cfg(windows)]
+    const VISIBLE: &str = "VICTORY_TEST_VISIBLE_DIALOGS";
+
+    /// The real, visible host dialogs, modal as a title gets them, driven
+    /// the way a click drives them: the command of a control is posted to
+    /// the dialog once it is up. It opens topmost windows on the desktop
+    /// and takes the foreground, so it runs only where it is asked for
+    /// (`VICTORY_TEST_VISIBLE_DIALOGS=1`), and needs a session that can
+    /// show a window.
+    #[cfg(windows)]
+    #[test]
+    fn visible_host_dialogs_end_with_the_command_they_are_sent() {
         use windows_sys::Win32::UI::WindowsAndMessaging::{
             FindWindowW, IDCANCEL, IDOK, PostMessageW, WM_COMMAND,
         };
+        if std::env::var_os(VISIBLE).is_none_or(|v| v != "1") {
+            return crate::testing::skip(
+                "visible dialogs are shown only with VICTORY_TEST_VISIBLE_DIALOGS=1",
+            );
+        }
 
         /// Posts `command` to the dialog titled `title` when it appears;
         /// whether it did within ten seconds.
@@ -859,22 +1187,13 @@ mod tests {
             let title = format!("victory message test {id} {n}");
             let presser = press(&title, command);
             let pressed = dialog::message(&title, "Two lines\nof text", &buttons, 2);
-            assert!(presser.join().unwrap(), "the dialog came up: {title}");
+            if n == 0 && !presser.join().unwrap() {
+                // No dialog came up at all, so the call returned at once.
+                assert_eq!(pressed, None);
+                return crate::testing::skip("no dialog can be shown in this session");
+            }
             assert_eq!(pressed, expected, "command {command}");
         }
-        // A command of a button that does not exist ends nothing; the
-        // cancel that follows does.
-        let title = format!("victory message test {id} absent");
-        let absent = press(&title, dialog::FIRST_BUTTON + 1);
-        let pressed = std::thread::scope(|s| {
-            let shown = s.spawn(|| dialog::message(&title, "Text", &buttons, 0));
-            assert!(absent.join().unwrap());
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            assert!(!shown.is_finished(), "still open");
-            assert!(press(&title, IDCANCEL).join().unwrap());
-            shown.join().unwrap()
-        });
-        assert_eq!(pressed, None);
 
         // Text entry, over the same template code: OK takes the text.
         let title = format!("victory entry test {id}");
