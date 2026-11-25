@@ -1168,4 +1168,65 @@ mod tests {
         (m.release)(acp);
         assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
     }
+
+    /// Set in the child process of the heap test below.
+    const HEAP_CHILD: &str = "VICTORY_APU_HEAP_CHILD";
+
+    /// In a child process of the test below (the heap exists once per
+    /// process, and other tests have allocated from it); does nothing
+    /// otherwise. Prints what a title that sizes the heap first is told.
+    #[test]
+    fn apu_heap_child() {
+        if std::env::var_os(HEAP_CHILD).is_none() {
+            return;
+        }
+        let no_cached_part = ApuCreateHeap(0, 0x1000);
+        let created = ApuCreateHeap(0x1000, 0);
+        let again = ApuCreateHeap(0x2000, 0x2000);
+        // Sixteen times the size the heap was created with, in one block
+        // and then in blocks of that size.
+        let (mut big, mut big_apu) = (std::ptr::null_mut(), 0);
+        let beyond = ApuAlloc(&mut big, &mut big_apu, 0x1_0000, 0x1000, 1);
+        let big_mapped = !big.is_null() && !ApuMapApuAddress(big_apu + 0xffff).is_null();
+        let mut blocks = Vec::new();
+        let mut each = Vec::new();
+        for _ in 0..4 {
+            let (mut ptr, mut apu) = (std::ptr::null_mut(), 0);
+            each.push(ApuAlloc(&mut ptr, &mut apu, 0x1000, 0x1000, 1) as u32);
+            blocks.push(ptr);
+        }
+        println!(
+            "HEAP no_cached_part={:#x} created={:#x} again={:#x} beyond={:#x} mapped={big_mapped} each={each:x?}",
+            no_cached_part as u32, created as u32, again as u32, beyond as u32
+        );
+        ApuFree(big);
+        for ptr in blocks {
+            ApuFree(ptr);
+        }
+    }
+
+    /// `ApuCreateHeap` checks its sizes and that it comes first and once,
+    /// but the sizes are not limits: allocations beyond them succeed, each
+    /// block being host memory of its own. That is today's shortcut,
+    /// pinned so that enforcing the sizes is a deliberate change; which
+    /// failure the console gives a title that runs out is not established.
+    #[test]
+    fn apu_heap_sizes_are_checked_once_and_are_not_limits_today() {
+        let test = "modules::audio::tests::apu_heap_child";
+        let out = crate::testing::child(test, &[(HEAP_CHILD, "1".as_ref())]);
+        let (printed, logged) = crate::testing::printed(&out);
+        let all = format!("{printed}{logged}");
+        assert!(out.status.success(), "{all}");
+        let told = printed
+            .lines()
+            .find_map(|line| line.find("HEAP ").map(|at| &line[at..]));
+        assert_eq!(
+            told,
+            Some(
+                "HEAP no_cached_part=0x80070057 created=0x0 again=0x8aca0001 \
+                 beyond=0x0 mapped=true each=[0, 0, 0, 0]"
+            ),
+            "{all}"
+        );
+    }
 }

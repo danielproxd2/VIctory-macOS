@@ -171,13 +171,73 @@ static CAPTURE_VTABLE: Methods<6> = Methods([
     take_screenshot as *const (), // 0x28
 ]);
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::modules::xgameruntime::{S_OK, method};
+    use crate::modules::xgameruntime::method;
 
+    /// `XDisplayTryEnableHdrMode` answers "disabled" (2) whatever the
+    /// title prefers, and describes no display mode: the mode info it is
+    /// given stays as it was, and may be absent.
+    #[test]
+    fn hdr_is_reported_disabled() {
+        type Hdr = extern "system" fn(This, u32, *mut c_void) -> u32;
+        let enable = method::<Hdr>(&HDR_OBJECT, 0x20);
+        // Prefer HDR, prefer the refresh rate, and a value that is neither.
+        for preference in [0, 1, 7] {
+            let mut info = [0xa5_u8; 64];
+            assert_eq!(
+                enable(&HDR_OBJECT, preference, info.as_mut_ptr().cast()),
+                2,
+                "preference {preference}"
+            );
+            assert_eq!(info, [0xa5; 64], "preference {preference}");
+            assert_eq!(enable(&HDR_OBJECT, preference, std::ptr::null_mut()), 2);
+        }
+    }
+
+    /// Screenshots are not taken: `XAppCaptureTakeScreenshot` fails with
+    /// `HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)` and writes nothing to its
+    /// result, with or without a user or a result; the diagnostic
+    /// screenshot and clip slots are not implemented. Today's answers,
+    /// until the GPU side can hand a frame back.
+    #[test]
+    fn screenshots_are_not_supported_and_leave_outputs_empty() {
+        use crate::modules::xasync::E_NOTIMPL;
+        type Take = extern "system" fn(This, *const c_void, *mut c_void) -> HRESULT;
+        let take = method::<Take>(&CAPTURE_OBJECT, 0x28);
+        assert_eq!(NOT_SUPPORTED as u32, 0x8007_0032);
+        let user = 0x1234 as *const c_void;
+        for user in [user, std::ptr::null()] {
+            let mut result = [0xa5_u8; 512];
+            assert_eq!(
+                take(&CAPTURE_OBJECT, user, result.as_mut_ptr().cast()),
+                NOT_SUPPORTED
+            );
+            assert_eq!(result, [0xa5; 512]);
+            assert_eq!(
+                take(&CAPTURE_OBJECT, user, std::ptr::null_mut()),
+                NOT_SUPPORTED
+            );
+        }
+        type Diagnostic = extern "system" fn(This, *mut u8) -> HRESULT;
+        for at in [0x18, 0x20] {
+            let mut out = [0xa5_u8; 64];
+            let slot = method::<Diagnostic>(&CAPTURE_OBJECT, at);
+            assert_eq!(
+                slot(&CAPTURE_OBJECT, out.as_mut_ptr()),
+                E_NOTIMPL,
+                "{at:#x}"
+            );
+            assert_eq!(out, [0xa5; 64], "{at:#x}");
+        }
+        assert_eq!(E_NOTIMPL as u32, 0x8000_4001);
+    }
+
+    #[cfg(windows)]
     #[test]
     fn sdr_and_display_deferrals() {
+        use crate::modules::xgameruntime::S_OK;
         type Hdr = extern "system" fn(This, u32, *mut c_void) -> u32;
         assert_eq!(
             method::<Hdr>(&HDR_OBJECT, 0x20)(&HDR_OBJECT, 0, std::ptr::null_mut()),

@@ -777,4 +777,67 @@ mod tests {
         assert_eq!(XGCreateTextureComputer(&bad, &mut c), E_INVALIDARG);
         assert!(module().exports.len() == 2);
     }
+
+    /// Tiling in 64 KiB tiles is answered for 2D textures only. A 3D
+    /// texture in a 64 KiB standard mode has a thick layout, whose tiles
+    /// this does not compute: the call fails with `E_NOTIMPL` and writes
+    /// to none of its outputs. The same texture in two dimensions answers.
+    #[test]
+    fn thick_tiling_is_e_notimpl() {
+        type Tiling = extern "system" fn(
+            This,
+            *mut u32,
+            *mut PackedMips,
+            *mut [u32; 3],
+            *mut u32,
+            u32,
+            *mut SubresourceTiling,
+        ) -> HRESULT;
+        let ask = |d: &ResourceDesc| {
+            let c = create(d);
+            let tiling: Tiling = slot(c, 10);
+            let mut tiles = 0xa5a5_a5a5_u32;
+            let mut packed = PackedMips {
+                standard: 0xa5,
+                packed: 0xa5,
+                tiles: 0xa5a5_a5a5,
+                start: 0xa5a5_a5a5,
+            };
+            let mut shape = [0xa5a5_a5a5_u32; 3];
+            let mut count = 1_u32;
+            let mut entry = SubresourceTiling {
+                width: 0xa5a5_a5a5,
+                height: 0xa5a5,
+                depth: 0xa5a5,
+                start: 0xa5a5_a5a5,
+            };
+            let hr = tiling(
+                c,
+                &mut tiles,
+                &mut packed,
+                &mut shape,
+                &mut count,
+                0,
+                &mut entry,
+            );
+            let thick = computer(c).texture.planes[0].layout.thick;
+            assert_eq!(release(c), 0);
+            let untouched = tiles == 0xa5a5_a5a5
+                && (packed.standard, packed.packed) == (0xa5, 0xa5)
+                && (packed.tiles, packed.start) == (0xa5a5_a5a5, 0xa5a5_a5a5)
+                && shape == [0xa5a5_a5a5; 3]
+                && count == 1
+                && (entry.width, entry.height) == (0xa5a5_a5a5, 0xa5a5)
+                && (entry.depth, entry.start) == (0xa5a5, 0xa5a5_a5a5);
+            (thick, hr, untouched)
+        };
+        // 256x256 RGBA8, one mip, 64 KiB standard mode (9).
+        let flat = desc(256, 256, 1, 28, 0x109);
+        let mut volume = flat;
+        volume.dimension = TEXTURE_3D;
+        volume.depth_or_array = 16;
+        assert_eq!(ask(&volume), (true, E_NOTIMPL, true));
+        assert_eq!(ask(&flat), (false, S_OK, false));
+        assert_eq!(E_NOTIMPL as u32, 0x8000_4001);
+    }
 }

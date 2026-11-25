@@ -1589,4 +1589,63 @@ mod tests {
         assert_eq!(xmem::XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(xmem::XMemFreePhysicalPages(1, b.as_ptr()), 1);
     }
+
+    /// Option bits this runtime gives no meaning (5-20: a further
+    /// transform; 23: a source in physical pages; anything above) fail the
+    /// request with `E_NOTIMPL` before anything is read: the destination
+    /// keeps its bytes, and the queue goes on with the next request.
+    #[test]
+    fn unknown_option_bits_fail_the_request_with_e_notimpl() {
+        let contents = pattern(256);
+        let (_dir, file) = file_with(&contents);
+        let bits = [5_u32, 12, 20, 23, 24, 40, 63];
+        let (queue, array) = (new_queue(0), status_array(bits.len() as u32 + 1));
+        let mut buffers = vec![[0xa5_u8; 16]; bits.len() + 1];
+        for (i, bit) in bits.iter().enumerate() {
+            let out = buffers[i].as_mut_ptr().cast();
+            // Alone, and beside options that are known.
+            let known = if i % 2 == 0 { 0 } else { ZLIB };
+            enqueue(queue, &request(known | 1 << bit, out, 16, file, 0, 16));
+            enqueue_status(queue, array, i as u32);
+        }
+        let last = bits.len();
+        let out = buffers[last].as_mut_ptr().cast();
+        enqueue(queue, &request(0, out, 16, file, 32, 16));
+        enqueue_status(queue, array, last as u32);
+        void(queue, 0x30);
+        assert_eq!(wait(array, last as u32), S_OK);
+        for (i, bit) in bits.iter().enumerate() {
+            assert_eq!(result(array, i as u32), E_NOTIMPL, "bit {bit}");
+            assert_eq!(buffers[i], [0xa5; 16], "bit {bit}");
+        }
+        assert_eq!(buffers[last], contents[32..48]);
+        assert_eq!(E_NOTIMPL as u32, 0x8000_4001);
+        void(queue, 0x40);
+    }
+
+    /// Cancelling by tag (queue slot 0x38 in the 2020 order, taking a mask
+    /// and a value) is not implemented: the slot answers `E_NOTIMPL` and
+    /// cancels nothing, so a queued request whose tag matches is still
+    /// read and completes with success.
+    #[test]
+    fn cancel_by_tag_is_not_implemented_and_cancels_nothing() {
+        let contents = pattern(256);
+        let (_dir, file) = file_with(&contents);
+        let (queue, array) = (new_queue(0), status_array(1));
+        let mut out = [0xa5_u8; 16];
+        let mut tagged = request(0, out.as_mut_ptr().cast(), 16, file, 64, 16);
+        tagged.tag = 0x7a6;
+        enqueue(queue, &tagged);
+        enqueue_status(queue, array, 0);
+        let cancel: extern "system" fn(*mut c_void, u64, u64) -> HRESULT = call(queue, 0x38);
+        assert_eq!(cancel(queue, u64::MAX, 0x7a6), E_NOTIMPL);
+        assert_eq!(result(array, 0), E_PENDING, "still queued");
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        assert_eq!(out, contents[64..80]);
+        // Nor does it cancel what is already done or stop the queue.
+        assert_eq!(cancel(queue, u64::MAX, 0x7a6), E_NOTIMPL);
+        assert_eq!(result(array, 0), S_OK);
+        void(queue, 0x40);
+    }
 }
