@@ -2,6 +2,14 @@
 //! (`runtime::Title::storage`, under the data directory, never the cache)
 //! with the quota its manifest declares, seen by the title as a drive
 //! (`files`).
+//!
+//! The quota is reported, not enforced: the space queries and the prompt
+//! answer from it, but a write that takes the folder past it succeeds as
+//! far as the host disk allows. Which call fails on the console when the
+//! quota is full, and with which error, is not established by anything in
+//! this repository, so no write is refused here on a guess. The account
+//! stays truthful past the quota: what is used is what is there, and
+//! nothing is free.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::path::Path;
@@ -145,14 +153,22 @@ pub(crate) fn disk_free(dir: &Path) -> u64 {
 
 fn space() -> SpaceInfo {
     let title = runtime::title();
-    let used = used_bytes(&title.storage);
-    let free = title.storage_bytes.saturating_sub(used);
+    space_of(&title.storage, title.storage_bytes)
+}
+
+/// The account of the folder `storage` under a quota of `quota` bytes. A
+/// folder that holds more than its quota has nothing free; it never has
+/// "less than nothing", which an unsigned number would show as a huge
+/// amount.
+fn space_of(storage: &Path, quota: u64) -> SpaceInfo {
+    let used = used_bytes(storage);
+    let free = quota.saturating_sub(used);
     SpaceInfo {
         // Writable now: the quota's rest, as far as the host disk allows.
-        available_free: free.min(disk_free(&title.storage)),
+        available_free: free.min(disk_free(storage)),
         total_free: free,
         used,
-        total: title.storage_bytes,
+        total: quota,
     }
 }
 
@@ -255,6 +271,42 @@ mod tests {
             assert_eq!(xasync::XAsyncGetStatus(&mut block, true), expect);
             assert_eq!(result(this, &mut block), expect, "{bytes} bytes");
         }
+    }
+
+    #[test]
+    fn free_space_is_the_quota_minus_use() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
+        std::fs::write(dir.path().join("top.dat"), [0u8; 100]).unwrap();
+        std::fs::write(dir.path().join("a/b/deep.dat"), [0u8; 50]).unwrap();
+        let info = space_of(dir.path(), 1000);
+        assert_eq!((info.used, info.total_free, info.total), (150, 850, 1000));
+        assert!(info.available_free <= 850, "{info:?}");
+        // No quota (a title without a manifest entry): nothing is free.
+        let none = space_of(dir.path(), 0);
+        assert_eq!(
+            (none.used, none.total_free, none.available_free),
+            (150, 0, 0)
+        );
+        // A folder that is not there holds nothing.
+        let absent = space_of(&dir.path().join("absent"), 1000);
+        assert_eq!((absent.used, absent.total_free), (0, 1000));
+    }
+
+    /// The quota is not enforced on writes (see the module's first lines):
+    /// a write past it succeeds, and the account then shows the real use
+    /// and nothing free, not a difference that wrapped.
+    #[test]
+    fn a_write_past_the_quota_succeeds_and_leaves_nothing_free() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("save.dat"), [0u8; 900]).unwrap();
+        assert_eq!(space_of(dir.path(), 1000).total_free, 100);
+        std::fs::write(dir.path().join("more.dat"), [0u8; 1100]).unwrap();
+        let info = space_of(dir.path(), 1000);
+        assert_eq!(
+            (info.used, info.total_free, info.available_free, info.total),
+            (2000, 0, 0, 1000)
+        );
     }
 
     #[test]
