@@ -65,16 +65,17 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
     // and no imports, so loading it runs no title code.
     let module = unsafe { LoadLibraryExW(wide.as_ptr(), std::ptr::null_mut(), 0) };
     if module.is_null() {
-        bail!(
-            "LoadLibraryExW({}) failed: {}{}",
-            path.display(),
-            std::io::Error::last_os_error(),
-            if prepared.info.has_relocations {
-                ""
-            } else {
-                " (image has no relocations; its preferred base may be taken)"
-            }
-        );
+        // Read before anything else can change it.
+        let error = std::io::Error::last_os_error();
+        let cause = if prepared.info.has_relocations {
+            String::new()
+        } else {
+            format!(
+                " (image has no relocations; its preferred base {:#x} may be taken)",
+                prepared.info.image_base
+            )
+        };
+        bail!("LoadLibraryExW({}) failed: {error}{cause}", path.display());
     }
     let mut loaded = LoadedImage {
         module,
