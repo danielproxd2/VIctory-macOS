@@ -399,6 +399,59 @@ mod with_the_stand_in_title {
         assert!(!home.title_log().exists(), "{run:#?}");
     }
 
+    /// The stand-in title that is a DLL, with the DLLs it ships beside it.
+    fn install_the_probe(home: &Home) -> PathBuf {
+        for dll in ["title_a.dll", "title_b.dll", "title_quiet.dll"] {
+            install(home, dll);
+        }
+        install(home, "hle_probe.dll")
+    }
+
+    /// A DLL has no entry point of a program: it is not started, and
+    /// nothing is mapped or made for the attempt.
+    #[test]
+    fn run_execute_refuses_a_dll() {
+        let home = Home::new();
+        let probe = install_the_probe(&home);
+        let run = home.victory(&["run".as_ref(), "--execute".as_ref(), probe.as_os_str()]);
+        assert_eq!(run.code, Some(1), "{run:#?}");
+        assert_eq!(run.stdout, "", "{run:#?}");
+        let said = run.stderr.lines().find(|l| l.starts_with("Error: "));
+        let said = said.unwrap_or_else(|| panic!("no error: {run:#?}"));
+        assert!(said.contains("hle_probe.dll is a DLL"), "{said}");
+        assert!(said.contains("cannot be started as a title"), "{said}");
+        assert!(!home.path("data").exists(), "{run:#?}");
+        assert!(!home.path("cache").exists(), "{run:#?}");
+    }
+
+    /// Without `--execute` a DLL is mapped and bound like any image, with
+    /// the title DLLs it imports from.
+    #[test]
+    fn run_binds_a_dll_and_the_title_dlls_it_imports() {
+        let home = Home::new();
+        let probe = install_the_probe(&home);
+        let run = home.victory(&["run".as_ref(), probe.as_os_str()]);
+        assert_eq!(run.code, Some(0), "{run:#?}");
+        assert!(
+            line(&run.stdout, "title dll      title_a.dll at ").starts_with("0x"),
+            "{run:#?}"
+        );
+        let [hle, host, from_title, none] = bound(&run.stdout, "hle_probe.dll");
+        assert!(hle >= 1 && host >= 1 && from_title >= 1, "{run:#?}");
+        // The import from a DLL nobody has is named.
+        let missing = missing(&run.stdout);
+        let nobodys = "victory-probe-missing.dll!VIctoryProbeNotImplemented";
+        assert!(missing.contains(&nobodys), "{run:#?}");
+        assert!(none >= 1, "{run:#?}");
+        for ours in ["XGameRuntimeInitialize", "title_a_named"] {
+            assert!(
+                !missing.iter().any(|m| m.contains(ours)),
+                "{ours}: {run:#?}"
+            );
+        }
+        assert!(!run.stdout.contains("title exited"), "{run:#?}");
+    }
+
     #[test]
     fn run_execute_fails_on_a_title_that_is_not_there() {
         let home = Home::new();

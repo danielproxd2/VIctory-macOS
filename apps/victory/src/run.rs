@@ -26,6 +26,14 @@ pub fn run(
     let cfg = victory_core::Config::load()?;
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
+    // A DLL's entry point is its `DllMain`, which takes three arguments
+    // and is not where a program starts: started as a title it would be
+    // called with none and its answer taken for an exit code.
+    anyhow::ensure!(
+        !(execute && prepared.info.is_dll()),
+        "{} is a DLL, which cannot be started as a title (without --execute it is mapped and bound)",
+        exe.display()
+    );
     let hash = prepared.original_hash.to_hex();
     match victory_game::identify(&hash) {
         Some(build) => writeln!(out, "build          {} ({hash})", build.label)?,
