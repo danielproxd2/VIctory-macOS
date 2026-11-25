@@ -358,11 +358,19 @@ mod tests {
         assert_eq!(total([]), 0);
     }
 
-    /// A link to a folder inside the tree, leading back to the tree's
-    /// root. Followed, it has every file counted again on each turn, until
-    /// the host refuses the path.
+    /// Guards the walk against a change to following links (asking
+    /// `std::fs::metadata` for the path instead of `symlink_metadata`). The
+    /// tree holds a link to a folder that leads back to the tree's root:
+    /// followed, it has every file counted again on each turn until the
+    /// host refuses the path, so the walk still ends, with a sum many
+    /// times too large (1920 for these 120 bytes on macOS).
+    ///
+    /// The walk this one replaced did not follow links either (it asked
+    /// the directory entry, which answers for the link itself) and gave
+    /// 120 on Windows too. What it got wrong was to count a link's own
+    /// length, which on Unix hosts is that of the path it names.
     #[test]
-    fn a_link_loop_does_not_hang_the_size_walk() {
+    fn links_are_not_followed_and_count_nothing_in_the_size_walk() {
         let dir = tempfile::tempdir().unwrap();
         let inner = dir.path().join("inner");
         std::fs::create_dir(&inner).unwrap();
