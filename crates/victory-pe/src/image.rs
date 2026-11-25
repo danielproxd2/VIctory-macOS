@@ -301,13 +301,19 @@ fn parse_delay_imports(
 }
 
 /// Pairs each name-table entry with its IAT slot. The IAT RVA is not checked
-/// by `object`, so every slot is checked to lie inside the image here.
+/// by `object`, so every slot is checked here: it lies inside the image, and
+/// on an 8-byte boundary, because binding stores a pointer through it.
 fn entries<'data>(
     mut thunks: ImportThunkList<'data>,
     iat_rva: u32,
     size_of_image: u32,
     import: impl Fn(pe::ImageThunkData64) -> object::read::Result<Import<'data>>,
 ) -> Result<Vec<ImportEntry>, PeError> {
+    if iat_rva % 8 != 0 {
+        return Err(PeError::Malformed(format!(
+            "IAT at {iat_rva:#x} is not 8-byte aligned"
+        )));
+    }
     let mut entries = Vec::new();
     while let Some(thunk) = thunks.next::<ImageNtHeaders64>()? {
         let iat_slot_rva = u32::try_from(entries.len() * 8)
@@ -753,6 +759,50 @@ mod tests {
     /// File offset of the first section's data: where the headers end.
     fn info_headers_len(data: &[u8]) -> usize {
         ImageInfo::parse(data).unwrap().sections[0].file_offset as usize
+    }
+
+    /// File offset of the first import descriptor of [`sample_image`].
+    fn first_import_descriptor(data: &[u8]) -> usize {
+        let dd = layout::data_directory_offset(data, dir::IMPORT).unwrap();
+        let import_rva = layout::read_u32(data, dd).unwrap();
+        let info = ImageInfo::parse(data).unwrap();
+        info.rva_to_file_offset(import_rva).unwrap() as usize
+    }
+
+    fn malformed(result: Result<ImageInfo, PeError>) -> String {
+        match result {
+            Err(PeError::Malformed(why)) => why,
+            other => panic!("expected PeError::Malformed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_unaligned_iat_slot() {
+        let mut data = sample_image();
+        let desc = first_import_descriptor(&data);
+        let iat = layout::read_u32(&data, desc + 16).unwrap();
+        assert_eq!(iat % 8, 0, "the builder aligns the table");
+        // FirstThunk four bytes on: still inside the image and its section,
+        // but binding would store a pointer through an unaligned address.
+        for off_by in [4u32, 1, 7] {
+            data[desc + 16..desc + 20].copy_from_slice(&(iat + off_by).to_le_bytes());
+            let why = malformed(ImageInfo::parse(&data));
+            assert!(why.contains("not 8-byte aligned"), "{why}");
+        }
+        // The delay IAT is bound the same way.
+        let mut data = sample()
+            .delay_import("late.dll", DELAYLOAD_RVA_BASED, &[by_name(1, "Later")])
+            .build()
+            .unwrap()
+            .bytes;
+        let directory = layout::data_directory_offset(&data, dir::DELAY_IMPORT).unwrap();
+        let descriptor_rva = layout::read_u32(&data, directory).unwrap();
+        let info = ImageInfo::parse(&data).unwrap();
+        let desc = info.rva_to_file_offset(descriptor_rva).unwrap() as usize;
+        let iat = info.delay_imports[0].entries[0].iat_slot_rva;
+        data[desc + 12..desc + 16].copy_from_slice(&(iat + 4).to_le_bytes());
+        let why = malformed(ImageInfo::parse(&data));
+        assert!(why.contains("not 8-byte aligned"), "{why}");
     }
 
     #[test]
