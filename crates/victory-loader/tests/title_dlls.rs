@@ -8,7 +8,9 @@ use std::os::windows::ffi::OsStrExt;
 use victory_loader::{ImportResolver, Provenance, Resolution, UnimplementedPolicy};
 use victory_pe::{ImageInfo, ImportSymbol};
 use windows_sys::Win32::Foundation::FreeLibrary;
-use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA, LoadLibraryExW};
+use windows_sys::Win32::System::LibraryLoader::{
+    GetModuleHandleA, GetProcAddress, LoadLibraryA, LoadLibraryExW,
+};
 
 mod common;
 use common::fixture;
@@ -478,5 +480,158 @@ fn import_cycle_terminates() {
     for (_, image) in reversed {
         // SAFETY: none of its code ran or will.
         unsafe { image.unload() };
+    }
+}
+
+fn named(name: &str) -> ImportSymbol {
+    ImportSymbol::Name {
+        hint: 0,
+        name: name.to_owned(),
+    }
+}
+
+/// An export of a title DLL that names another DLL's export is that other
+/// export: of the title's prepared DLL, or of whoever else provides the
+/// DLL. The Windows loader, which knows only the unprepared files, is not
+/// asked.
+#[test]
+fn forwarded_export_resolves_into_the_prepared_module() {
+    let title = title_dir(&["title_a.dll", "title_b.dll"]);
+    let cache = tempfile::tempdir().unwrap();
+    let dlls = victory_loader::load_title_dll("title_b.dll", title.path(), cache.path(), &|_| true)
+        .unwrap();
+    assert_eq!(names(&dlls), ["title_a.dll", "title_b.dll"]);
+    let (title_a, title_b) = (&dlls[0].1, &dlls[1].1);
+    let resolver = victory_loader::WithTitleDlls {
+        inner: &HostOnly,
+        dlls: &dlls,
+    };
+
+    // By name.
+    let target = title_a.export("title_a_named").unwrap();
+    let inside = title_a.base()..title_a.base() + title_a.info().size_of_image as usize;
+    assert!(inside.contains(&target));
+    assert_eq!(
+        resolver.resolve("title_b.dll", &named("title_b_forwarded")),
+        Resolution::Found {
+            address: target,
+            provenance: Provenance::Title,
+        }
+    );
+    // SAFETY: title_a.dll's export takes nothing, returns a `u32` and uses
+    // no import.
+    let f: extern "system" fn() -> u32 = unsafe { std::mem::transmute(target) };
+    assert_eq!(f(), 0x0A00_0001);
+
+    // To an export that has only an ordinal.
+    let seventh = title_a.export_symbol(&ImportSymbol::Ordinal(7)).unwrap();
+    assert!(inside.contains(&seventh) && seventh != target);
+    assert_eq!(
+        resolver.resolve("TITLE_B.dll", &named("title_b_forwarded_ordinal")),
+        Resolution::Found {
+            address: seventh,
+            provenance: Provenance::Title,
+        }
+    );
+    // By the forwarding export's own ordinal.
+    let ordinal = title_b
+        .info()
+        .exports
+        .iter()
+        .find(|e| e.name.as_deref() == Some("title_b_forwarded"))
+        .unwrap()
+        .ordinal;
+    assert_eq!(
+        resolver.resolve("title_b.dll", &ImportSymbol::Ordinal(ordinal)),
+        resolver.resolve("title_b.dll", &named("title_b_forwarded"))
+    );
+
+    // To a DLL the title does not ship: whoever answers for it answers.
+    assert_eq!(
+        resolver.resolve("title_b.dll", &named("title_b_forwarded_host")),
+        HostOnly.resolve("kernel32.dll", &named("GetCurrentProcessId"))
+    );
+    assert!(matches!(
+        HostOnly.resolve("kernel32.dll", &named("GetCurrentProcessId")),
+        Resolution::Found {
+            provenance: Provenance::Host,
+            ..
+        }
+    ));
+
+    // The image alone has no address for an export without code.
+    assert_eq!(title_b.export("title_b_forwarded"), None);
+    assert_eq!(title_b.export_symbol(&ImportSymbol::Ordinal(ordinal)), None);
+    assert!(title_b.export("title_b_chain").is_some());
+
+    // Windows was not asked for the DLL the forwarders name: it would have
+    // mapped the file as it is, or found none.
+    for name in [c"title_a.dll", c"title_a"] {
+        // SAFETY: a NUL-terminated name; no reference is taken.
+        let module = unsafe { GetModuleHandleA(name.as_ptr().cast()) };
+        assert!(module.is_null(), "{name:?} is loaded under its own name");
+    }
+}
+
+/// Counts what it is asked and knows nothing.
+#[derive(Default)]
+struct Asked(std::cell::RefCell<Vec<String>>);
+
+impl ImportResolver for Asked {
+    fn resolve(&self, dll: &str, symbol: &ImportSymbol) -> Resolution {
+        self.0.borrow_mut().push(format!("{dll}!{symbol}"));
+        Resolution::Missing
+    }
+}
+
+/// Forwarders that name each other have no address: the import is missing,
+/// after a fixed number of steps. A chain that ends is followed to its end.
+#[test]
+fn forwarder_loop_is_an_error() {
+    let title = title_dir(&["title_loop_a.dll", "title_loop_b.dll"]);
+    let cache = tempfile::tempdir().unwrap();
+    let dlls =
+        victory_loader::load_title_dll("title_loop_a.dll", title.path(), cache.path(), &|_| true)
+            .unwrap();
+    assert_eq!(names(&dlls), ["title_loop_b.dll", "title_loop_a.dll"]);
+    let loop_a = &dlls[1].1;
+    let asked = Asked::default();
+    let resolver = victory_loader::WithTitleDlls {
+        inner: &asked,
+        dlls: &dlls,
+    };
+
+    // Two steps: a's forwarder names b's, which names a function of a.
+    assert_eq!(
+        resolver.resolve("title_loop_a.dll", &named("title_loop_a_through")),
+        Resolution::Found {
+            address: loop_a.export("title_loop_a_leaf").unwrap(),
+            provenance: Provenance::Title,
+        }
+    );
+    assert_eq!(
+        *asked.0.borrow(),
+        [
+            "title_loop_a.dll!title_loop_a_through",
+            "title_loop_b.dll!title_loop_b_through",
+            "title_loop_a.dll!title_loop_a_leaf",
+        ]
+    );
+
+    // Around: the import itself and eight forwarders, then no more.
+    asked.0.borrow_mut().clear();
+    assert_eq!(
+        resolver.resolve("title_loop_a.dll", &named("title_loop_a_round")),
+        Resolution::Missing
+    );
+    let steps = asked.0.borrow().clone();
+    assert_eq!(steps.len(), 9, "{steps:?}");
+    for (i, step) in steps.iter().enumerate() {
+        let expected = if i % 2 == 0 {
+            "title_loop_a.dll!title_loop_a_round"
+        } else {
+            "title_loop_b.dll!title_loop_b_round"
+        };
+        assert_eq!(step, expected, "step {i} of {steps:?}");
     }
 }

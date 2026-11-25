@@ -1,16 +1,16 @@
 //! Loading a prepared image as a real Windows module and binding it.
 
 use std::collections::HashSet;
-use std::ffi::{CString, c_void};
+use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use anyhow::{Context, Result, bail};
-use victory_pe::{ImageInfo, ImportSymbol};
+use victory_pe::{ExportInfo, ImageInfo, ImportSymbol};
 use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE};
-use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW};
+use windows_sys::Win32::System::LibraryLoader::LoadLibraryExW;
 use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
 
 use crate::thunks::{ImportSite, ThunkBlock, UnimplementedPolicy};
@@ -173,26 +173,57 @@ fn map_dll(
     Ok(())
 }
 
+/// How many forwarders in a row are followed before the export counts as
+/// missing: forwarders that name each other never end.
+const MAX_FORWARDS: usize = 8;
+
 /// Resolves through `inner`, then through the exports of the title's DLLs.
+///
+/// A forwarded export of a title DLL (`other.Function`, `other.#7`) is
+/// resolved here like an import of `other.dll` by that DLL: by `inner`,
+/// then by the title's DLLs, whichever of them goes by that name. The
+/// Windows loader is never asked: it would look for a file of that name,
+/// and map the title's unprepared DLL (or none) if it found one.
 pub struct WithTitleDlls<'a> {
     pub inner: &'a dyn ImportResolver,
     pub dlls: &'a [(String, LoadedImage)],
 }
 
-impl ImportResolver for WithTitleDlls<'_> {
-    fn resolve(&self, dll: &str, symbol: &ImportSymbol) -> Resolution {
+impl WithTitleDlls<'_> {
+    fn resolve_through(&self, dll: &str, symbol: &ImportSymbol, forwards: usize) -> Resolution {
         let found = self.inner.resolve(dll, symbol);
         if found != Resolution::Missing {
             return found;
         }
-        self.dlls
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(dll))
-            .and_then(|(_, image)| image.export_symbol(symbol))
-            .map_or(Resolution::Missing, |address| Resolution::Found {
-                address,
+        let named = |(name, _): &&(String, LoadedImage)| name.eq_ignore_ascii_case(dll);
+        let Some((_, image)) = self.dlls.iter().find(named) else {
+            return Resolution::Missing;
+        };
+        let Some(export) = image.export_entry(symbol) else {
+            return Resolution::Missing;
+        };
+        if let Some(rva) = export.rva {
+            return Resolution::Found {
+                address: image.base() + rva as usize,
                 provenance: Provenance::Title,
-            })
+            };
+        }
+        let forward = export.forward.as_deref().unwrap_or_default();
+        let Some((target, target_symbol)) = crate::names::forward_target(forward) else {
+            tracing::warn!(dll, %symbol, forward, "forwarder string not understood");
+            return Resolution::Missing;
+        };
+        if forwards == MAX_FORWARDS {
+            tracing::warn!(dll, %symbol, forward, "too many forwarders in a row");
+            return Resolution::Missing;
+        }
+        self.resolve_through(&target, &target_symbol, forwards + 1)
+    }
+}
+
+impl ImportResolver for WithTitleDlls<'_> {
+    fn resolve(&self, dll: &str, symbol: &ImportSymbol) -> Resolution {
+        self.resolve_through(dll, symbol, 0)
     }
 }
 
@@ -223,22 +254,30 @@ impl LoadedImage {
         self.redirected_tls_loads
     }
 
-    /// Address of an export of the image, if it has one by that name.
+    /// Address of an export of the image, if it has one by that name with
+    /// code or data of its own; `None` for a forwarded export, which only a
+    /// resolver can follow (see [`WithTitleDlls`]).
     pub fn export(&self, name: &str) -> Option<usize> {
-        let name = CString::new(name).ok()?;
-        // SAFETY: valid module handle and NUL-terminated name.
-        unsafe { GetProcAddress(self.module, name.as_ptr().cast()) }
-            .map(|f| f as *const () as usize)
+        self.export_symbol(&ImportSymbol::Name {
+            hint: 0,
+            name: name.to_owned(),
+        })
     }
 
-    /// Address of an export, by name or ordinal.
+    /// Address of an export, by name or ordinal; as [`Self::export`].
     pub fn export_symbol(&self, symbol: &ImportSymbol) -> Option<usize> {
-        match symbol {
-            ImportSymbol::Name { name, .. } => self.export(name),
-            // SAFETY: MAKEINTRESOURCE-style ordinal lookup on a valid module.
-            ImportSymbol::Ordinal(o) => unsafe { GetProcAddress(self.module, *o as usize as _) }
-                .map(|f| f as *const () as usize),
-        }
+        let rva = self.export_entry(symbol)?.rva?;
+        Some(self.base() + rva as usize)
+    }
+
+    /// The export table's entry for `symbol`, read from the image's file
+    /// rather than asked of the host (`GetProcAddress`), which would load
+    /// the DLL a forwarder names. Names are compared exactly, as there.
+    fn export_entry(&self, symbol: &ImportSymbol) -> Option<&ExportInfo> {
+        self.info.exports.iter().find(|export| match symbol {
+            ImportSymbol::Name { name, .. } => export.name.as_deref() == Some(name.as_str()),
+            ImportSymbol::Ordinal(ordinal) => export.ordinal == *ordinal,
+        })
     }
 
     /// Fills every IAT slot of the image.

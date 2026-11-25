@@ -1,8 +1,11 @@
 //! Names a title's image gives us, before they are used: the DLL names of
 //! its import tables (and of its `LoadLibrary` calls), which become file
-//! paths. Pure, so that the rules are tested on every host.
+//! paths, and the forwarder strings of its export tables. Pure, so that the
+//! rules are tested on every host.
 
 use std::path::{Path, PathBuf};
+
+use victory_pe::ImportSymbol;
 
 /// Device names Windows reserves in every folder, with or without an
 /// extension ("Naming Files, Paths, and Namespaces",
@@ -45,6 +48,35 @@ pub fn title_dll_path(dir: &Path, name: &str) -> Option<PathBuf> {
         return None;
     }
     Some(dir.join(name))
+}
+
+/// What a forwarded export names: the DLL's file name and the export in it.
+///
+/// A forwarder string is `DLL.function` or `DLL.#ordinal`, the DLL without
+/// its extension (PE Format, "Export Address Table",
+/// <https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#export-address-table>).
+/// The format says nothing of a string with more than one dot, where the
+/// DLL's name and the function's cannot be told apart, so that one is
+/// refused like every other string that is not of these two forms.
+pub fn forward_target(forward: &str) -> Option<(String, ImportSymbol)> {
+    let (dll, export) = forward.split_once('.')?;
+    if dll.is_empty() || export.is_empty() || export.contains('.') {
+        return None;
+    }
+    let symbol = match export.strip_prefix('#') {
+        Some(ordinal) => {
+            // Digits only: `parse` alone would take a sign.
+            if ordinal.is_empty() || !ordinal.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            ImportSymbol::Ordinal(ordinal.parse().ok()?)
+        }
+        None => ImportSymbol::Name {
+            hint: 0,
+            name: export.to_owned(),
+        },
+    };
+    Some((format!("{dll}.dll"), symbol))
 }
 
 #[cfg(test)]
@@ -121,6 +153,54 @@ mod tests {
             let path = path.unwrap();
             assert_eq!(path.parent(), Some(dir), "{plain:?}");
             assert_eq!(path.file_name().and_then(|n| n.to_str()), Some(plain));
+        }
+    }
+
+    #[test]
+    fn forward_target_reads_the_two_documented_forms() {
+        let named = |name: &str| ImportSymbol::Name {
+            hint: 0,
+            name: name.to_owned(),
+        };
+        assert_eq!(
+            forward_target("title_a.title_a_named"),
+            Some(("title_a.dll".to_owned(), named("title_a_named")))
+        );
+        assert_eq!(
+            forward_target("MYDLL.#27"),
+            Some(("MYDLL.dll".to_owned(), ImportSymbol::Ordinal(27)))
+        );
+        assert_eq!(
+            forward_target("api-ms-win-core-heap-l1-1-0.HeapAlloc"),
+            Some((
+                "api-ms-win-core-heap-l1-1-0.dll".to_owned(),
+                named("HeapAlloc")
+            ))
+        );
+        assert_eq!(
+            forward_target("a.#65535"),
+            Some(("a.dll".to_owned(), ImportSymbol::Ordinal(65535)))
+        );
+    }
+
+    #[test]
+    fn forward_target_refuses_everything_else() {
+        for refused in [
+            "",
+            "nodot",
+            ".name",
+            "dll.",
+            ".",
+            "a.b.c",
+            "a.dll.name",
+            "a.#",
+            "a.#x",
+            "a.#+7",
+            "a.#-7",
+            "a.#65536",
+            "a.#7.b",
+        ] {
+            assert_eq!(forward_target(refused), None, "{refused:?}");
         }
     }
 }
