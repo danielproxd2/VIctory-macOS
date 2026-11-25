@@ -56,14 +56,14 @@ const EXCEPTIONS: &[Exception] = &[
     Exception {
         path: "crates/victory-gpu/src/clamp_bytecode.rs",
         reason: "our own clamp.hlsl compiled by Microsoft's compilers, which Wine cannot run; written by `cargo xtask embed-clamp`, which prints this entry's numbers",
-        len: 49067,
-        fnv: 0xfa974a25879aa281,
+        len: 53443,
+        fnv: 0x54edae24f410269c,
     },
     Exception {
         path: "crates/victory-gpu/src/depth_bytecode.rs",
         reason: "our own depth.hlsl compiled by Microsoft's compilers, which Wine cannot run; written by `cargo xtask embed-depth`, which prints this entry's numbers. Pinned now as the form without bytes: the shader was not built yet",
-        len: 49637,
-        fnv: 0x859d11526b34dc4d,
+        len: 37785,
+        fnv: 0x0df0ecbfd54c2196,
     },
 ];
 
