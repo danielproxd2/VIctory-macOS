@@ -482,12 +482,75 @@ pub unsafe fn report_unhandled(info: *const EXCEPTION_POINTERS) {
 /// # Safety
 /// `at`'s page is readable.
 unsafe fn instruction_bytes(at: usize) -> String {
+    // SAFETY: forwarded from the caller.
+    let (bytes, n) = unsafe { instruction_code(at) };
+    let hex: Vec<_> = bytes[..n].iter().map(|b| format!("{b:02x}")).collect();
+    hex.join(" ")
+}
+
+/// The bytes [`instruction_bytes`] prints, and how many there are.
+///
+/// # Safety
+/// `at`'s page is readable.
+unsafe fn instruction_code(at: usize) -> ([u8; 15], usize) {
     let n = (0x1000 - (at & 0xfff)).min(15);
+    let mut bytes = [0u8; 15];
     // SAFETY: `n` bytes from `at` stay inside its page, which the caller
     // says is readable.
-    let bytes = unsafe { std::slice::from_raw_parts(at as *const u8, n) };
-    let hex: Vec<_> = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    hex.join(" ")
+    unsafe { std::ptr::copy_nonoverlapping(at as *const u8, bytes.as_mut_ptr(), n) };
+    (bytes, n)
+}
+
+/// The name of the instruction `code` starts with, if it is one only AMD
+/// CPUs have, a console title may use and [`emulate_amd_only`] has no
+/// substitute for:
+///
+/// * `rdpru` (`0f 01 fd`) reads the MPERF or APERF counter. There is no
+///   such counter to read here, and no value to make up for one.
+/// * SSE4a's `movntss`/`movntsd` (`f3`/`f2 [rex] 0f 2b /r`, a memory
+///   operand): scalar non-temporal stores.
+///
+/// A report that names one says what is missing; the bytes alone leave
+/// that to be looked up. `None` for every other instruction, the emulated
+/// ones too (one of those is reported when it could not be emulated where
+/// it stood, which is not the instruction being unsupported), and for one
+/// `code` does not hold whole.
+fn unsupported_amd_instruction(code: &[u8]) -> Option<&'static str> {
+    let (name, rest) = match code {
+        [0x0f, 0x01, 0xfd, ..] => return Some("rdpru"),
+        [0xf3, rest @ ..] => ("movntss", rest),
+        [0xf2, rest @ ..] => ("movntsd", rest),
+        _ => return None,
+    };
+    let rest = match rest {
+        [rex, rest @ ..] if rex & 0xf0 == 0x40 => rest,
+        _ => rest,
+    };
+    match rest {
+        // Only the store to memory exists.
+        [0x0f, 0x2b, modrm, ..] if modrm >> 6 != 3 => Some(name),
+        _ => None,
+    }
+}
+
+/// The detail of a report for the instruction at `at` that the CPU
+/// refused with `exception`: its bytes, and for an illegal instruction
+/// that [`unsupported_amd_instruction`] knows, its name ahead of them.
+///
+/// # Safety
+/// `at`'s page is readable.
+unsafe fn refused_instruction(exception: i32, at: usize) -> String {
+    // SAFETY: forwarded from the caller.
+    let (bytes, n) = unsafe { instruction_code(at) };
+    // SAFETY: as above.
+    let hex = unsafe { instruction_bytes(at) };
+    let name = (exception == EXCEPTION_ILLEGAL_INSTRUCTION)
+        .then(|| unsupported_amd_instruction(&bytes[..n]))
+        .flatten();
+    match name {
+        Some(name) => format!(" (unsupported AMD instruction {name}: code {hex})"),
+        None => format!(" (code {hex})"),
+    }
 }
 
 /// MSVC's code for a C++ `throw`, and its magic first parameter.
@@ -655,7 +718,7 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         format!(" (C++ {what} thrown)")
     } else if code == EXCEPTION_ILLEGAL_INSTRUCTION || code == EXCEPTION_PRIV_INSTRUCTION {
         // SAFETY: the CPU refused the instruction at `at`, so it fetched it.
-        format!(" (code {})", unsafe { instruction_bytes(at) })
+        unsafe { refused_instruction(code, at) }
     } else {
         String::new()
     };
@@ -1725,6 +1788,82 @@ mod tests {
         assert_eq!(Image::loaded_at(base + 0x1000), None);
         assert_eq!(Image::loaded_at(0), None);
         assert_eq!(Image::loaded_at(usize::MAX), None);
+    }
+
+    #[test]
+    fn amd_instructions_without_a_substitute_are_named() {
+        let named = unsupported_amd_instruction;
+        assert_eq!(named(&[0x0f, 0x01, 0xfd]), Some("rdpru"));
+        assert_eq!(named(&[0x0f, 0x01, 0xfd, 0x48, 0x89, 0xc1]), Some("rdpru"));
+        // movntss [rax], xmm0; movntsd [rax], xmm0; with REX: [r8], xmm9;
+        // with a displacement the slice does not have to hold.
+        assert_eq!(named(&[0xf3, 0x0f, 0x2b, 0x00]), Some("movntss"));
+        assert_eq!(named(&[0xf2, 0x0f, 0x2b, 0x00]), Some("movntsd"));
+        assert_eq!(named(&[0xf3, 0x45, 0x0f, 0x2b, 0x08]), Some("movntss"));
+        assert_eq!(named(&[0xf2, 0x0f, 0x2b, 0x80]), Some("movntsd"));
+        // A register operand is no instruction; without the prefix it is
+        // movntps, which every x86-64 CPU has.
+        assert_eq!(named(&[0xf3, 0x0f, 0x2b, 0xc0]), None);
+        assert_eq!(named(&[0xf2, 0x41, 0x0f, 0x2b, 0xc1]), None);
+        assert_eq!(named(&[0x0f, 0x2b, 0x00]), None);
+        assert_eq!(named(&[0x66, 0x0f, 0x2b, 0x00]), None);
+        // Cut short, at every length.
+        for whole in [&[0x0f, 0x01, 0xfd][..], &[0xf3, 0x45, 0x0f, 0x2b, 0x08]] {
+            for n in 0..whole.len() {
+                assert_eq!(named(&whole[..n]), None, "{:02x?}", &whole[..n]);
+            }
+        }
+        // The emulated ones have no name here: clzero, monitorx, mwaitx,
+        // extrq, insertq (both forms), clwb. Nor has anything else.
+        for other in [
+            &[0x0f, 0x01, 0xfc][..],
+            &[0x0f, 0x01, 0xfa],
+            &[0x0f, 0x01, 0xfb],
+            &[0x66, 0x0f, 0x78, 0xc0, 0x08, 0x14],
+            &[0x66, 0x0f, 0x79, 0xc1],
+            &[0xf2, 0x0f, 0x78, 0xc1, 0x10, 0x10],
+            &[0xf2, 0x0f, 0x79, 0xc1],
+            &[0x66, 0x0f, 0xae, 0x30],
+            &[0x0f, 0x0b],
+            &[0x0f, 0x01, 0xf9],
+            &[0xf3, 0x0f, 0x01, 0xfd],
+            &[0xcc],
+        ] {
+            assert_eq!(named(other), None, "{other:02x?}");
+        }
+    }
+
+    /// The report's detail for a refused instruction: the name where there
+    /// is one, the bytes always. Nothing is executed, so this is the same
+    /// on a CPU that has the instruction.
+    #[test]
+    fn a_refused_amd_instruction_is_reported_by_name() {
+        // rdpru, then mov rcx, rax and padding.
+        let mut code = [0x90_u8; 32];
+        code[..6].copy_from_slice(&[0x0f, 0x01, 0xfd, 0x48, 0x89, 0xc1]);
+        let at = code.as_ptr() as usize;
+        // SAFETY: `code` is readable, and 15 bytes from each address used
+        // stay inside it or inside its page.
+        let detail = |exception, at| unsafe { refused_instruction(exception, at) };
+        let rdpru = detail(EXCEPTION_ILLEGAL_INSTRUCTION, at);
+        assert!(
+            rdpru.starts_with(" (unsupported AMD instruction rdpru: code 0f 01 fd 48 89 c1 90"),
+            "{rdpru}"
+        );
+        // Not an illegal instruction: no name. Not a known one: no name.
+        let privileged = detail(EXCEPTION_PRIV_INSTRUCTION, at);
+        assert!(
+            privileged.starts_with(" (code 0f 01 fd 48 89 c1 90"),
+            "{privileged}"
+        );
+        let other = detail(EXCEPTION_ILLEGAL_INSTRUCTION, at + 3);
+        assert!(other.starts_with(" (code 48 89 c1 90"), "{other}");
+        code[8..12].copy_from_slice(&[0xf2, 0x0f, 0x2b, 0x00]);
+        let movntsd = detail(EXCEPTION_ILLEGAL_INSTRUCTION, code.as_ptr() as usize + 8);
+        assert!(
+            movntsd.starts_with(" (unsupported AMD instruction movntsd: code f2 0f 2b 00 90"),
+            "{movntsd}"
+        );
     }
 
     #[test]
