@@ -1677,7 +1677,10 @@ mod tests {
         // On a busy host the thread above may get to run only later (seen
         // under Wine with other test runs on the machine): then the request
         // fails as it should, and there is nothing to check here.
-        let window = std::time::Duration::from_millis(LATE_LIST_TRIES.into());
+        // Half of it is asked of the host: the request's sleeps may each end
+        // a little early, and a list filled near the end of the window (seen
+        // once under Wine, at a failed request) settles nothing either way.
+        let window = std::time::Duration::from_millis(LATE_LIST_TRIES.into()) / 2;
         if status != S_OK && filled > window {
             return crate::testing::skip_unless_required(
                 "VICTORY_REQUIRE_IDLE",

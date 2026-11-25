@@ -389,6 +389,10 @@ fn casts_item(casts: &Casts) -> Item {
         Casts::NotAsked(why) => return Item::not_checked(name, why.clone()),
         Casts::Asked(asked) => asked,
     };
+    // What D3DMetal was measured to refuse (docs/macos.md): the only
+    // refusals the runtime is known to get by without.
+    const KNOWN: [u32; 3] = [89, 68, 69];
+    let unknown = asked.iter().any(|a| !a.taken && !KNOWN.contains(&a.cast));
     let refused: Vec<String> = asked
         .iter()
         .filter(|a| !a.taken)
@@ -410,6 +414,17 @@ fn casts_item(casts: &Casts) -> Item {
                 "measured on 4 by 4 textures: the device refuses each of the {} castable formats \
                  asked, so no texture is castable: views in another format are refused or copied",
                 refused.len()
+            ),
+        )
+    } else if unknown {
+        Item::warning(
+            name,
+            format!(
+                "measured on 4 by 4 textures: the device refuses {} in a texture's castable \
+                 formats and takes the other {taken} asked. Not all of these are refusals seen \
+                 before (docs/macos.md names 89, 68 and 69): VIctory leaves the refused ones \
+                 out, and what a title does with views in them is not known",
+                refused.join(", ")
             ),
         )
     } else {

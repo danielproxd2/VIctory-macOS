@@ -83,7 +83,7 @@ pub const STEPS: [&str; 16] = [
     "D3D12SerializeRootSignature",
     "CreateRootSignature (device 0x80)",
     "CreatePipelineState (device 0x2b0)",
-    "Reset (list 0x50)",
+    "Reset (allocator 0x40, then list 0x50)",
     "the frame's token (device 0x280)",
     "no frame showed anything drawn",
 ];

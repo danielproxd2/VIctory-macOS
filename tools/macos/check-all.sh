@@ -40,8 +40,9 @@
 #   VICTORY_REQUIRE_NTFS VICTORY_REQUIRE_IDLE VICTORY_REQUIRE_FIDELITYFX
 #   VICTORY_REQUIRE_POLICY VICTORY_REQUIRE_RECONNECT
 # One of them set in the environment of this script reaches the Wine runs
-# all the same. No switch is set for the native runs: they have no device,
-# no validator and no Wine, and print their skip lines.
+# all the same. The native runs have every switch taken out of their
+# environment: they have no device, no validator and no Wine, and print
+# their skip lines.
 #
 # Each step's output goes to a file of its own in a new folder per run under
 # VICTORY_CHECK_DIR (default: ~/Library/Caches/victory-macos/check), named
@@ -195,9 +196,12 @@ if [ "$WINE_RUNS" = 1 ]; then
     fi
     # The newest DXC folder that has the validator.
     DXC_DIR=""
-    for dir in "$HOME"/Library/Caches/victory-macos/dxc/*/; do
-        [ ! -f "${dir}dxil.dll" ] || DXC_DIR="${dir%/}"
-    done
+    # In version order (v1.10 after v1.9), not name order.
+    while IFS= read -r dir; do
+        [ ! -f "$dir/dxil.dll" ] || DXC_DIR="$dir"
+    done <<EOF
+$(ls -d "$HOME"/Library/Caches/victory-macos/dxc/*/ 2>/dev/null | sed 's:/$::' | sort -V)
+EOF
     if [ -z "$DXIL_UNIX" ] && [ -n "$DXC_DIR" ]; then
         DXIL_UNIX="$DXC_DIR/dxil.dll"
     fi
@@ -256,10 +260,17 @@ step() {
 
 step "policy" policy.log "$CARGO" xtask policy
 step "fmt-check" fmt-check.log "$CARGO" xtask fmt-check
-step "native tests (dev)" native-dev.log "$CARGO" test --workspace --locked --no-fail-fast
+# A switch the caller exported would fail the native tests for what no
+# native run has.
+NATIVE_ENV=(env)
+for switch in GPU DXIL CLAMP DEPTH HLSL WARP DIFF PC_GPU NTFS IDLE FIDELITYFX POLICY RECONNECT; do
+    NATIVE_ENV+=(-u "VICTORY_REQUIRE_$switch")
+done
+step "native tests (dev)" native-dev.log \
+    "${NATIVE_ENV[@]}" "$CARGO" test --workspace --locked --no-fail-fast
 if [ "$QUICK" = 0 ]; then
     step "native tests (release)" native-release.log \
-        "$CARGO" test --workspace --locked --no-fail-fast --release
+        "${NATIVE_ENV[@]}" "$CARGO" test --workspace --locked --no-fail-fast --release
 fi
 if [ "$WINE_RUNS" = 1 ]; then
     for profile in dev release; do

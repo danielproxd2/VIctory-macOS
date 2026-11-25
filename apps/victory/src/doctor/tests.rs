@@ -458,6 +458,11 @@ fn refused_castable_formats_are_named() {
         some.text
     );
 
+    // A refusal not measured before is not called ok.
+    let new = casts_item(&asked(&[89, 29]));
+    assert_eq!(new.mark, Mark::Warning);
+    assert!(new.text.contains("(29)"), "{}", new.text);
+
     let none = casts_item(&asked(&[29, 87, 89, 49, 68, 69]));
     assert_eq!(none.mark, Mark::Warning);
 
