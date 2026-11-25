@@ -39,14 +39,7 @@ pub fn rectangle_gs(vs: &[u8]) -> Result<Vec<u8>, ShaderError> {
             let mut comps = Vec::new();
             for col in 0..e.cols {
                 let args = [s.m.i32(id as u32), s.m.i32(0), s.m.i8(col), s.m.i32(k)];
-                comps.push(s.op(
-                    b,
-                    &format!("loadInput{suffix}"),
-                    Attr::ReadNone,
-                    ty,
-                    4,
-                    &args,
-                ));
+                comps.push(s.op(b, &format!("loadInput{suffix}"), Attr::ReadNone, ty, 4, &args));
             }
             values.push(comps);
         }
@@ -77,14 +70,7 @@ pub fn rectangle_gs(vs: &[u8]) -> Result<Vec<u8>, ShaderError> {
                 for col in 0..e.cols {
                     let v = corners[k][id][usize::from(col)];
                     let args = [s.m.i32(id as u32), s.m.i32(0), s.m.i8(col), v];
-                    s.op(
-                        b,
-                        &format!("storeOutput{suffix}"),
-                        Attr::NoUnwind,
-                        s.t.void,
-                        5,
-                        &args,
-                    );
+                    s.op(b, &format!("storeOutput{suffix}"), Attr::NoUnwind, s.t.void, 5, &args);
                 }
             }
             let stream = [s.m.i8(0)];
@@ -128,22 +114,13 @@ mod tests {
         let b = s.entry;
         let (inputs, outputs) = if pixel {
             (
-                vec![
-                    element("SV_Position", 3, 4, 0, 4),
-                    element("TEXCOORD", 0, 2, 1, 2),
-                ],
+                vec![element("SV_Position", 3, 4, 0, 4), element("TEXCOORD", 0, 2, 1, 2)],
                 vec![element("SV_Target", 16, 0, 0, 4)],
             )
         } else {
             (
-                vec![
-                    element("POSITION", 0, 0, 0, 4),
-                    element("TEXCOORD", 0, 0, 1, 2),
-                ],
-                vec![
-                    element("SV_Position", 3, 0, 0, 4),
-                    element("TEXCOORD", 0, 0, 1, 2),
-                ],
+                vec![element("POSITION", 0, 0, 0, 4), element("TEXCOORD", 0, 0, 1, 2)],
+                vec![element("SV_Position", 3, 0, 0, 4), element("TEXCOORD", 0, 0, 1, 2)],
             )
         };
         let load = |s: &mut Shader, id: u32, col: u8| {

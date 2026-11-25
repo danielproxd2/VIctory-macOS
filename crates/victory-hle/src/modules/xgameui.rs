@@ -69,8 +69,7 @@ extern "system" fn text_entry_async(
     scope: u32,
     max_length: u32,
 ) -> HRESULT {
-    let [title, description, default] =
-        [title, description, default].map(|t| text(t).unwrap_or_default());
+    let [title, description, default] = [title, description, default].map(|t| text(t).unwrap_or_default());
     let max_length = max_length_for(scope, max_length);
     tracing::info!(title, description, max_length, "text entry");
     xasync::pending_with(block, (&raw const TEXT).cast(), move || {
@@ -614,12 +613,7 @@ mod dialog {
         }
     }
 
-    extern "system" fn procedure(
-        dialog: HWND,
-        message: u32,
-        wparam: WPARAM,
-        lparam: LPARAM,
-    ) -> isize {
+    extern "system" fn procedure(dialog: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> isize {
         // SAFETY: our dialog; its user data is the `Entry` from `ask`,
         // stored at WM_INITDIALOG.
         unsafe {
@@ -870,29 +864,19 @@ mod tests {
             u32,
         ) -> HRESULT;
         type Size = extern "system" fn(This, *mut AsyncBlock, *mut u32) -> HRESULT;
-        type Result_ =
-            extern "system" fn(This, *mut AsyncBlock, u32, *mut c_char, *mut u32) -> HRESULT;
+        type Result_ = extern "system" fn(This, *mut AsyncBlock, u32, *mut c_char, *mut u32) -> HRESULT;
         let null = std::ptr::null();
         let entry = method::<Entry>(&OBJECT, 0x88);
         // Dismissed: cancelled.
         let mut b = block();
-        assert_eq!(
-            entry(this, &mut b, c"Name".as_ptr(), null, null, 0, 16),
-            S_OK
-        );
+        assert_eq!(entry(this, &mut b, c"Name".as_ptr(), null, null, 0, 16), S_OK);
         assert_eq!(xasync::XAsyncGetStatus(&mut b, true), E_ABORT);
         let mut size = 0;
-        assert_eq!(
-            method::<Size>(&OBJECT, 0x90)(this, &mut b, &mut size),
-            E_ABORT
-        );
+        assert_eq!(method::<Size>(&OBJECT, 0x90)(this, &mut b, &mut size), E_ABORT);
         // Typed: the text, cut to the limit, with its NUL.
         let mut b = block();
         let default = c"abc".as_ptr();
-        assert_eq!(
-            entry(this, &mut b, c"Type".as_ptr(), null, default, 0, 6),
-            S_OK
-        );
+        assert_eq!(entry(this, &mut b, c"Type".as_ptr(), null, default, 0, 6), S_OK);
         assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
         assert_eq!(method::<Size>(&OBJECT, 0x90)(this, &mut b, &mut size), S_OK);
         assert_eq!(size, 7);

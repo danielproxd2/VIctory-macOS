@@ -363,11 +363,7 @@ impl Host {
                 BytecodeLength: ps.len(),
             },
             GS: D3D12_SHADER_BYTECODE {
-                pShaderBytecode: if gs.is_empty() {
-                    std::ptr::null()
-                } else {
-                    gs.as_ptr().cast()
-                },
+                pShaderBytecode: if gs.is_empty() { std::ptr::null() } else { gs.as_ptr().cast() },
                 BytecodeLength: gs.len(),
             },
             SampleMask: u32::MAX,

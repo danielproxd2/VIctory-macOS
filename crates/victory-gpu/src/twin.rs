@@ -109,12 +109,7 @@ fn plane_formats(console: u32) -> Option<&'static [u32]> {
 fn make(console: u32, depth: &ID3D12Resource) -> Option<Twin> {
     let host = host()?;
     let Some(formats) = plane_formats(console) else {
-        once(
-            console,
-            0,
-            0,
-            "a depth texture of this format gets no writable twin: its unordered writes are dropped",
-        );
+        once(console, 0, 0, "a depth texture of this format gets no writable twin: its unordered writes are dropped");
         return None;
     };
     // SAFETY: a live resource.
@@ -136,14 +131,7 @@ fn make(console: u32, depth: &ID3D12Resource) -> Option<Twin> {
         let mut texture: Option<ID3D12Resource> = None;
         // SAFETY: plain creation; our out pointer.
         let made = unsafe {
-            host.device.CreateCommittedResource(
-                &heap,
-                D3D12_HEAP_FLAG_NONE,
-                &desc,
-                D3D12_RESOURCE_STATE_COMMON,
-                None,
-                &mut texture,
-            )
+            host.device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut texture)
         };
         if let Err(e) = made {
             tracing::warn!(error = %e, ?desc, "no writable twin for a depth texture");
@@ -160,24 +148,12 @@ fn make(console: u32, depth: &ID3D12Resource) -> Option<Twin> {
     let mut df = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); n as usize];
     let mut drows = vec![0u32; n as usize];
     // SAFETY: outputs sized for `n` subresources.
-    unsafe {
-        host.device.GetCopyableFootprints(
-            &dd,
-            0,
-            n,
-            0,
-            Some(df.as_mut_ptr()),
-            Some(drows.as_mut_ptr()),
-            None,
-            None,
-        )
-    };
+    unsafe { host.device.GetCopyableFootprints(&dd, 0, n, 0, Some(df.as_mut_ptr()), Some(drows.as_mut_ptr()), None, None) };
     let mut routes = Vec::new();
     let mut at = 0u64;
     let mut place = |mut f: D3D12_PLACED_SUBRESOURCE_FOOTPRINT, rows: u32| {
         f.Offset = at;
-        let bytes =
-            u64::from(f.Footprint.RowPitch) * u64::from(rows) * u64::from(f.Footprint.Depth);
+        let bytes = u64::from(f.Footprint.RowPitch) * u64::from(rows) * u64::from(f.Footprint.Depth);
         at = (at + bytes).next_multiple_of(512);
         f
     };
@@ -187,51 +163,20 @@ fn make(console: u32, depth: &ID3D12Resource) -> Option<Twin> {
         let mut tf = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); subs as usize];
         let mut trows = vec![0u32; subs as usize];
         // SAFETY: outputs sized for `subs` subresources.
-        unsafe {
-            host.device.GetCopyableFootprints(
-                &td,
-                0,
-                subs,
-                0,
-                Some(tf.as_mut_ptr()),
-                Some(trows.as_mut_ptr()),
-                None,
-                None,
-            )
-        };
+        unsafe { host.device.GetCopyableFootprints(&td, 0, subs, 0, Some(tf.as_mut_ptr()), Some(trows.as_mut_ptr()), None, None) };
         for s in 0..subs {
             let d = (p as u32 * subs + s) as usize;
             let same = df[d].Footprint.Format == td.Format;
             // The same bytes: both sides copy through the depth texture's
             // footprint; else each its own, converted between.
             let route = if same {
-                Route {
-                    plane: p,
-                    twin_sub: s,
-                    depth_sub: d as u32,
-                    twin: place(df[d], drows[d]),
-                    depth: None,
-                }
+                Route { plane: p, twin_sub: s, depth_sub: d as u32, twin: place(df[d], drows[d]), depth: None }
             } else {
                 let twin = place(tf[s as usize], trows[s as usize]);
-                Route {
-                    plane: p,
-                    twin_sub: s,
-                    depth_sub: d as u32,
-                    twin,
-                    depth: Some(place(df[d], drows[d])),
-                }
+                Route { plane: p, twin_sub: s, depth_sub: d as u32, twin, depth: Some(place(df[d], drows[d])) }
             };
-            if route.depth.is_some()
-                && (td.Format != DXGI_FORMAT_R16_TYPELESS
-                    || df[d].Footprint.Format != DXGI_FORMAT_R32_TYPELESS)
-            {
-                once(
-                    console,
-                    td.Format.0 as u32,
-                    df[d].Footprint.Format.0 as u32,
-                    "a depth twin plane with no conversion to the host's: not made",
-                );
+            if route.depth.is_some() && (td.Format != DXGI_FORMAT_R16_TYPELESS || df[d].Footprint.Format != DXGI_FORMAT_R32_TYPELESS) {
+                once(console, td.Format.0 as u32, df[d].Footprint.Format.0 as u32, "a depth twin plane with no conversion to the host's: not made");
                 return None;
             }
             routes.push(route);
@@ -239,19 +184,8 @@ fn make(console: u32, depth: &ID3D12Resource) -> Option<Twin> {
     }
     let scratch = scratch_buffer(at)?;
     crate::host::name(&scratch, || format!("depth twin copies {at:#x}"));
-    tracing::debug!(
-        console,
-        width = dd.Width,
-        height = dd.Height,
-        planes = planes.len(),
-        "a writable twin for a depth texture"
-    );
-    Some(Twin {
-        planes,
-        newer: AtomicU8::new(DEPTH),
-        routes,
-        scratch,
-    })
+    tracing::debug!(console, width = dd.Width, height = dd.Height, planes = planes.len(), "a writable twin for a depth texture");
+    Some(Twin { planes, newer: AtomicU8::new(DEPTH), routes, scratch })
 }
 
 /// A default-heap buffer of `size` bytes shaders may write, in the common
@@ -268,10 +202,7 @@ fn scratch_buffer(size: u64) -> Option<ID3D12Resource> {
         Height: 1,
         DepthOrArraySize: 1,
         MipLevels: 1,
-        SampleDesc: DXGI_SAMPLE_DESC {
-            Count: 1,
-            Quality: 0,
-        },
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
         Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
         Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
         ..Default::default()
@@ -279,14 +210,7 @@ fn scratch_buffer(size: u64) -> Option<ID3D12Resource> {
     let mut buffer: Option<ID3D12Resource> = None;
     // SAFETY: plain creation.
     let made = unsafe {
-        host.device.CreateCommittedResource(
-            &heap,
-            D3D12_HEAP_FLAG_NONE,
-            &desc,
-            D3D12_RESOURCE_STATE_COMMON,
-            None,
-            &mut buffer,
-        )
+        host.device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buffer)
     };
     made.ok().and(buffer)
 }
@@ -315,10 +239,7 @@ pub(crate) fn uav(
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<ID3D12Resource> {
     let console = crate::resource::title_format(resource)?;
-    let twin = copy
-        .twin
-        .get_or_init(|| make(console, &copy.texture))
-        .as_ref()?;
+    let twin = copy.twin.get_or_init(|| make(console, &copy.texture)).as_ref()?;
     let mut words = *words?;
     const TEXTURE_2D: u32 = 4;
     const TEXTURE_2D_ARRAY: u32 = 5;
@@ -328,23 +249,13 @@ pub(crate) fn uav(
         TEXTURE_2D => 3,
         TEXTURE_2D_ARRAY => 5,
         other => {
-            once(
-                console,
-                words[0],
-                other,
-                "an unordered view of a depth texture of this dimension: not made",
-            );
+            once(console, words[0], other, "an unordered view of a depth texture of this dimension: not made");
             return None;
         }
     };
     let plane = words[plane_word] as usize;
     let Some(texture) = twin.planes.get(plane) else {
-        once(
-            console,
-            words[0],
-            plane as u32,
-            "an unordered view of a depth plane the twin does not have: not made",
-        );
+        once(console, words[0], plane as u32, "an unordered view of a depth plane the twin does not have: not made");
         return None;
     };
     // SAFETY: a live resource.
@@ -362,54 +273,19 @@ pub(crate) fn uav(
             _ => 62,
         }
     };
-    once(
-        console,
-        words[0],
-        plane as u32,
-        "an unordered view of a depth texture, made on its writable twin",
-    );
+    once(console, words[0], plane as u32, "an unordered view of a depth texture, made on its writable twin");
     words[0] = format;
     words[plane_word] = 0;
     // SAFETY: 40 bytes in the host's layout.
-    let desc = unsafe {
-        std::ptr::from_ref(&words)
-            .cast::<D3D12_UNORDERED_ACCESS_VIEW_DESC>()
-            .read_unaligned()
-    };
+    let desc = unsafe { std::ptr::from_ref(&words).cast::<D3D12_UNORDERED_ACCESS_VIEW_DESC>().read_unaligned() };
     // SAFETY: a live texture and a slot of our heap.
-    unsafe {
-        host()?
-            .device
-            .CreateUnorderedAccessView(&texture.texture, None, Some(&desc), at)
-    };
+    unsafe { host()?.device.CreateUnorderedAccessView(&texture.texture, None, Some(&desc), at) };
     Some(texture.texture.clone())
 }
 
 /// Whether a format holds integers (`_UINT`, `_SINT`).
 fn integer(format: u32) -> bool {
-    matches!(
-        format,
-        3 | 4
-            | 7
-            | 8
-            | 12
-            | 14
-            | 17
-            | 18
-            | 25
-            | 30
-            | 32
-            | 36
-            | 38
-            | 42
-            | 43
-            | 50
-            | 52
-            | 57
-            | 59
-            | 62
-            | 64
-    )
+    matches!(format, 3 | 4 | 7 | 8 | 12 | 14 | 17 | 18 | 25 | 30 | 32 | 36 | 38 | 42 | 43 | 50 | 52 | 57 | 59 | 62 | 64)
 }
 
 /// Before a use in `list` of the depth texture `depth` (with `twin`) in
@@ -418,13 +294,8 @@ fn integer(format: u32) -> bool {
 /// unordered access the twin's planes are moved there and true returned:
 /// the depth texture itself is not used.
 pub(crate) fn route(list: &HostList, depth: &Arc<HostTexture>, twin: &Twin, wanted: u32) -> bool {
-    let side = if wanted & UNORDERED_ACCESS != 0 {
-        TWIN
-    } else {
-        DEPTH
-    };
-    let writes =
-        side == TWIN || wanted & (DEPTH_WRITE | RENDER_TARGET | COPY_DEST | RESOLVE_DEST) != 0;
+    let side = if wanted & UNORDERED_ACCESS != 0 { TWIN } else { DEPTH };
+    let writes = side == TWIN || wanted & (DEPTH_WRITE | RENDER_TARGET | COPY_DEST | RESOLVE_DEST) != 0;
     if let Some(to_depth) = list.twin_use(depth, side, writes)
         && twin.copy(&list.list, depth, to_depth, &mut |t, w| {
             list.move_texture(t, w)
@@ -435,11 +306,7 @@ pub(crate) fn route(list: &HostList, depth: &Arc<HostTexture>, twin: &Twin, want
     if side == DEPTH {
         return false;
     }
-    let barriers: Vec<_> = twin
-        .planes
-        .iter()
-        .filter_map(|p| list.move_texture(p, UNORDERED_ACCESS))
-        .collect();
+    let barriers: Vec<_> = twin.planes.iter().filter_map(|p| list.move_texture(p, UNORDERED_ACCESS)).collect();
     if !barriers.is_empty() {
         // SAFETY: an open list and live textures.
         unsafe { list.list.ResourceBarrier(&barriers) };
@@ -449,11 +316,7 @@ pub(crate) fn route(list: &HostList, depth: &Arc<HostTexture>, twin: &Twin, want
 
 impl Use {
     pub(crate) fn new(depth: &Arc<HostTexture>, side: u8, writes: bool) -> Self {
-        Use {
-            first: side,
-            last: writes.then_some(side),
-            depth: depth.clone(),
-        }
+        Use { first: side, last: writes.then_some(side), depth: depth.clone() }
     }
 
     /// A later use in the list needing `side`: whether a copy must be
@@ -497,9 +360,7 @@ fn submitted(first: u8, last: Option<u8>, newer: u8) -> (Option<bool>, u8) {
 /// At submission, for a list's twin uses in order: the copies its prelude
 /// records first (the depth texture and whether into it), the twins'
 /// newer sides moved on to where the list leaves them.
-pub(crate) fn at_submission<'a>(
-    uses: impl Iterator<Item = &'a Use>,
-) -> Vec<(Arc<HostTexture>, bool)> {
+pub(crate) fn at_submission<'a>(uses: impl Iterator<Item = &'a Use>) -> Vec<(Arc<HostTexture>, bool)> {
     let mut copies = Vec::new();
     for u in uses {
         let Some(Some(twin)) = u.depth.twin.get() else {
@@ -515,8 +376,7 @@ pub(crate) fn at_submission<'a>(
 }
 
 /// Moves a texture to a state for a copy: the barrier, if any.
-pub(crate) type Mover<'a> =
-    dyn FnMut(&Arc<HostTexture>, u32) -> Option<D3D12_RESOURCE_BARRIER> + 'a;
+pub(crate) type Mover<'a> = dyn FnMut(&Arc<HostTexture>, u32) -> Option<D3D12_RESOURCE_BARRIER> + 'a;
 
 impl Twin {
     /// Records into `l` the copy of the newer side into the other: from
@@ -524,27 +384,15 @@ impl Twin {
     /// the copy states (tracked by the list, or from their real states in
     /// a prelude). True if it ran our conversion, which replaces the
     /// list's compute root signature and pipeline.
-    pub(crate) fn copy(
-        &self,
-        l: &ID3D12GraphicsCommandList,
-        depth: &Arc<HostTexture>,
-        to_depth: bool,
-        mv: &mut Mover,
-    ) -> bool {
-        let (src, dst) = if to_depth {
-            (COPY_SOURCE, COPY_DEST)
-        } else {
-            (COPY_DEST, COPY_SOURCE)
-        };
+    pub(crate) fn copy(&self, l: &ID3D12GraphicsCommandList, depth: &Arc<HostTexture>, to_depth: bool, mv: &mut Mover) -> bool {
+        let (src, dst) = if to_depth { (COPY_SOURCE, COPY_DEST) } else { (COPY_DEST, COPY_SOURCE) };
         let mut barriers: Vec<_> = self.planes.iter().filter_map(|p| mv(p, src)).collect();
         barriers.extend(mv(depth, dst));
         let at = |r: &ID3D12Resource, sub: u32| D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: a borrowed pointer the copy does not release.
             pResource: unsafe { std::mem::transmute_copy(r) },
             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                SubresourceIndex: sub,
-            },
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: sub },
         };
         let placed = |f: D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: as above.
@@ -572,14 +420,7 @@ impl Twin {
                 if to_depth {
                     l.CopyTextureRegion(&placed(r.twin), 0, 0, 0, &at(plane, r.twin_sub), None);
                 } else {
-                    l.CopyTextureRegion(
-                        &placed(r.depth.unwrap_or(r.twin)),
-                        0,
-                        0,
-                        0,
-                        &at(&depth.texture, r.depth_sub),
-                        None,
-                    );
+                    l.CopyTextureRegion(&placed(r.depth.unwrap_or(r.twin)), 0, 0, 0, &at(&depth.texture, r.depth_sub), None);
                 }
             }
             if converts && let Some(c) = converter() {
@@ -590,23 +431,11 @@ impl Twin {
                 for r in &self.routes {
                     let Some(d) = r.depth else { continue };
                     let (t, d) = (r.twin.Footprint, d);
-                    let constants = [
-                        t.Width,
-                        t.Height,
-                        t.RowPitch,
-                        r.twin.Offset as u32,
-                        d.Footprint.RowPitch,
-                        d.Offset as u32,
-                        u32::from(to_depth),
-                        0,
-                    ];
+                    let constants = [t.Width, t.Height, t.RowPitch, r.twin.Offset as u32, d.Footprint.RowPitch, d.Offset as u32, u32::from(to_depth), 0];
                     l.SetComputeRoot32BitConstants(0, 8, constants.as_ptr().cast(), 0);
                     l.Dispatch(t.Width.div_ceil(2).div_ceil(64), t.Height, 1);
                 }
-                l.ResourceBarrier(&[
-                    uav_barrier(),
-                    state(UNORDERED_ACCESS as i32, COPY_SOURCE as i32),
-                ]);
+                l.ResourceBarrier(&[uav_barrier(), state(UNORDERED_ACCESS as i32, COPY_SOURCE as i32)]);
                 converted = true;
             } else {
                 l.ResourceBarrier(&[state(COPY_DEST as i32, COPY_SOURCE as i32)]);
@@ -614,14 +443,7 @@ impl Twin {
             for r in &self.routes {
                 let plane = &self.planes[r.plane].texture;
                 if to_depth {
-                    l.CopyTextureRegion(
-                        &at(&depth.texture, r.depth_sub),
-                        0,
-                        0,
-                        0,
-                        &placed(r.depth.unwrap_or(r.twin)),
-                        None,
-                    );
+                    l.CopyTextureRegion(&at(&depth.texture, r.depth_sub), 0, 0, 0, &placed(r.depth.unwrap_or(r.twin)), None);
                 } else {
                     l.CopyTextureRegion(&at(plane, r.twin_sub), 0, 0, 0, &placed(r.twin), None);
                 }
@@ -638,9 +460,7 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
         Anonymous: D3D12_RESOURCE_BARRIER_0 {
-            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                pResource: std::mem::ManuallyDrop::new(None),
-            }),
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
         },
     }
 }
@@ -767,10 +587,7 @@ fn from_bytecode(device: &ID3D12Device, bytes: &[u8]) -> windows::core::Result<C
         let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
-            CS: D3D12_SHADER_BYTECODE {
-                pShaderBytecode: bytes.as_ptr().cast(),
-                BytecodeLength: bytes.len(),
-            },
+            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: bytes.as_ptr().cast(), BytecodeLength: bytes.len() },
             ..Default::default()
         })?;
         Ok(Converter { root, pso })

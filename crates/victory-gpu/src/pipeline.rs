@@ -178,10 +178,7 @@ impl Shader {
 fn thread_cpu() -> (u64, u64) {
     use windows_sys::Win32::Foundation::FILETIME;
     use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
-    let mut t = [FILETIME {
-        dwLowDateTime: 0,
-        dwHighDateTime: 0,
-    }; 4];
+    let mut t = [FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 }; 4];
     let [created, exited, kernel, user] = &mut t;
     // SAFETY: four times of our own thread into our own variables.
     unsafe { GetThreadTimes(GetCurrentThread(), created, exited, kernel, user) };
@@ -202,10 +199,7 @@ fn thread_cpu_since(then: (u64, u64)) -> (u64, u64) {
 #[cfg(windows)]
 fn translate(container: &[u8]) -> (Result<Translated, String>, bool) {
     let (host, cached) = crate::shader_cache::host_shader(container);
-    (
-        host.and_then(|host| with_resources(container, host)),
-        cached,
-    )
+    (host.and_then(|host| with_resources(container, host)), cached)
 }
 
 #[cfg(windows)]
@@ -365,10 +359,7 @@ pub(crate) fn note_drop(this: This) {
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn note_why(why: String) {
     let mut drops = DROPS.lock().unwrap_or_else(|e| e.into_inner());
-    *drops
-        .get_or_insert_with(HashMap::new)
-        .entry(why)
-        .or_default() += 1;
+    *drops.get_or_insert_with(HashMap::new).entry(why).or_default() += 1;
 }
 
 /// The drops counted since the last call, most first (diagnostics).
@@ -674,11 +665,7 @@ impl Prebuild {
 
     /// Its shaders and state as a diagnostics build logs them.
     pub fn describe(&self) -> String {
-        let state = self
-            .graphics
-            .as_ref()
-            .map(|g| g.describe())
-            .unwrap_or_default();
+        let state = self.graphics.as_ref().map(|g| g.describe()).unwrap_or_default();
         format!("{:?}\t{state}", self.shaders)
     }
 
@@ -703,12 +690,10 @@ impl Prebuild {
         library::save(false);
         match made {
             Some(_) => Ok(()),
-            None => Err(
-                match self.shaders.iter().find(|s| s.translated().is_none()) {
-                    Some(s) => format!("{} shader does not translate", s.stage),
-                    None => "the host refuses it".into(),
-                },
-            ),
+            None => Err(match self.shaders.iter().find(|s| s.translated().is_none()) {
+                Some(s) => format!("{} shader does not translate", s.stage),
+                None => "the host refuses it".into(),
+            }),
         }
     }
 }
@@ -961,10 +946,7 @@ mod tests {
             stream: stream.as_ptr(),
         };
         let mut p = std::ptr::null();
-        assert_eq!(
-            create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p),
-            S_OK
-        );
+        assert_eq!(create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p), S_OK);
         // SAFETY: the stream points at live code and elements.
         let pre = unsafe { Prebuild::graphics(&stream) };
         let title = pipeline(p);

@@ -169,9 +169,7 @@ fn hard_faults() -> u64 {
     let mut buf = vec![0u8; 4 << 20];
     let mut ret = 0;
     // SAFETY: a buffer of that length.
-    if unsafe { NtQuerySystemInformation(PROCESSES, buf.as_mut_ptr(), buf.len() as u32, &mut ret) }
-        < 0
-    {
+    if unsafe { NtQuerySystemInformation(PROCESSES, buf.as_mut_ptr(), buf.len() as u32, &mut ret) } < 0 {
         return 0;
     }
     let mut at = 0usize;
@@ -180,9 +178,7 @@ fn hard_faults() -> u64 {
         let next = u32::from_le_bytes(entry[0..4].try_into().unwrap_or_default()) as usize;
         let pid = usize::from_le_bytes(entry[0x50..0x58].try_into().unwrap_or_default());
         if pid == id {
-            return u64::from(u32::from_le_bytes(
-                entry[0x10..0x14].try_into().unwrap_or_default(),
-            ));
+            return u64::from(u32::from_le_bytes(entry[0x10..0x14].try_into().unwrap_or_default()));
         }
         if next == 0 || at + next + 0x58 > buf.len() {
             return 0;
@@ -305,13 +301,8 @@ pub(crate) fn log(frames: f64) {
         })
         .collect();
     tracing::info!("  guard lock held per frame: {}", held.join(", "));
-    let mut snapshots: Vec<((u64, u64), u64)> = SNAPSHOTS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take()
-        .into_iter()
-        .flatten()
-        .collect();
+    let mut snapshots: Vec<((u64, u64), u64)> =
+        SNAPSHOTS.lock().unwrap_or_else(|e| e.into_inner()).take().into_iter().flatten().collect();
     snapshots.sort_by_key(|&(_, bytes)| std::cmp::Reverse(bytes));
     let snapshots: Vec<String> = snapshots
         .iter()

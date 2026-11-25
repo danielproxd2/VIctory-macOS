@@ -788,12 +788,7 @@ pub fn aliases(at: usize, len: usize, out: &mut Vec<(usize, usize)>) {
         .next_back()
         .filter(|(base, (size, _))| *base + size > at)
         .map(|(base, _)| *base);
-    let starts = first.into_iter().chain(
-        physical
-            .views
-            .range(at.saturating_add(1)..end)
-            .map(|(b, _)| *b),
-    );
+    let starts = first.into_iter().chain(physical.views.range(at.saturating_add(1)..end).map(|(b, _)| *b));
     for base in starts.collect::<Vec<_>>() {
         let (size, slice) = &physical.views[&base];
         let (from, to) = (at.max(base), end.min(base + size));
@@ -1098,11 +1093,7 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     let Some(runs) = runs(pages, offset, data.len()) else {
         return false;
     };
-    let shown = shown_at(
-        pages
-            .get(offset / PAGE..(offset + data.len()).div_ceil(PAGE))
-            .unwrap_or(&[]),
-    );
+    let shown = shown_at(pages.get(offset / PAGE..(offset + data.len()).div_ceil(PAGE)).unwrap_or(&[]));
     let (mut within, mut done) = (offset % PAGE, 0);
     for (slice, n) in &runs {
         let Some(mut view) = View::map(slice, *n) else {
@@ -1154,11 +1145,7 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
         view: View::map(slice, *n)?,
         within: offset % PAGE,
         len,
-        shown: shown_at(
-            pages
-                .get(offset / PAGE..(offset + len).div_ceil(PAGE))
-                .unwrap_or(&[]),
-        ),
+        shown: shown_at(pages.get(offset / PAGE..(offset + len).div_ceil(PAGE)).unwrap_or(&[])),
     })
 }
 
@@ -2741,11 +2728,7 @@ mod tests {
         both.sort_unstable();
         assert_eq!(both, [b as usize, at(b, 1) as usize]);
         assert!(map_alias(b as u64, 0, PAGE as u64));
-        assert_eq!(
-            others(at(a, 2)),
-            [at(b, 1) as usize],
-            "unmapped views are forgotten"
-        );
+        assert_eq!(others(at(a, 2)), [at(b, 1) as usize], "unmapped views are forgotten");
         assert_eq!(query(b).host.State, MEM_RESERVE);
         assert!(!map_alias(b as u64, at(a, 1) as u64, PAGE as u64));
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);

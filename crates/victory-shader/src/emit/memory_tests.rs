@@ -166,15 +166,8 @@ fn program() -> HostShader {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
-    let memory = res
-        .scalar
-        .iter()
-        .filter(|s| s.1.param == resource::MEMORY)
-        .count();
-    assert_eq!(
-        memory, 11,
-        "every access through the pointer is title memory"
-    );
+    let memory = res.scalar.iter().filter(|s| s.1.param == resource::MEMORY).count();
+    assert_eq!(memory, 11, "every access through the pointer is title memory");
     let io = io::raise(&p, &native).expect("io::raise");
     let l = lower::lower(&lower::Parts {
         native: &native,
@@ -190,10 +183,7 @@ fn program() -> HostShader {
     })
     .expect("lower");
     assert!(l.memory && l.memory_writes && l.view_addresses);
-    assert!(
-        l.root_uavs.is_empty(),
-        "the root UAV is read as title memory"
-    );
+    assert!(l.root_uavs.is_empty(), "the root UAV is read as title memory");
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: l.dxil,
@@ -239,12 +229,7 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
     memory[3] = (pointer >> 32) as u32;
     // The next page (no copy) and another 256 MiB region (no block).
     let (next, far) = (TITLE + 0x1_0010, 0x55_0000_0040u64);
-    memory[4..8].copy_from_slice(&[
-        next as u32,
-        (next >> 32) as u32,
-        far as u32,
-        (far >> 32) as u32,
-    ]);
+    memory[4..8].copy_from_slice(&[next as u32, (next >> 32) as u32, far as u32, (far >> 32) as u32]);
     memory[0x40] = 0x2222_2222;
     // The root UAV's address, and what it loads there.
     let root_uav = TITLE + 0x200;
@@ -280,21 +265,9 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
                     &Dispatch {
                         roots: vec![
                             (0, Root::Constants(ud)),
-                            (
-                                1,
-                                Root::View {
-                                    srv: true,
-                                    data: page_table(1, 3),
-                                },
-                            ),
+                            (1, Root::View { srv: true, data: page_table(1, 3) }),
                             (2, Root::Uav(2 * 4096 / 32)),
-                            (
-                                3,
-                                Root::View {
-                                    srv: true,
-                                    data: view_addresses.clone(),
-                                },
-                            ),
+                            (3, Root::View { srv: true, data: view_addresses.clone() }),
                         ],
                         views: &[
                             View::RawUav(6),
@@ -314,11 +287,7 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
                 "{label}: reads"
             );
             assert_eq!(out[1][0x40 / 4], value, "{label}: the store");
-            assert_eq!(
-                out[1][(0x200 + 0x20) / 4],
-                value,
-                "{label}: the root UAV store"
-            );
+            assert_eq!(out[1][(0x200 + 0x20) / 4], value, "{label}: the root UAV store");
             let floats = [f32::from_bits(out[1][0x20]), f32::from_bits(out[1][0x21])];
             let want = [operand.min(1.0), operand.max(-1.0)];
             assert_eq!(floats, want, "{label}: float min and max");
@@ -328,11 +297,7 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
             let marked: Vec<usize> = (0..out[2].len() * 32)
                 .filter(|&b| out[2][b / 32] >> (b % 32) & 1 != 0)
                 .collect();
-            assert_eq!(
-                marked,
-                [(far >> 28) as usize, entry, entry + 1],
-                "{label}: pages"
-            );
+            assert_eq!(marked, [(far >> 28) as usize, entry, entry + 1], "{label}: pages");
         }
         ran += 1;
     }
@@ -352,10 +317,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
     }
     /// MUBUF `op` (offen) of `vdata` at `vaddr` through `s[srsrc:srsrc+3]`.
     const fn mubuf(op: u32, vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
-        [
-            0x38 << 26 | op << 18 | 1 << 12,
-            0x80 << 24 | (srsrc as u32 >> 2) << 16 | (vdata as u32) << 8 | vaddr as u32,
-        ]
+        [0x38 << 26 | op << 18 | 1 << 12, 0x80 << 24 | (srsrc as u32 >> 2) << 16 | (vdata as u32) << 8 | vaddr as u32]
     }
     const V_LSHLREV_B32: u32 = 0x1A;
     let mut w = vec![
@@ -441,20 +403,14 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         view_marks: false,
     })
     .expect("lower");
-    assert!(
-        l.root_srvs.is_empty() && !l.memory,
-        "no root descriptor, no title memory"
-    );
+    assert!(l.root_srvs.is_empty() && !l.memory, "no root descriptor, no title memory");
     let marks: Vec<(u32, u32)> = l
         .user_data
         .iter()
         .filter(|u| u.root == RootType::Descriptor)
         .map(|u| (u.index, u.dword))
         .collect();
-    assert_eq!(
-        marks,
-        [(6, super::ROOT_SRV_VIEW), (7, super::ROOT_VIEW_OFFSET)]
-    );
+    assert_eq!(marks, [(6, super::ROOT_SRV_VIEW), (7, super::ROOT_VIEW_OFFSET)]);
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: l.dxil,
@@ -502,9 +458,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
                 },
             )
             .unwrap_or_else(|e| panic!("{label}: {e}"));
-        let want: Vec<u32> = (0..32)
-            .map(|lane| if lane < 16 { 0x1000 + 4 + 16 * lane } else { 0 })
-            .collect();
+        let want: Vec<u32> = (0..32).map(|lane| if lane < 16 { 0x1000 + 4 + 16 * lane } else { 0 }).collect();
         assert_eq!(out[0], want, "{label}");
         ran += 1;
     }
@@ -561,10 +515,7 @@ fn writes_through_views_mark_their_pages() {
         stage: HwStage::Cs,
         wave64: false,
         vgprs: 8,
-        layout: vec![
-            param(RootType::Constants, 0, 4, 0),
-            param(RootType::Table, 4, 1, 1),
-        ],
+        layout: vec![param(RootType::Constants, 0, 4, 0), param(RootType::Table, 4, 1, 1)],
         used: (0..3).map(uav).collect(),
         io: StageIo::Cs(ComputeIo {
             rsrc2: 5 << 1,
@@ -618,11 +569,7 @@ fn writes_through_views_mark_their_pages() {
         let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
         let mut ud = vec![0u32; shader.user_data_dwords() as usize];
         for u in &shader.user_data {
-            ud[u.index as usize] = if u.root == RootType::Constants {
-                value
-            } else {
-                0
-            };
+            ud[u.index as usize] = if u.root == RootType::Constants { value } else { 0 };
         }
         let out = host
             .dispatch(
@@ -631,13 +578,7 @@ fn writes_through_views_mark_their_pages() {
                 &Dispatch {
                     roots: vec![
                         (0, Root::Constants(ud)),
-                        (
-                            1,
-                            Root::View {
-                                srv: true,
-                                data: marks.clone(),
-                            },
-                        ),
+                        (1, Root::View { srv: true, data: marks.clone() }),
                         (2, Root::Uav(8)),
                     ],
                     views: &[View::RawUav(8), View::RawUav(8), View::RawUav(8)],
@@ -646,11 +587,7 @@ fn writes_through_views_mark_their_pages() {
                 },
             )
             .unwrap_or_else(|e| panic!("{label}: {e}"));
-        assert_eq!(
-            out[0],
-            [value, 0, 0, value, value, value, value, 0],
-            "{label}: view 0"
-        );
+        assert_eq!(out[0], [value, 0, 0, value, value, value, value, 0], "{label}: view 0");
         assert_eq!(out[1][1], value, "{label}: view 1");
         assert_eq!(out[2][2], value, "{label}: the atomic");
         let marked: Vec<usize> = (0..out[3].len() * 32)

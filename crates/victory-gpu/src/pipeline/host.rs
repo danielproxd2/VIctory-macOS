@@ -179,12 +179,7 @@ impl GraphicsState {
             .map(|(e, name)| {
                 format!(
                     "{name:?} {} {} {} {} {} {}",
-                    e.SemanticIndex,
-                    e.Format.0,
-                    e.InputSlot,
-                    e.AlignedByteOffset,
-                    e.InputSlotClass.0,
-                    e.InstanceDataStepRate
+                    e.SemanticIndex, e.Format.0, e.InputSlot, e.AlignedByteOffset, e.InputSlotClass.0, e.InstanceDataStepRate
                 )
             })
             .collect();
@@ -347,10 +342,7 @@ impl HostPipeline {
             stages
         };
         if mesh.is_some() && !host()?.mesh_shaders() {
-            return refuse(
-                "the host GPU has no mesh shaders (or no shader model 6.6)",
-                shaders,
-            );
+            return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
         }
         for (s, _) in &stages {
             s.translated()?;
@@ -456,24 +448,9 @@ impl HostPipeline {
                 }
             }
             for (used, kind, register, out) in [
-                (
-                    t.memory,
-                    D3D12_ROOT_PARAMETER_TYPE_SRV,
-                    0,
-                    &mut stage.memory,
-                ),
-                (
-                    t.memory_writes,
-                    D3D12_ROOT_PARAMETER_TYPE_UAV,
-                    0,
-                    &mut stage.memory_dirty,
-                ),
-                (
-                    t.view_addresses,
-                    D3D12_ROOT_PARAMETER_TYPE_SRV,
-                    1,
-                    &mut stage.view_addresses,
-                ),
+                (t.memory, D3D12_ROOT_PARAMETER_TYPE_SRV, 0, &mut stage.memory),
+                (t.memory_writes, D3D12_ROOT_PARAMETER_TYPE_UAV, 0, &mut stage.memory_dirty),
+                (t.view_addresses, D3D12_ROOT_PARAMETER_TYPE_SRV, 1, &mut stage.view_addresses),
             ] {
                 if used {
                     *out = Some(params.len() as u32);
@@ -516,14 +493,8 @@ impl HostPipeline {
             .then(|| {
                 let first = params.len() as u32;
                 for (kind, register) in [
-                    (
-                        D3D12_ROOT_PARAMETER_TYPE_SRV,
-                        victory_shader::emit::VIEW_MARKS,
-                    ),
-                    (
-                        D3D12_ROOT_PARAMETER_TYPE_UAV,
-                        victory_shader::emit::VIEW_WRITES,
-                    ),
+                    (D3D12_ROOT_PARAMETER_TYPE_SRV, victory_shader::emit::VIEW_MARKS),
+                    (D3D12_ROOT_PARAMETER_TYPE_UAV, victory_shader::emit::VIEW_WRITES),
                 ] {
                     params.push(D3D12_ROOT_PARAMETER1 {
                         ParameterType: kind,
@@ -539,14 +510,13 @@ impl HostPipeline {
                 }
                 (first, first + 1)
             });
-        let (root, root_blob) =
-            match root_signature(&host.device, &params, &samplers, compute.is_some()) {
-                Ok(root) => root,
-                Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host root signature refused");
-                    return None;
-                }
-            };
+        let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
+            Ok(root) => root,
+            Err(e) => {
+                tracing::warn!(error = %e, ?shaders, "host root signature refused");
+                return None;
+            }
+        };
         let code = |i: usize| {
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
                 D3D12_SHADER_BYTECODE::default(),
@@ -632,10 +602,7 @@ impl HostPipeline {
         // Rectangle lists: a geometry shader made for the vertex shader adds
         // each rectangle's fourth corner (else rectangles are expanded on
         // the CPU from vertex inputs, see `draw`).
-        let gs = match (
-            g.topology.0,
-            stages.first().and_then(|(s, _)| s.translated()),
-        ) {
+        let gs = match (g.topology.0, stages.first().and_then(|(s, _)| s.translated())) {
             (RECTANGLES, Some(vs)) => match victory_shader::emit::rectangle_gs(&vs.host.dxil) {
                 Ok(gs) => gs,
                 Err(e) => {
@@ -651,11 +618,7 @@ impl HostPipeline {
             VS: code(0),
             PS: code(1),
             GS: D3D12_SHADER_BYTECODE {
-                pShaderBytecode: if gs.is_empty() {
-                    std::ptr::null()
-                } else {
-                    gs.as_ptr().cast()
-                },
+                pShaderBytecode: if gs.is_empty() { std::ptr::null() } else { gs.as_ptr().cast() },
                 BytecodeLength: gs.len(),
             },
             BlendState: g.blend,
@@ -696,12 +659,7 @@ impl HostPipeline {
                 return None;
             }
         };
-        tracing::info!(
-            ?shaders,
-            ms = started.elapsed().as_millis(),
-            rectangles = !gs.is_empty(),
-            "host pipeline"
-        );
+        tracing::info!(?shaders, ms = started.elapsed().as_millis(), rectangles = !gs.is_empty(), "host pipeline");
         crate::host::name(&pso, || format!("{shaders:?}"));
         tracing::debug!(
             ?shaders,
@@ -765,35 +723,20 @@ fn mesh_pipeline(
         topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
     }
     let mut stream = Stream {
-        root: Sub(
-            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE,
-            root.as_raw(),
-        ),
+        root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
         ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
         ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
         blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
-        mask: Sub(
-            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK,
-            g.sample_mask,
-        ),
+        mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
         raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
         depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
-        targets: Sub(
-            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS,
-            g.targets,
-        ),
-        dsv: Sub(
-            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT,
-            g.depth_format,
-        ),
+        targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, g.targets),
+        dsv: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, g.depth_format),
         samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples),
         // The type the host derives from the mesh shader anyway, given: a
         // pipeline library compares descriptions with it, and loads none
         // made from a stream without it.
-        topology: Sub(
-            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY,
-            host_topology(g),
-        ),
+        topology: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, host_topology(g)),
     };
     let desc = D3D12_PIPELINE_STATE_STREAM_DESC {
         SizeInBytes: size_of::<Stream>(),
@@ -815,8 +758,7 @@ fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
         return Vec::new();
     }
     // SAFETY: a translation's own bytes, alive while its shader is.
-    unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }
-        .to_vec()
+    unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }.to_vec()
 }
 
 fn root_signature(

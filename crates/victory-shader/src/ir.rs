@@ -820,8 +820,7 @@ fn effects(
             // (and below the proven bound).
             let indexed = |op: &Operand, out: &mut Vec<Reg>| match *op {
                 Operand::Vector { reg, .. } if u16::from(reg) < vgprs => {
-                    let end =
-                        m0_max.map_or(vgprs, |m| vgprs.min(u16::from(reg) + u16::from(m) + 1));
+                    let end = m0_max.map_or(vgprs, |m| vgprs.min(u16::from(reg) + u16::from(m) + 1));
                     out.extend((u16::from(reg)..end).map(|r| Reg::V(r as u8)));
                     Ok(())
                 }

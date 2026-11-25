@@ -323,10 +323,7 @@ impl OwnTls {
 /// title callbacks.
 fn started_by_rust() -> bool {
     // SAFETY: the calling thread's pseudo handle.
-    starts_in(
-        unsafe { windows_sys::Win32::System::Threading::GetCurrentThread() },
-        c"",
-    )
+    starts_in(unsafe { windows_sys::Win32::System::Threading::GetCurrentThread() }, c"")
 }
 
 /// Whether `thread`'s start routine lies in the module named `module`

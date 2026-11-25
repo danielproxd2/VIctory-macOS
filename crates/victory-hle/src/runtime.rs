@@ -425,15 +425,9 @@ fn elements(text: &str) -> (Vec<(String, String)>, Option<Refusal>) {
             .unwrap_or("");
         path.push(name);
         let body = field_text(rest);
-        let body = [
-            ("&lt;", "<"),
-            ("&gt;", ">"),
-            ("&quot;", "\""),
-            ("&apos;", "'"),
-            ("&amp;", "&"),
-        ]
-        .iter()
-        .fold(body, |b, (entity, c)| b.replace(entity, c));
+        let body = [("&lt;", "<"), ("&gt;", ">"), ("&quot;", "\""), ("&apos;", "'"), ("&amp;", "&")]
+            .iter()
+            .fold(body, |b, (entity, c)| b.replace(entity, c));
         out.push((path.join("/"), body));
         if closed {
             path.pop();

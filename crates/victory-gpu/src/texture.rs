@@ -70,8 +70,7 @@ unsafe impl Sync for Staging {}
 /// are the host's, not title memory's, which stays as it was.
 pub(crate) fn host_written(resource: This) {
     if let Some(copy) = crate::resource::host_copy(resource) {
-        copy.host_written
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        copy.host_written.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -128,16 +127,8 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
         let mut total = 0;
         // SAFETY: outputs sized for `n` subresources.
         unsafe {
-            host.device.GetCopyableFootprints(
-                d,
-                0,
-                n,
-                0,
-                Some(f.as_mut_ptr()),
-                Some(rows.as_mut_ptr()),
-                None,
-                Some(&mut total),
-            );
+            host.device
+                .GetCopyableFootprints(d, 0, n, 0, Some(f.as_mut_ptr()), Some(rows.as_mut_ptr()), None, Some(&mut total));
         }
         (f, rows, total)
     };
@@ -148,18 +139,11 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     let n = (0..fa.len().min(fb.len()))
         .take_while(|&i| {
             let (x, y) = (fa[i], fb[i]);
-            x.Offset == y.Offset
-                && x.Footprint.RowPitch == y.Footprint.RowPitch
-                && ra[i] == rb[i]
-                && x.Footprint.Depth == y.Footprint.Depth
+            x.Offset == y.Offset && x.Footprint.RowPitch == y.Footprint.RowPitch && ra[i] == rb[i] && x.Footprint.Depth == y.Footprint.Depth
         })
         .count() as u32;
     if n == 0 {
-        once!(
-            ?da,
-            ?db,
-            "an aliased texture not copied: its layouts differ on the host"
-        );
+        once!(?da, ?db, "an aliased texture not copied: its layouts differ on the host");
         return;
     }
     let Some(buffer) = host.default_buffer(total) else {
@@ -169,20 +153,17 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     crate::texture::host_written(to);
     crate::list::ensure_state(list, from, COPY_SOURCE);
     crate::list::ensure_state(list, to, COPY_DEST);
-    let place =
-        |r: &ID3D12Resource, f: D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
-            // SAFETY: a borrowed pointer the copy does not release.
-            pResource: unsafe { std::mem::transmute_copy(r) },
-            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: f },
-        };
+    let place = |r: &ID3D12Resource, f: D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: a borrowed pointer the copy does not release.
+        pResource: unsafe { std::mem::transmute_copy(r) },
+        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: f },
+    };
     let sub = |r: &ID3D12Resource, i: u32| D3D12_TEXTURE_COPY_LOCATION {
         // SAFETY: as above.
         pResource: unsafe { std::mem::transmute_copy(r) },
         Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-            SubresourceIndex: i,
-        },
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: i },
     };
     let l = &list.list;
     // SAFETY: an open list; live resources in the states named.
@@ -420,7 +401,8 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
         let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
-        let unreadable = info.Protect == 0 || info.Protect & (PAGE_NOACCESS | PAGE_GUARD) != 0;
+        let unreadable = info.Protect == 0
+            || info.Protect & (PAGE_NOACCESS | PAGE_GUARD) != 0;
         if n == 0 || info.State != MEM_COMMIT || unreadable {
             return false;
         }
@@ -524,14 +506,8 @@ mod tests {
         };
         assert!(!committed(usize::MAX as *const u8, 16));
         // SAFETY: reserving and committing one private page for the test, freed below.
-        let noaccess = unsafe {
-            VirtualAlloc(
-                std::ptr::null(),
-                4096,
-                MEM_RESERVE | MEM_COMMIT,
-                PAGE_NOACCESS,
-            )
-        };
+        let noaccess =
+            unsafe { VirtualAlloc(std::ptr::null(), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS) };
         assert!(!noaccess.is_null());
         assert!(!committed(noaccess.cast::<u8>(), 4096));
         // SAFETY: freeing the allocation above.
@@ -539,14 +515,8 @@ mod tests {
 
         // Negative control: a readable committed page still passes.
         // SAFETY: reserving and committing one private page for the test, freed below.
-        let rw = unsafe {
-            VirtualAlloc(
-                std::ptr::null(),
-                4096,
-                MEM_RESERVE | MEM_COMMIT,
-                PAGE_READWRITE,
-            )
-        };
+        let rw =
+            unsafe { VirtualAlloc(std::ptr::null(), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
         assert!(!rw.is_null());
         assert!(committed(rw.cast::<u8>(), 4096));
         // SAFETY: freeing the allocation above.

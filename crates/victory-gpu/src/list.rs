@@ -126,10 +126,7 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
 #[cfg(windows)]
-pub(crate) fn with_state(
-    this: This,
-    f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State),
-) {
+pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
     let Some(list) = host_list(this) else { return };
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
@@ -772,13 +769,8 @@ extern "system" fn clear_dsv(
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
-            list.list.ClearDepthStencilView(
-                dsv,
-                D3D12_CLEAR_FLAGS(flags as i32 & 3),
-                depth,
-                stencil,
-                rects,
-            )
+            list.list
+                .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects)
         };
     }
     #[cfg(not(windows))]
@@ -939,10 +931,7 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
     let at = unsafe { start.add(start.align_offset(align)) };
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
-    uploads
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push(block);
+    uploads.lock().unwrap_or_else(|e| e.into_inner()).push(block);
     at
 }
 
@@ -1378,11 +1367,7 @@ extern "system" fn execute_indirect(
     {
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
-        let kind = if *kind == DISPATCH_SINGLE {
-            DISPATCH
-        } else {
-            *kind
-        };
+        let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
         with_state(this, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
@@ -1452,8 +1437,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
         // SAFETY: the same layout; no resource named.
-        let barrier =
-            unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+        let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
     }
@@ -1798,10 +1782,7 @@ mod tests {
         assert!((1 << 32..1 << 40).contains(&(p as usize)), "{p:p}");
         // SAFETY: 40 bytes were handed out.
         unsafe { p.write_bytes(0xab, 40) };
-        assert!(
-            allocate_upload(list, 8, 0x30).is_null(),
-            "not a power of two"
-        );
+        assert!(allocate_upload(list, 8, 0x30).is_null(), "not a power of two");
         assert_eq!(reset(list, allocator, null), S_OK);
         assert!(
             // SAFETY: the list is ours.

@@ -147,10 +147,7 @@ struct Stats {
 static STATS: std::sync::Mutex<Option<Stats>> = std::sync::Mutex::new(None);
 
 fn stats<R>(f: impl FnOnce(&mut Stats) -> R) -> R {
-    f(STATS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get_or_insert_default())
+    f(STATS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default())
 }
 
 /// `bytes` of a range shaders wrote through a view did not go back into
@@ -168,18 +165,12 @@ pub(crate) fn note_use(pipeline: &str) {
 /// presented frame while shaders use it.
 pub(crate) fn log_frame() {
     let s = stats(std::mem::take);
-    if s.uses.is_empty()
-        && s.written + s.withheld + s.withheld_bytes + s.missed_pages + s.missed_regions == 0
-    {
+    if s.uses.is_empty() && s.written + s.withheld + s.withheld_bytes + s.missed_pages + s.missed_regions == 0 {
         return;
     }
     let mut uses: Vec<(&String, &u64)> = s.uses.iter().collect();
     uses.sort_by(|a, b| b.1.cmp(a.1));
-    let uses: Vec<String> = uses
-        .iter()
-        .take(32)
-        .map(|(p, n)| format!("{n} {p}"))
-        .collect();
+    let uses: Vec<String> = uses.iter().take(32).map(|(p, n)| format!("{n} {p}")).collect();
     let missed: Vec<String> = s.first_missed.iter().map(|a| format!("{a:#x}")).collect();
     tracing::info!(
         "title memory this frame: {} draws/dispatches ({}), {} page tables, {} pages \
@@ -210,11 +201,7 @@ pub(crate) fn heap() -> Option<&'static crate::descriptor::host::HostHeap> {
 /// bytes), copy k's view pair at heap index `pairs[k]`, `null` the null
 /// pair: the table's dwords, the level-1 index of each block, and the copy
 /// each entry names. At most [`CAPACITY`] blocks besides the null one.
-fn table(
-    copies: &[(u64, u64)],
-    pairs: &[u32],
-    null: u32,
-) -> (Vec<u32>, Vec<usize>, Vec<Option<usize>>) {
+fn table(copies: &[(u64, u64)], pairs: &[u32], null: u32) -> (Vec<u32>, Vec<usize>, Vec<Option<usize>>) {
     let mut order: Vec<usize> = (0..copies.len()).collect();
     order.sort_by_key(|&k| std::cmp::Reverse(copies[k].1));
     let mut level1 = vec![0u32; LEVEL1];
@@ -259,11 +246,7 @@ fn table(
         };
         dwords.extend(entry);
     }
-    (
-        dwords,
-        blocks,
-        owner.into_iter().map(|o| o.map(|o| o.0)).collect(),
-    )
+    (dwords, blocks, owner.into_iter().map(|o| o.map(|o| o.0)).collect())
 }
 
 impl Shared {
@@ -304,10 +287,7 @@ impl Shared {
             }
             keep
         });
-        let (mut named, mut slots) = (
-            Vec::with_capacity(copies.len()),
-            Vec::with_capacity(copies.len()),
-        );
+        let (mut named, mut slots) = (Vec::with_capacity(copies.len()), Vec::with_capacity(copies.len()));
         for c in copies {
             let key = Arc::as_ptr(&c) as usize;
             let slot = match self.pairs.get(&key) {
@@ -330,14 +310,8 @@ impl Shared {
         let (dwords, blocks, owner) = table(&ranges, &slots, self.null);
         // SAFETY: the mapping has room for `CAPACITY` blocks, which `table`
         // keeps to; no submission runs.
-        unsafe {
-            std::ptr::copy_nonoverlapping(dwords.as_ptr(), self.data as *mut u32, dwords.len())
-        };
-        tracing::debug!(
-            copies = ranges.len(),
-            blocks = blocks.len() - 1,
-            "title memory page table"
-        );
+        unsafe { std::ptr::copy_nonoverlapping(dwords.as_ptr(), self.data as *mut u32, dwords.len()) };
+        tracing::debug!(copies = ranges.len(), blocks = blocks.len() - 1, "title memory page table");
         self.layout = Arc::new(Layout {
             copies: named,
             blocks,
@@ -366,9 +340,7 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
     let layout = with_heap(key, |heap| {
         let mut shared = shared();
         let host = std::ptr::from_ref(heap) as usize;
-        let (_, s) = shared
-            .iter_mut()
-            .find(|(k, s)| *k == key && s.host == host)?;
+        let (_, s) = shared.iter_mut().find(|(k, s)| *k == key && s.host == host)?;
         let now = crate::shadow::generation();
         if s.generation != now {
             s.rewrite(heap, now);
@@ -404,8 +376,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
     })
     .flatten()?;
     let bits = (CAPACITY + 1) * BLOCK;
-    let (bitmap, data) =
-        crate::host::host()?.shared_buffer((bits / 8).next_multiple_of(256) as u64)?;
+    let (bitmap, data) = crate::host::host()?.shared_buffer((bits / 8).next_multiple_of(256) as u64)?;
     crate::host::name(&bitmap, || "title memory written pages".into());
     let words = bits / 32;
     // SAFETY: our mapped buffer of at least `words` dwords.
@@ -424,18 +395,12 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         marks.iter().enumerate().any(|(w, &mark)| {
             (0..32).filter(|b| mark >> b & 1 != 0).any(|b| {
                 let entry = w * 32 + b;
-                entry / BLOCK == 0
-                    || l.blocks.get(entry / BLOCK).is_none()
-                    || l.owner.get(entry).is_none_or(|o| o.is_none())
+                entry / BLOCK == 0 || l.blocks.get(entry / BLOCK).is_none() || l.owner.get(entry).is_none_or(|o| o.is_none())
             })
         })
     });
     list.defer_after(move || {
-        let Layout {
-            copies,
-            blocks,
-            owner,
-        } = &*layout(key);
+        let Layout { copies, blocks, owner } = &*layout(key);
         let precise = byte_for_byte.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: the bitmap is mapped and the list's run is over.
         let marks = unsafe { std::slice::from_raw_parts_mut(data as *mut u32, words) };
@@ -455,10 +420,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                 };
                 let at = (l1 << 28 | page << 16) as u64;
                 match owner.get(entry) {
-                    Some(_)
-                        if precise
-                            .iter()
-                            .any(|&(a, n)| a < at + (1 << 16) && at < a + n) => {}
+                    Some(_) if precise.iter().any(|&(a, n)| a < at + (1 << 16) && at < a + n) => {}
                     Some(Some(k)) => writes.push((*k, at)),
                     _ => {
                         pages += 1;
@@ -472,11 +434,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         // the title's own data (garbage pointers in title threads, run c1).
         // shortcut: root UAV writes of such a list still go back (their
         // bytes, `Shadow::gpu_writes`).
-        let withheld = if pages + regions > 0 {
-            writes.len() as u64
-        } else {
-            0
-        };
+        let withheld = if pages + regions > 0 { writes.len() as u64 } else { 0 };
         let mut written = 0;
         for &(k, at) in writes.iter().take_while(|_| withheld == 0) {
             let n = copies[k].copy_back_page(at as usize);
@@ -558,17 +516,12 @@ mod tests {
     /// named, the rest read as missing; the table fits its buffer.
     #[test]
     fn a_full_table_names_the_largest_copies() {
-        let copies: Vec<(u64, u64)> = (0..CAPACITY as u64 + 2)
-            .map(|k| (k << 28, 0x1_0000 + k))
-            .collect();
+        let copies: Vec<(u64, u64)> = (0..CAPACITY as u64 + 2).map(|k| (k << 28, 0x1_0000 + k)).collect();
         let pairs: Vec<u32> = (0..copies.len() as u32).map(|k| 10 + 2 * k).collect();
         let (dwords, blocks, _) = table(&copies, &pairs, 4);
         assert_eq!(blocks.len(), CAPACITY + 1);
         assert_eq!(dwords.len(), LEVEL1 + (CAPACITY + 1) * BLOCK * 2);
-        assert_eq!(
-            look_up(&dwords, (CAPACITY as u64 + 1) << 28).0,
-            pairs[CAPACITY + 1]
-        );
+        assert_eq!(look_up(&dwords, (CAPACITY as u64 + 1) << 28).0, pairs[CAPACITY + 1]);
         assert_eq!(look_up(&dwords, 0).0, 4, "the smallest copy is left out");
     }
 
@@ -640,20 +593,11 @@ void main(uint3 id : SV_DispatchThreadID) {
         // Title memory (below 2^40, as the runtime places it): 1, 2 and
         // (from the second submission on) 1 page, write-watched as its pools.
         let pool = |pages: usize| -> usize {
-            use windows_sys::Win32::System::Memory::{
-                MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
-            };
+            use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
             (0..256u64)
                 .map(|k| 0x40_0000_0000 + (k << 28))
                 // SAFETY: a fresh allocation where nothing is mapped, or none.
-                .map(|hint| unsafe {
-                    VirtualAlloc(
-                        hint as *const _,
-                        pages * PAGE,
-                        MEM_RESERVE | MEM_COMMIT | crate::watch::tests::MEM_WRITE_WATCH,
-                        PAGE_READWRITE,
-                    )
-                } as usize)
+                .map(|hint| unsafe { VirtualAlloc(hint as *const _, pages * PAGE, MEM_RESERVE | MEM_COMMIT | crate::watch::tests::MEM_WRITE_WATCH, PAGE_READWRITE) } as usize)
                 .find(|&p| p != 0)
                 .expect("memory below 2^40")
         };
@@ -666,10 +610,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         let lists = [host.new_list().unwrap(), host.new_list().unwrap()];
         // Each list reads 4 dwords at its address into its 16 bytes of `out`.
         let record = |reads: [usize; 2]| -> Vec<Map> {
-            let maps: Vec<Map> = lists
-                .iter()
-                .map(|l| bind(l, OURS).expect("a page table"))
-                .collect();
+            let maps: Vec<Map> = lists.iter().map(|l| bind(l, OURS).expect("a page table")).collect();
             for (k, (list, &address)) in lists.iter().zip(&reads).enumerate() {
                 let constants = [address as u32, (address >> 32) as u32, 16 * k as u32];
                 // SAFETY: an open list, live objects of ours.
@@ -679,8 +620,7 @@ void main(uint3 id : SV_DispatchThreadID) {
                     list.list.SetComputeRootDescriptorTable(0, views.gpu(0));
                     list.list.SetComputeRootShaderResourceView(1, maps[k].table);
                     list.list.SetComputeRootUnorderedAccessView(2, out_gpu);
-                    list.list
-                        .SetComputeRoot32BitConstants(3, 3, constants.as_ptr().cast(), 0);
+                    list.list.SetComputeRoot32BitConstants(3, 3, constants.as_ptr().cast(), 0);
                     list.list.SetPipelineState(&pso);
                     list.list.Dispatch(1, 1, 1);
                 }
@@ -705,15 +645,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         fill(memory[0] + 16, 0x100);
         fill(memory[1] + PAGE, 0x200);
         host.execute(&[&lists[0], &lists[1]]);
-        assert_eq!(
-            read(),
-            [0x100, 0x101, 0x102, 0x103, 0x200, 0x201, 0x202, 0x203]
-        );
+        assert_eq!(read(), [0x100, 0x101, 0x102, 0x103, 0x200, 0x201, 0x202, 0x203]);
         let pairs = (pair_of(OURS, &a).unwrap(), pair_of(OURS, &b).unwrap());
-        assert!(
-            pairs.0 >= 1 << 18 && pairs.1 >= 1 << 18,
-            "past the dynamic slots"
-        );
+        assert!(pairs.0 >= 1 << 18 && pairs.1 >= 1 << 18, "past the dynamic slots");
         // A second submission, after a third copy came.
         let c = copy(memory[2], 1);
         for list in &lists {
@@ -723,15 +657,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         fill(memory[2] + 32, 0x300);
         fill(memory[0] + 16, 0x400);
         host.execute(&[&lists[0], &lists[1]]);
-        assert_eq!(
-            read(),
-            [0x300, 0x301, 0x302, 0x303, 0x400, 0x401, 0x402, 0x403]
-        );
-        assert_eq!(
-            (pair_of(OURS, &a).unwrap(), pair_of(OURS, &b).unwrap()),
-            pairs,
-            "views kept"
-        );
+        assert_eq!(read(), [0x300, 0x301, 0x302, 0x303, 0x400, 0x401, 0x402, 0x403]);
+        assert_eq!((pair_of(OURS, &a).unwrap(), pair_of(OURS, &b).unwrap()), pairs, "views kept");
         assert!(pair_of(OURS, &c).is_some());
         for (&p, copy) in memory.iter().zip([a, b, c]) {
             crate::shadow::unregister(p, p as u64);

@@ -180,10 +180,7 @@ pub(crate) fn sync_heaps() {
                 if !crate::host::read_into(page as *const u8, &mut [0u8; 4]) {
                     continue;
                 }
-                let (first, last) = (
-                    (page as u64 - start) / step,
-                    (end as u64 - start).div_ceil(step),
-                );
+                let (first, last) = ((page as u64 - start) / step, (end as u64 - start).div_ceil(step));
                 for index in first..last.min(u64::from(heap.desc.count)) {
                     host.mirror(index as u32, start + index * step, false);
                 }
@@ -863,11 +860,7 @@ mod tests {
             // Our record, written where no heap sees it, then copied in.
             let mut elsewhere = [0u64; 2];
             let at = elsewhere.as_mut_ptr() as u64;
-            create_sampler(
-                std::ptr::null(),
-                &[21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0],
-                at,
-            );
+            create_sampler(std::ptr::null(), &[21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0], at);
             let slot = memory as u64 + 5 * 16;
             // SAFETY: 16 bytes of each, ours; the heap's page is guarded
             // (our handler opens it).

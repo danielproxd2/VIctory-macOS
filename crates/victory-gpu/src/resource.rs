@@ -887,19 +887,8 @@ static REPLACED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 #[cfg(windows)]
 pub(crate) fn texture_counts() -> (u64, u64, u64, u64, u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
-    let shared = (
-        SHARED.load(Relaxed),
-        SAVED.load(Relaxed),
-        REPLACED.load(Relaxed),
-    );
-    (
-        TEXTURES.load(Relaxed),
-        TEXTURE_BYTES.load(Relaxed),
-        USED.load(Relaxed),
-        shared.0,
-        shared.1,
-        shared.2,
-    )
+    let shared = (SHARED.load(Relaxed), SAVED.load(Relaxed), REPLACED.load(Relaxed));
+    (TEXTURES.load(Relaxed), TEXTURE_BYTES.load(Relaxed), USED.load(Relaxed), shared.0, shared.1, shared.2)
 }
 
 #[cfg(windows)]
@@ -913,12 +902,7 @@ impl Drop for HostTexture {
         #[cfg(feature = "diagnostics")]
         {
             use windows::core::Interface;
-            life::note(
-                self.texture.as_raw() as usize,
-                life::LET_GO,
-                0,
-                life::holders(&self.texture),
-            );
+            life::note(self.texture.as_raw() as usize, life::LET_GO, 0, life::holders(&self.texture));
         }
     }
 }
@@ -1168,14 +1152,7 @@ fn shared_texture(
         SHARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(host) = crate::host::host() {
             // SAFETY: a plain query on a host description (same layout).
-            let info = unsafe {
-                host.device.GetResourceAllocationInfo(
-                    0,
-                    &[std::ptr::from_ref(&d)
-                        .cast::<windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC>()
-                        .read_unaligned()],
-                )
-            };
+            let info = unsafe { host.device.GetResourceAllocationInfo(0, &[std::ptr::from_ref(&d).cast::<windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC>().read_unaligned()]) };
             SAVED.fetch_add(info.SizeInBytes, std::sync::atomic::Ordering::Relaxed);
         }
         return live;
@@ -1187,10 +1164,7 @@ fn shared_texture(
     if let Some(k) = key {
         if live.is_some() {
             REPLACED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            tracing::debug!(
-                ?k,
-                "a texture memory's host texture replaced by one with more uses or another format"
-            );
+            tracing::debug!(?k, "a texture memory's host texture replaced by one with more uses or another format");
         }
         if map.len().is_power_of_two() {
             map.retain(|_, w| w.strong_count() > 0);
@@ -1244,9 +1218,7 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
         value[0] = pc_format(value[0]);
         value
     });
-    let clear_value = clear_value
-        .as_ref()
-        .map(|v| std::ptr::from_ref(v).cast::<D3D12_CLEAR_VALUE>());
+    let clear_value = clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast::<D3D12_CLEAR_VALUE>());
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
@@ -1262,11 +1234,7 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
         && let Ok(device) = host.device.cast::<ID3D12Device10>()
     {
         // SAFETY: the description has the host layout (checked size).
-        let p = unsafe {
-            std::ptr::from_ref(d)
-                .cast::<D3D12_RESOURCE_DESC>()
-                .read_unaligned()
-        };
+        let p = unsafe { std::ptr::from_ref(d).cast::<D3D12_RESOURCE_DESC>().read_unaligned() };
         // The plain description plus the sampler feedback region (none).
         let desc1 = D3D12_RESOURCE_DESC1 {
             Dimension: p.Dimension,
@@ -1281,10 +1249,7 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
             Flags: p.Flags,
             SamplerFeedbackMipRegion: Default::default(),
         };
-        let formats: Vec<DXGI_FORMAT> = castable_formats
-            .iter()
-            .map(|&f| DXGI_FORMAT(f as i32))
-            .collect();
+        let formats: Vec<DXGI_FORMAT> = castable_formats.iter().map(|&f| DXGI_FORMAT(f as i32)).collect();
         // SAFETY: a host description and our out pointer; the list and the
         // clear value live through the call.
         let made = unsafe {
@@ -1331,14 +1296,7 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
     let texture = texture?;
     crate::host::name(&texture, || {
         // Its address, for the lifetime notes (`life`) of a freed one.
-        format!(
-            "texture {}x{} f{} flags {:#x} @{:#x}",
-            d.width,
-            d.height,
-            d.format,
-            d.flags,
-            texture.as_raw() as usize
-        )
+        format!("texture {}x{} f{} flags {:#x} @{:#x}", d.width, d.height, d.format, d.flags, texture.as_raw() as usize)
     });
     let initial = crate::host::legal_state(&texture, initial);
     Some(HostTexture::new(texture, initial, castable_formats))
@@ -1455,14 +1413,7 @@ pub(crate) fn alias_source(placed: This) -> Option<This> {
         let (size, block) = element(d.format)?;
         let swizzle = texture_layout(d).map_or(d.layout, |t| t.planes[0].layout.desc.swizzle.0);
         let rows = u64::from(d.height).div_ceil(block);
-        Some((
-            d.dimension,
-            d.width.div_ceil(block) * size,
-            rows,
-            d.depth_or_array_size,
-            d.sample_count,
-            swizzle,
-        ))
+        Some((d.dimension, d.width.div_ceil(block) * size, rows, d.depth_or_array_size, d.sample_count, swizzle))
     };
     let want = bytes(&b.desc)?;
     map.get(&(b.data() as u64))?
@@ -1501,12 +1452,7 @@ impl Drop for Resource {
         #[cfg(feature = "diagnostics")]
         if let Some(h) = &self.host {
             use windows::core::Interface;
-            life::note(
-                h.texture.as_raw() as usize,
-                life::RELEASED,
-                0,
-                life::holders(&h.texture),
-            );
+            life::note(h.texture.as_raw() as usize, life::RELEASED, 0, life::holders(&h.texture));
         }
         crate::bindless::forget(std::ptr::from_ref::<Resource>(self) as usize);
         if self.desc.dimension != BUFFER {
@@ -2022,40 +1968,17 @@ mod tests {
     /// another memory. The library's own layout pick resolves as spelled.
     #[test]
     fn one_memory_one_key_in_any_format_of_its_element() {
-        let a = ResourceDesc {
-            flags: 4,
-            ..texture(192, 108, 42, 1)
-        };
-        let b = ResourceDesc {
-            format: 67,
-            flags: 0,
-            ..a
-        };
+        let a = ResourceDesc { flags: 4, ..texture(192, 108, 42, 1) };
+        let b = ResourceDesc { format: 67, flags: 0, ..a };
         let key = memory_key(0x1_0000, &a);
         assert!(key.is_some());
         assert_eq!(key, memory_key(0x1_0000, &b));
-        assert_eq!(
-            key,
-            memory_key(0x1_0000, &ResourceDesc { layout: 0x105, ..b })
-        );
+        assert_eq!(key, memory_key(0x1_0000, &ResourceDesc { layout: 0x105, ..b }));
         assert_ne!(key, memory_key(0x2_0000, &a));
         assert_ne!(key, memory_key(0x1_0000, &ResourceDesc { width: 96, ..a }));
         assert_ne!(key, memory_key(0x1_0000, &ResourceDesc { format: 10, ..a }));
-        assert_ne!(
-            key,
-            memory_key(0x1_0000, &ResourceDesc { layout: 0x102, ..a })
-        );
-        assert_ne!(
-            key,
-            memory_key(
-                0x1_0000,
-                &ResourceDesc {
-                    flags: 2,
-                    format: 40,
-                    ..a
-                }
-            )
-        );
+        assert_ne!(key, memory_key(0x1_0000, &ResourceDesc { layout: 0x102, ..a }));
+        assert_ne!(key, memory_key(0x1_0000, &ResourceDesc { flags: 2, format: 40, ..a }));
         assert_eq!(memory_key(0x1_0000, &buffer(256)), None);
     }
 

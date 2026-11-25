@@ -145,12 +145,7 @@ pub(crate) fn key(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) -> 
         key.update(s.stage.as_bytes());
         key.update(s.hash.as_bytes());
     }
-    key.update(
-        graphics
-            .map(|g| g.describe())
-            .unwrap_or_default()
-            .as_bytes(),
-    );
+    key.update(graphics.map(|g| g.describe()).unwrap_or_default().as_bytes());
     key.finalize().to_hex()[..32].to_owned()
 }
 
@@ -204,9 +199,7 @@ fn log(what: &str, key: &str, rest: impl FnOnce() -> String) {
     };
     let mut log = LOG.lock().unwrap_or_else(|e| e.into_inner());
     if log.is_none() {
-        *log = std::fs::File::create(path)
-            .ok()
-            .map(|f| (f, HashSet::new()));
+        *log = std::fs::File::create(path).ok().map(|f| (f, HashSet::new()));
     }
     let Some((file, seen)) = log.as_mut() else {
         return;
@@ -259,10 +252,7 @@ fn start(p: &Arc<Pending>, now: bool) {
 fn enqueue(p: &Pending, now: bool) -> Option<bool> {
     let first = !p.queued.swap(true, Ordering::Relaxed);
     if first {
-        PEAK.fetch_max(
-            WAITING.fetch_add(1, Ordering::Relaxed) + 1,
-            Ordering::Relaxed,
-        );
+        PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
     }
     let ahead = now && !p.now.swap(true, Ordering::Relaxed);
     (first || ahead && !p.taken.load(Ordering::Relaxed)).then_some(ahead)
@@ -294,10 +284,7 @@ fn wait(p: &Pending, frame: u64) {
         if rest.is_zero() {
             break;
         }
-        held = done
-            .wait_timeout(held, rest)
-            .unwrap_or_else(|e| e.into_inner())
-            .0;
+        held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
     WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
@@ -346,10 +333,8 @@ fn turn(p: &Pending) {
 
 /// Pipelines for the workers: those draws wait for, then those started
 /// early.
-static QUEUES: (Mutex<[VecDeque<Arc<Pending>>; 2]>, Condvar) = (
-    Mutex::new([VecDeque::new(), VecDeque::new()]),
-    Condvar::new(),
-);
+static QUEUES: (Mutex<[VecDeque<Arc<Pending>>; 2]>, Condvar) =
+    (Mutex::new([VecDeque::new(), VecDeque::new()]), Condvar::new());
 
 /// Hands `p` to the workers (half the logical processors, 2 to 8), started
 /// on first use.
