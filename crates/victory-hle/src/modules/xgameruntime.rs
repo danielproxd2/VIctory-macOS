@@ -537,7 +537,10 @@ mod tests {
     #[test]
     fn unimplemented_slots_answer_not_implemented() {
         type Method = extern "system" fn(*const Object) -> HRESULT;
-        for slot in [0x40, 0xa0, 0xa8, 0xd8, 0xe0, 0xf0] {
+        // 0xa0 and 0xa8 (a wait handle registered and unregistered) are
+        // methods where the host has wait handles, on Windows.
+        let waiter: &[usize] = if cfg!(windows) { &[] } else { &[0xa0, 0xa8] };
+        for &slot in [0x40, 0xd8, 0xe0, 0xf0].iter().chain(waiter) {
             let call = method::<Method>(&xasync::OBJECT, slot);
             assert_eq!(call(&xasync::OBJECT), xasync::E_NOTIMPL, "{slot:#x}");
         }

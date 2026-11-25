@@ -31,6 +31,8 @@ pub const PROVIDER: Guid = Guid {
 pub const E_PENDING: HRESULT = 0x8000_000A_u32 as i32;
 pub const E_ABORT: HRESULT = 0x8000_4004_u32 as i32;
 pub const E_NOTIMPL: HRESULT = 0x8000_4001_u32 as i32;
+#[cfg(windows)]
+const E_FAIL: HRESULT = 0x8000_4005_u32 as i32;
 pub const E_INVALIDARG: HRESULT = 0x8007_0057_u32 as i32;
 pub const E_NOT_SUFFICIENT_BUFFER: HRESULT = 0x8007_007A_u32 as i32;
 pub const E_ILLEGAL_METHOD_CALL: HRESULT = 0x8000_000E_u32 as i32;
@@ -197,7 +199,21 @@ impl Pool {
 pub struct Queue {
     ports: [Arc<Port>; 2],
     monitors: Mutex<Vec<(u64, usize, usize)>>,
+    /// The wait handles registered with the queue, by token.
+    #[cfg(windows)]
+    waiters: Mutex<Vec<(u64, Arc<waiter::Waiter>)>>,
     terminated: AtomicBool,
+}
+
+/// A queue that goes takes its waiters with it: unregistering one is
+/// optional, as documented.
+#[cfg(windows)]
+impl Drop for Queue {
+    fn drop(&mut self) {
+        for (_, waiter) in lock(&self.waiters).drain(..) {
+            waiter.stop();
+        }
+    }
 }
 
 impl Queue {
@@ -205,6 +221,8 @@ impl Queue {
         Arc::new(Queue {
             ports,
             monitors: Mutex::default(),
+            #[cfg(windows)]
+            waiters: Mutex::default(),
             terminated: AtomicBool::new(false),
         })
     }
@@ -383,6 +401,11 @@ pub fn XTaskQueueTerminate(
         return E_INVALIDARG;
     };
     queue.terminated.store(true, Ordering::Release);
+    // Nothing more can be submitted, so nothing more is waited for.
+    #[cfg(windows)]
+    for (_, waiter) in lock(&queue.waiters).drain(..) {
+        waiter.stop();
+    }
     for port in &queue.ports {
         let pending: Vec<Task> = lock(&port.tasks).drain(..).collect();
         // Dispatches waiting on this queue end: nothing more will come.
@@ -423,6 +446,184 @@ pub fn XTaskQueueRegisterMonitor(
 pub fn XTaskQueueUnregisterMonitor(handle: *const Queue, token: u64) {
     if let Some(queue) = queue(handle) {
         lock(&queue.monitors).retain(|m| m.0 != token);
+    }
+}
+
+/// `XTaskQueueRegisterWaiter`: whenever `handle` (an event, usually) is
+/// signalled, `callback` is submitted to `port` of the queue. As
+/// documented, the next one is submitted only once the current one has
+/// completed, for as long as the handle is signalled, so a manual-reset
+/// event keeps the callback coming and an auto-reset event gives one
+/// callback per signal. The wait ends when the waiter is unregistered or
+/// the queue is terminated or closed for good.
+#[cfg(windows)]
+pub fn XTaskQueueRegisterWaiter(
+    handle: *const Queue,
+    port: u32,
+    wait_handle: *mut c_void,
+    context: *mut c_void,
+    callback: Option<Callback>,
+    token: *mut u64,
+) -> HRESULT {
+    let (Some(queue), Some(callback)) = (queue(handle), callback) else {
+        return E_INVALIDARG;
+    };
+    if port > COMPLETION || wait_handle.is_null() || token.is_null() {
+        return E_INVALIDARG;
+    }
+    if queue.terminated.load(Ordering::Acquire) {
+        return E_ABORT;
+    }
+    let task = Task::new(context, callback);
+    let Some(waiter) = waiter::Waiter::start(&queue, port, wait_handle, task) else {
+        return E_FAIL;
+    };
+    let id = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+    lock(&queue.waiters).push((id, waiter));
+    // SAFETY: checked non-null.
+    unsafe { token.write(id) };
+    S_OK
+}
+
+/// `XTaskQueueUnregisterWaiter`: the handle is no longer waited for and
+/// the callback no longer invoked, not even one already submitted that
+/// the queue has not run yet.
+#[cfg(windows)]
+pub fn XTaskQueueUnregisterWaiter(handle: *const Queue, token: u64) {
+    let Some(queue) = queue(handle) else {
+        return;
+    };
+    let mut waiters = lock(&queue.waiters);
+    let found = waiters.iter().position(|(id, _)| *id == token);
+    let waiter = found.map(|at| waiters.remove(at).1);
+    drop(waiters);
+    if let Some(waiter) = waiter {
+        waiter.stop();
+    }
+}
+
+/// Waiting for the title's handles, one thread per registration.
+#[cfg(windows)]
+mod waiter {
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Weak};
+
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::{
+        CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects,
+    };
+
+    use super::{Queue, S_OK, Task};
+
+    /// A registration: the title's callback and our two events.
+    pub(super) struct Waiter {
+        task: Task,
+        /// Set when the registration ends.
+        stopped: AtomicBool,
+        /// Signalled (manual reset) when the registration ends.
+        stop: usize,
+        /// Signalled (auto reset) when a submitted callback has returned.
+        done: usize,
+    }
+
+    impl Drop for Waiter {
+        fn drop(&mut self) {
+            // SAFETY: our own events, used by nobody else by now.
+            unsafe {
+                CloseHandle(self.stop as HANDLE);
+                CloseHandle(self.done as HANDLE);
+            }
+        }
+    }
+
+    /// What the queue runs in place of the title's callback: the title's,
+    /// unless the registration has ended meanwhile; then the waiter may
+    /// submit the next.
+    extern "system" fn run(context: *mut c_void, canceled: bool) {
+        // SAFETY: the reference `Waiter::submit` leaked for this call.
+        let waiter = unsafe { Arc::from_raw(context.cast::<Waiter>()) };
+        if !waiter.stopped.load(Ordering::Acquire) {
+            waiter.task.run(canceled);
+        }
+        // SAFETY: our event.
+        unsafe { SetEvent(waiter.done as HANDLE) };
+    }
+
+    impl Waiter {
+        /// Starts waiting for `handle` on behalf of `queue`; `None` if the
+        /// host gives us no events.
+        pub(super) fn start(
+            queue: &Arc<Queue>,
+            port: u32,
+            handle: *mut c_void,
+            task: Task,
+        ) -> Option<Arc<Waiter>> {
+            // SAFETY: unnamed events with default security.
+            let (stop, done) = unsafe {
+                (
+                    CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()),
+                    CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()),
+                )
+            };
+            if stop.is_null() || done.is_null() {
+                // SAFETY: whichever was created is ours to close.
+                unsafe {
+                    CloseHandle(stop);
+                    CloseHandle(done);
+                }
+                return None;
+            }
+            let waiter = Arc::new(Waiter {
+                task,
+                stopped: AtomicBool::new(false),
+                stop: stop as usize,
+                done: done as usize,
+            });
+            // The thread does not keep the queue alive: a queue closed
+            // with a waiter still registered ends the wait.
+            let (queue, handle) = (Arc::downgrade(queue), handle as usize);
+            let waiting = waiter.clone();
+            std::thread::spawn(move || waiting.wait(queue, port, handle));
+            Some(waiter)
+        }
+
+        /// Ends the registration: no callback of it starts after this.
+        pub(super) fn stop(&self) {
+            self.stopped.store(true, Ordering::Release);
+            // SAFETY: our event.
+            unsafe { SetEvent(self.stop as HANDLE) };
+        }
+
+        /// Blocks until `other` or the stop event is signalled; true for
+        /// `other`. A wait that fails (the title closed its handle) ends
+        /// the registration.
+        fn signalled(&self, other: usize) -> bool {
+            let handles = [self.stop as HANDLE, other as HANDLE];
+            // SAFETY: two handles, ours and the one the title registered.
+            let woke = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) };
+            woke == WAIT_OBJECT_0 + 1 && !self.stopped.load(Ordering::Acquire)
+        }
+
+        fn wait(self: Arc<Self>, queue: Weak<Queue>, port: u32, handle: usize) {
+            while self.signalled(handle) {
+                let Some(queue) = queue.upgrade() else {
+                    break;
+                };
+                let context = Arc::into_raw(self.clone()).cast_mut().cast::<c_void>();
+                if queue.submit(port, 0, Task::new(context, run)) != S_OK {
+                    // Terminated: the callback will not run, so the
+                    // reference it was to take is taken back.
+                    // SAFETY: the pointer leaked just above.
+                    drop(unsafe { Arc::from_raw(context.cast::<Waiter>()) });
+                    break;
+                }
+                drop(queue);
+                if !self.signalled(self.done) {
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -1149,9 +1350,36 @@ extern "system" fn m_get_process_queue(_: This, out: *mut *const Queue) -> bool 
 extern "system" fn m_set_process_queue(_: This, q: *const Queue) {
     XTaskQueueSetCurrentProcessTaskQueue(q)
 }
+#[cfg(windows)]
+extern "system" fn m_register_waiter(
+    _: This,
+    q: *const Queue,
+    port: u32,
+    handle: *mut c_void,
+    context: *mut c_void,
+    callback: Option<Callback>,
+    token: *mut u64,
+) -> HRESULT {
+    XTaskQueueRegisterWaiter(q, port, handle, context, callback, token)
+}
+#[cfg(windows)]
+extern "system" fn m_unregister_waiter(_: This, q: *const Queue, token: u64) {
+    XTaskQueueUnregisterWaiter(q, token)
+}
 /// The runtime's debug check that the caller is not a time-critical thread,
 /// which every runtime call in a title makes first.
 extern "system" fn m_check_thread(_: This) {}
+
+/// Registering and unregistering a wait handle. Wait handles are the
+/// host's, so only Windows has them; elsewhere the two slots answer like
+/// any method we lack.
+#[cfg(windows)]
+const WAITER: [*const (); 2] = [
+    m_register_waiter as *const (),
+    m_unregister_waiter as *const (),
+];
+#[cfg(not(windows))]
+const WAITER: [*const (); 2] = [missing::<20> as *const (), missing::<21> as *const ()];
 
 static VTABLE: Methods<31> = Methods([
     query_interface as *const (),      // 0x00 QueryInterface
@@ -1174,8 +1402,8 @@ static VTABLE: Methods<31> = Methods([
     m_close as *const (),              // 0x88
     m_submit as *const (),             // 0x90
     m_submit_delayed as *const (),     // 0x98
-    missing::<20> as *const (),        // 0xa0 register a wait handle
-    missing::<21> as *const (),        // 0xa8 unregister it
+    WAITER[0],                         // 0xa0 register a wait handle
+    WAITER[1],                         // 0xa8 unregister it
     m_terminate as *const (),          // 0xb0
     m_register_monitor as *const (),   // 0xb8
     m_unregister_monitor as *const (), // 0xc0
@@ -1847,5 +2075,228 @@ mod tests {
             E_ABORT
         );
         XTaskQueueCloseHandle(q);
+    }
+
+    #[cfg(windows)]
+    mod waiters {
+        use super::*;
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows_sys::Win32::System::Threading::{CreateEventW, ResetEvent, SetEvent};
+
+        type Create = extern "system" fn(This, u32, u32, *mut *const Queue) -> HRESULT;
+        type Register = extern "system" fn(
+            This,
+            *const Queue,
+            u32,
+            *mut c_void,
+            *mut c_void,
+            Option<Callback>,
+            *mut u64,
+        ) -> HRESULT;
+        type Unregister = extern "system" fn(This, *const Queue, u64);
+        type Dispatch = extern "system" fn(This, *const Queue, u32, u32) -> bool;
+        type Close = extern "system" fn(This, *const Queue);
+
+        /// What a waiter's callback saw: how often it ran, how often
+        /// cancelled, and on which thread last.
+        #[derive(Default)]
+        struct Ran {
+            times: AtomicU32,
+            canceled: AtomicU32,
+            thread: Mutex<Option<std::thread::ThreadId>>,
+        }
+
+        extern "system" fn ran(context: *mut c_void, canceled: bool) {
+            // SAFETY: the test's `Ran`, which outlives the registration.
+            let ran = unsafe { &*context.cast::<Ran>() };
+            *lock(&ran.thread) = Some(std::thread::current().id());
+            ran.canceled
+                .fetch_add(u32::from(canceled), Ordering::SeqCst);
+            ran.times.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn event(manual_reset: bool) -> HANDLE {
+            // SAFETY: an unnamed event, not signalled.
+            let event =
+                unsafe { CreateEventW(std::ptr::null(), manual_reset.into(), 0, std::ptr::null()) };
+            assert!(!event.is_null());
+            event
+        }
+
+        /// A queue whose two ports the test dispatches itself.
+        fn manual_queue() -> *const Queue {
+            let mut q = std::ptr::null();
+            assert_eq!(slot::<Create>(0x60)(&OBJECT, 0, 0, &mut q), S_OK);
+            q
+        }
+
+        fn register(q: *const Queue, port: u32, event: HANDLE, ran: &Ran) -> u64 {
+            let mut token = 0;
+            let context = std::ptr::from_ref(ran).cast_mut().cast();
+            let register = slot::<Register>(0xa0);
+            assert_eq!(
+                register(&OBJECT, q, port, event, context, Some(ran_fn()), &mut token),
+                S_OK
+            );
+            assert_ne!(token, 0);
+            token
+        }
+
+        fn ran_fn() -> Callback {
+            ran
+        }
+
+        /// Waits (5 s at most) until `done` holds.
+        fn eventually(done: impl Fn() -> bool) -> bool {
+            let start = std::time::Instant::now();
+            while !done() {
+                if start.elapsed() > Duration::from_secs(5) {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            true
+        }
+
+        #[test]
+        fn a_registered_waiter_runs_on_its_queue_when_signalled() {
+            let this: This = &OBJECT;
+            let dispatch = slot::<Dispatch>(0x80);
+            let q = manual_queue();
+            let (auto, seen) = (event(false), Ran::default());
+            let token = register(q, COMPLETION, auto, &seen);
+            let times = || seen.times.load(Ordering::SeqCst);
+
+            // Not signalled: nothing is submitted.
+            assert!(!dispatch(this, q, COMPLETION, 50));
+            assert_eq!(times(), 0);
+            // Signalled: the callback is submitted to the port it was
+            // registered for and runs where that port is dispatched.
+            // SAFETY: the test's event.
+            unsafe { SetEvent(auto) };
+            assert!(dispatch(this, q, COMPLETION, 5000));
+            assert_eq!((times(), seen.canceled.load(Ordering::SeqCst)), (1, 0));
+            assert_eq!(*lock(&seen.thread), Some(std::thread::current().id()));
+            assert!(!dispatch(this, q, WORK, 0), "the other port got nothing");
+            // An auto-reset event gives one callback for each signal.
+            assert!(!dispatch(this, q, COMPLETION, 100));
+            // SAFETY: as above.
+            unsafe { SetEvent(auto) };
+            assert!(dispatch(this, q, COMPLETION, 5000));
+            assert_eq!(times(), 2);
+            slot::<Unregister>(0xa8)(this, q, token);
+
+            // A manual-reset event keeps the callback coming, each one
+            // submitted when the one before has completed.
+            let (manual, again) = (event(true), Ran::default());
+            let token = register(q, WORK, manual, &again);
+            // SAFETY: the test's event.
+            unsafe { SetEvent(manual) };
+            for round in 1..=3 {
+                assert!(dispatch(this, q, WORK, 5000), "round {round}");
+                assert_eq!(again.times.load(Ordering::SeqCst), round);
+            }
+            slot::<Unregister>(0xa8)(this, q, token);
+            // SAFETY: as above.
+            unsafe { ResetEvent(manual) };
+
+            // What is no queue port, handle, callback or place for a token.
+            let register = slot::<Register>(0xa0);
+            let context = std::ptr::null_mut();
+            let mut token = 0;
+            let null = std::ptr::null_mut();
+            for (port, handle, callback, out) in [
+                (2, auto, Some(ran_fn()), &raw mut token),
+                (WORK, null, Some(ran_fn()), &raw mut token),
+                (WORK, auto, None, &raw mut token),
+                (WORK, auto, Some(ran_fn()), std::ptr::null_mut()),
+            ] {
+                assert_eq!(
+                    register(this, q, port, handle, context, callback, out),
+                    E_INVALIDARG
+                );
+            }
+            assert_eq!(token, 0);
+            slot::<Close>(0x88)(this, q);
+            // SAFETY: the test's events, waited for by nobody now.
+            unsafe {
+                CloseHandle(auto);
+                CloseHandle(manual);
+            }
+        }
+
+        #[test]
+        fn an_unregistered_waiter_never_runs() {
+            let this: This = &OBJECT;
+            let dispatch = slot::<Dispatch>(0x80);
+            let unregister = slot::<Unregister>(0xa8);
+            let q = manual_queue();
+            let (signal, seen) = (event(false), Ran::default());
+            let times = || seen.times.load(Ordering::SeqCst);
+            // SAFETY: a handle this test holds open.
+            let queued = |port: u32| unsafe { lock(&(&(*q).ports)[port as usize].tasks).len() };
+
+            // Unregistered before the signal: nothing is submitted.
+            let token = register(q, COMPLETION, signal, &seen);
+            unregister(this, q, token);
+            // SAFETY: the test's event.
+            unsafe { SetEvent(signal) };
+            assert!(!dispatch(this, q, COMPLETION, 200));
+            // SAFETY: as above.
+            unsafe { ResetEvent(signal) };
+
+            // Unregistered after the callback was submitted and before the
+            // queue ran it: it is not invoked either.
+            let token = register(q, COMPLETION, signal, &seen);
+            // SAFETY: as above.
+            unsafe { SetEvent(signal) };
+            assert!(eventually(|| queued(COMPLETION) == 1));
+            unregister(this, q, token);
+            dispatch(this, q, COMPLETION, 0);
+            assert_eq!(times(), 0);
+            // A token that names nothing is ignored.
+            unregister(this, q, token);
+            unregister(this, q, u64::MAX);
+
+            // A terminated queue takes no waiter and drops the ones it has.
+            let token = register(q, WORK, signal, &seen);
+            // SAFETY: a handle this test holds open.
+            let waiter = unsafe { lock(&(*q).waiters)[0].1.clone() };
+            assert_eq!(
+                XTaskQueueTerminate(q, false, std::ptr::null_mut(), None),
+                S_OK
+            );
+            // SAFETY: as above.
+            unsafe { SetEvent(signal) };
+            assert!(
+                eventually(|| Arc::strong_count(&waiter) == 1),
+                "the wait goes on after the queue was terminated"
+            );
+            assert_eq!((times(), queued(WORK)), (0, 0));
+            let mut refused = 0;
+            let context = std::ptr::from_ref(&seen).cast_mut().cast();
+            let register_slot = slot::<Register>(0xa0);
+            assert_eq!(
+                register_slot(this, q, WORK, signal, context, Some(ran_fn()), &mut refused),
+                E_ABORT
+            );
+            unregister(this, q, token);
+            slot::<Close>(0x88)(this, q);
+
+            // A queue closed with a waiter still registered ends the wait:
+            // unregistering is optional.
+            let q = manual_queue();
+            register(q, COMPLETION, signal, &seen);
+            // SAFETY: a handle this test holds open.
+            let waiter = unsafe { lock(&(*q).waiters)[0].1.clone() };
+            slot::<Close>(0x88)(this, q);
+            assert!(
+                eventually(|| Arc::strong_count(&waiter) == 1),
+                "the wait goes on after the queue was closed"
+            );
+            assert_eq!(times(), 0);
+            // SAFETY: the test's event, waited for by nobody now.
+            unsafe { CloseHandle(signal) };
+        }
     }
 }
