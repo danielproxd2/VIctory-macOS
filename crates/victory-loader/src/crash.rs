@@ -175,14 +175,13 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
                     // A whole write-back loop in one exception (see `clwb_loop`).
                     let limit = *gpr(context, pass.limit);
                     let base = gpr(context, pass.base);
-                    *base = if *base <= limit {
-                        base.wrapping_add(((limit - *base) / 64 + 1) * 64)
-                    } else {
-                        base.wrapping_add(64)
+                    let Some(end) = clwb_loop_end(*base, limit) else {
+                        return false;
                     };
-                    let flags = cmp_flags(*base, limit);
+                    *base = end;
+                    let flags = cmp_flags(end, limit);
                     context.EFlags = context.EFlags & !CMP_FLAGS | flags;
-                    context.Rip += pass.len as u64;
+                    context.Rip = context.Rip.wrapping_add(pass.len as u64);
                     return true;
                 }
                 if n >= 15
@@ -287,6 +286,20 @@ fn clwb_loop(code: &[u8]) -> Option<ClwbLoop> {
         return None;
     }
     (limit != base).then_some(ClwbLoop { base, limit, len })
+}
+
+/// `base` as a [`ClwbLoop`] leaves it: the first `base + 64 * k` (`k` at
+/// least 1, every loop makes one pass) above `limit`. `None` where that is
+/// past the end of the address space: there `base` wraps to a low address
+/// and the real loop goes on from it, which is not a write-back of a buffer
+/// and is not emulated. The registers are the title's, so no step of this
+/// may overflow.
+fn clwb_loop_end(base: u64, limit: u64) -> Option<u64> {
+    let passes = match limit.checked_sub(base) {
+        Some(distance) => distance / 64 + 1,
+        None => 1,
+    };
+    base.checked_add(passes.checked_mul(64)?)
 }
 
 /// The general register numbered `n` as instructions encode it.
@@ -772,6 +785,65 @@ mod tests {
         assert_eq!(cmp_flags(0x1000, 0x1000) & 0x40, 0x40);
     }
 
+    /// clwb [rcx]; add rcx, 0x40; cmp rcx, rax; jbe top
+    const CLWB_LOOP: [u8; 13] = [
+        0x66, 0x0f, 0xae, 0x31, 0x48, 0x83, 0xc1, 0x40, 0x48, 0x39, 0xc1, 0x76, 0xf3,
+    ];
+
+    #[test]
+    fn clwb_loop_advances_base_and_rip() {
+        let (skipped, after) = emulate_with(&CLWB_LOOP, |c| {
+            c.Rcx = 0x1000;
+            c.Rax = 0x10ff;
+            c.EFlags = 0x202 | CMP_FLAGS;
+        });
+        // Four lines: 0x1000, 0x1040, 0x1080 and 0x10c0; the loop leaves at
+        // the first base above the limit, with the flags of that compare.
+        assert_eq!(skipped, Some(13));
+        assert_eq!((after.Rcx, after.Rax), (0x1100, 0x10ff));
+        assert_eq!(after.EFlags, 0x202 | cmp_flags(0x1100, 0x10ff));
+        assert_eq!(after.EFlags & 0x41, 0, "above: CF and ZF clear");
+        // A base already above the limit: the one pass every loop makes.
+        let (skipped, after) = emulate_with(&CLWB_LOOP, |c| {
+            c.Rcx = 0x2000;
+            c.Rax = 0x1000;
+        });
+        assert_eq!((skipped, after.Rcx), (Some(13), 0x2040));
+        // Base and limit equal: one pass too.
+        let (skipped, after) = emulate_with(&CLWB_LOOP, |c| {
+            c.Rcx = 0x1000;
+            c.Rax = 0x1000;
+        });
+        assert_eq!((skipped, after.Rcx), (Some(13), 0x1040));
+    }
+
+    /// Where the loop's last base is past the end of the address space, the
+    /// real loop never leaves by its compare: nothing is emulated, and the
+    /// registers stay as they were.
+    #[test]
+    fn clwb_loop_with_extreme_limit_does_not_overflow() {
+        for (base, limit) in [
+            (0, u64::MAX),
+            (0x1000, u64::MAX - 63),
+            (u64::MAX - 10, 5),
+            (u64::MAX - 63, u64::MAX),
+        ] {
+            let (skipped, after) = emulate_with(&CLWB_LOOP, |c| {
+                c.Rcx = base;
+                c.Rax = limit;
+                c.EFlags = 0x202;
+            });
+            assert_eq!(skipped, None, "base {base:#x}, limit {limit:#x}");
+            assert_eq!((after.Rcx, after.Rax, after.EFlags), (base, limit, 0x202));
+        }
+        // Two passes that end in the last line of the address space.
+        let (skipped, after) = emulate_with(&CLWB_LOOP, |c| {
+            c.Rcx = u64::MAX - 0xff;
+            c.Rax = u64::MAX - 0x80;
+        });
+        assert_eq!((skipped, after.Rcx), (Some(13), u64::MAX - 0x7f));
+    }
+
     #[test]
     fn clwb_lengths() {
         let pad = |b: &[u8]| {
@@ -835,35 +907,56 @@ mod tests {
         }
     }
 
-    /// Gives `code` to the emulation as if it faulted with `exception` at
-    /// its first byte, with `rax` and `xmm` as the saved registers. The
-    /// emulation does not execute `code`, so this works on any CPU. Returns
-    /// the number of bytes that the emulation skipped, or `None` if it did
-    /// not emulate the instruction. `xmm` gets the saved registers after.
-    fn emulate_as(exception: i32, code: &[u8], rax: u64, xmm: &mut [M128A; 16]) -> Option<u64> {
-        // `int3` after the instruction, so that a decoder that reads too
-        // far sees no valid bytes.
-        let mut bytes = [0xcc_u8; 16];
-        bytes[..code.len()].copy_from_slice(code);
-        let start = bytes.as_ptr() as u64;
+    /// Gives the bytes at `rip` to the emulation as if they faulted with
+    /// `exception`, the saved registers being what `set` makes of zeroed
+    /// ones. The emulation does not execute the bytes, so this works on any
+    /// CPU. Returns the number of bytes that the emulation skipped, or
+    /// `None` if it did not emulate the instruction, and the registers
+    /// after.
+    fn emulate_at(
+        exception: i32,
+        rip: *const u8,
+        set: impl FnOnce(&mut CONTEXT),
+    ) -> (Option<u64>, CONTEXT) {
         // SAFETY: a zeroed record and context are valid; the emulation
-        // reads only `bytes` and writes only `context` (and memory at
-        // `rax` for clzero, which the caller owns).
+        // reads only the page `rip` is in and writes only `context` (and
+        // memory at `rax` for clzero, which the caller owns).
         unsafe {
             let mut record: EXCEPTION_RECORD = std::mem::zeroed();
             record.ExceptionCode = exception;
             let mut context: CONTEXT = std::mem::zeroed();
-            context.Rip = start;
-            context.Rax = rax;
-            context.Anonymous.FltSave.XmmRegisters = *xmm;
+            set(&mut context);
+            context.Rip = rip as u64;
             let mut pointers = EXCEPTION_POINTERS {
                 ExceptionRecord: &mut record,
                 ContextRecord: &mut context,
             };
             let emulated = emulate_amd_only(&mut pointers);
-            *xmm = context.Anonymous.FltSave.XmmRegisters;
-            emulated.then(|| context.Rip - start)
+            (emulated.then(|| context.Rip - rip as u64), context)
         }
+    }
+
+    /// [`emulate_at`] for an illegal instruction at the start of `code`,
+    /// which is followed by `int3`s, so that a decoder that reads too far
+    /// sees no valid bytes.
+    fn emulate_with(code: &[u8], set: impl FnOnce(&mut CONTEXT)) -> (Option<u64>, CONTEXT) {
+        let mut bytes = [0xcc_u8; 16];
+        bytes[..code.len()].copy_from_slice(code);
+        emulate_at(EXCEPTION_ILLEGAL_INSTRUCTION, bytes.as_ptr(), set)
+    }
+
+    /// [`emulate_at`] with `rax` and `xmm` as the saved registers; `xmm`
+    /// gets the saved registers after.
+    fn emulate_as(exception: i32, code: &[u8], rax: u64, xmm: &mut [M128A; 16]) -> Option<u64> {
+        let mut bytes = [0xcc_u8; 16];
+        bytes[..code.len()].copy_from_slice(code);
+        let (skipped, context) = emulate_at(exception, bytes.as_ptr(), |context| {
+            context.Rax = rax;
+            context.Anonymous.FltSave.XmmRegisters = *xmm;
+        });
+        // SAFETY: the saved floating-point state is plain data.
+        *xmm = unsafe { context.Anonymous.FltSave.XmmRegisters };
+        skipped
     }
 
     fn emulate(code: &[u8], rax: u64, xmm: &mut [M128A; 16]) -> Option<u64> {
