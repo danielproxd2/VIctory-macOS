@@ -1,0 +1,449 @@
+//! `victory run` as a user starts it: the binary, its standard output and
+//! its exit status. The title is the stand-in executable of the fixtures
+//! workspace (tests/fixtures/hle-probe-exe), written by us; it needs the
+//! Windows loader, so it runs on Windows and under Wine. What `run` does
+//! on another host, and without a title, is tested on every host.
+
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+#[cfg(windows)]
+#[path = "../../../crates/victory-loader/tests/common/mod.rs"]
+mod common;
+
+/// The folders of one test: the title's own (`title`, the package the
+/// title sees as `G:`), the two `victory` writes to (`cache`, `data`; made
+/// on first use), and an empty one to start it in (`cwd`: no victory.toml).
+struct Home {
+    dir: tempfile::TempDir,
+}
+
+impl Home {
+    fn new() -> Home {
+        let dir = tempfile::tempdir().unwrap();
+        for sub in ["title", "cwd"] {
+            std::fs::create_dir(dir.path().join(sub)).unwrap();
+        }
+        Home { dir }
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.dir.path().join(name)
+    }
+
+    /// Where the stand-in title writes what it saw.
+    fn title_log(&self) -> PathBuf {
+        self.path("title.log")
+    }
+
+    /// Runs `victory` with nothing configured but this test's folders.
+    fn victory(&self, args: &[&std::ffi::OsStr]) -> Run {
+        self.victory_with_data(&self.path("data"), args)
+    }
+
+    /// The same, with what titles save under `data`.
+    fn victory_with_data(&self, data: &Path, args: &[&std::ffi::OsStr]) -> Run {
+        let out = Command::new(env!("CARGO_BIN_EXE_victory"))
+            .args(args)
+            .current_dir(self.path("cwd"))
+            .env_remove("VICTORY_CONFIG")
+            .env_remove("VICTORY_GAME_DIR")
+            .env_remove("VICTORY_TEST_TITLES")
+            .env("VICTORY_CACHE_DIR", self.path("cache"))
+            .env("VICTORY_DATA_DIR", data)
+            .env("VICTORY_FIXTURE_LOG", self.title_log())
+            .output()
+            .expect("victory starts");
+        Run::of(out)
+    }
+}
+
+/// How one run of `victory` ended and what it said.
+#[derive(Debug)]
+struct Run {
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+impl Run {
+    fn of(out: Output) -> Run {
+        Run {
+            code: out.status.code(),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        }
+    }
+}
+
+/// `run` takes no title from the configuration: without one on the command
+/// line nothing is started, and the message names what is missing.
+#[test]
+fn run_without_a_title_names_the_missing_argument() {
+    let home = Home::new();
+    for args in [&["run"][..], &["run", "--execute"]] {
+        let args: Vec<&std::ffi::OsStr> = args.iter().map(|a| a.as_ref()).collect();
+        let run = home.victory(&args);
+        assert_eq!(run.code, Some(2), "{run:#?}");
+        assert_eq!(run.stdout, "", "{run:#?}");
+        assert!(run.stderr.contains("<EXE>"), "{run:#?}");
+        assert!(run.stderr.contains("Usage: "), "{run:#?}");
+        assert!(!home.path("data").exists(), "nothing was made: {run:#?}");
+    }
+}
+
+/// The loader is the Windows loader.
+#[cfg(not(windows))]
+#[test]
+fn run_fails_by_name_on_a_host_that_is_not_windows() {
+    let home = Home::new();
+    let title = home.path("title").join("title.exe");
+    let run = home.victory(&["run".as_ref(), "--execute".as_ref(), title.as_os_str()]);
+    assert_eq!(run.code, Some(1), "{run:#?}");
+    assert_eq!(run.stdout, "", "{run:#?}");
+    assert!(
+        run.stderr.contains("running titles requires Windows"),
+        "{run:#?}"
+    );
+    assert!(!home.path("data").exists(), "nothing was made: {run:#?}");
+}
+
+#[cfg(windows)]
+mod with_the_stand_in_title {
+    use std::ffi::OsStr;
+    use std::path::{Path, PathBuf};
+
+    use super::Home;
+    use super::common::fixture;
+
+    /// What tests/fixtures/hle-probe-exe answers with (the constants at the
+    /// top of its main.rs): its exit code is this plus what
+    /// `XGameRuntimeInitialize` returned, which is `S_OK` from our runtime.
+    const EXIT_BASE: i32 = 7;
+    /// What it returns when it finds no log to write to.
+    const FAILED_NO_LOG: i32 = 0xE001;
+    const TEMPLATE_VALUE: u64 = 41;
+    const WORKER_ADDS: [u64; 2] = [100, 200];
+
+    /// A synthetic manifest, in the two elements our reader takes; the
+    /// title id is made up.
+    const MANIFEST: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+        <Game configVersion=\"1\">\n  <TitleId>0A0B0C0D</TitleId>\n  \
+        <PersistentLocalStorage><SizeMB>16</SizeMB></PersistentLocalStorage>\n</Game>\n";
+
+    /// Copies the fixture `file` into the title's folder: the fixtures are
+    /// built inside the source tree, and a title's folder is not there.
+    fn install(home: &Home, file: &str) -> PathBuf {
+        let to = home.path("title").join(file);
+        std::fs::copy(fixture(file), &to).unwrap();
+        to
+    }
+
+    /// The one line of `text` that starts with `start`, without it.
+    #[track_caller]
+    fn line<'a>(text: &'a str, start: &str) -> &'a str {
+        let found: Vec<&str> = text.lines().filter_map(|l| l.strip_prefix(start)).collect();
+        match found[..] {
+            [line] => line.trim_end(),
+            _ => panic!("{} lines start with {start:?} in:\n{text}", found.len()),
+        }
+    }
+
+    /// The four numbers of `bound <image>: a hle, b host, c title, d missing`.
+    #[track_caller]
+    fn bound(text: &str, image: &str) -> [u64; 4] {
+        let counts = line(text, &format!("bound          {image}: "));
+        let numbers: Vec<u64> = counts
+            .split(", ")
+            .zip(["hle", "host", "title", "missing"])
+            .map(|(part, who)| {
+                let (number, name) = part.split_once(' ').expect("a count and who");
+                assert_eq!(name, who, "{counts}");
+                number.parse().expect("a count")
+            })
+            .collect();
+        numbers.try_into().expect("four counts")
+    }
+
+    /// The `dll!function` names under `missing`.
+    fn missing(text: &str) -> Vec<&str> {
+        text.lines()
+            .filter_map(|l| l.strip_prefix("  missing      "))
+            .map(str::trim_end)
+            .collect()
+    }
+
+    /// The folder the report says the title's storage is in.
+    #[track_caller]
+    fn storage(text: &str, id: &str) -> (PathBuf, String) {
+        let said = line(text, &format!("title          {id}, storage "));
+        let (path, size) = said.rsplit_once(" (").expect("a path and a size");
+        (PathBuf::from(path), size.trim_end_matches(')').to_owned())
+    }
+
+    /// The source tree, as this host names it.
+    fn repo_root() -> PathBuf {
+        std::fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
+            .expect("the tests run beside the source tree")
+    }
+
+    /// The number of the one line `name=number` in the title's log.
+    fn seen(log: &str, name: &str) -> Option<u64> {
+        let mut values = log
+            .lines()
+            .filter_map(|l| l.split_once('='))
+            .filter(|(key, _)| *key == name);
+        match (values.next(), values.next()) {
+            (Some((_, value)), None) => value.trim().parse().ok(),
+            _ => None,
+        }
+    }
+
+    /// The names of what lies in `dir`, sorted.
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn run_binds_the_title_without_starting_it() {
+        let home = Home::new();
+        let title = install(&home, "hle-probe-exe.exe");
+        let run = home.victory(&["run".as_ref(), title.as_os_str()]);
+        assert_eq!(run.code, Some(0), "{run:#?}");
+
+        // The build is not one we know; it is named by its hash.
+        let build = line(&run.stdout, "build          ");
+        let hash = build
+            .strip_prefix("unknown (")
+            .and_then(|b| b.strip_suffix(')'))
+            .unwrap_or_else(|| panic!("{build}"));
+        assert_eq!(hash.len(), 64, "{build}");
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()), "{build}");
+        assert!(line(&run.stdout, "mapped at      ").starts_with("0x"));
+        assert_eq!(line(&run.stdout, "console        "), "Xbox Series X");
+
+        // By property, not by number: the console import is ours, the
+        // host has the rest, and nothing is left over.
+        let [hle, host, title_dlls, none] = bound(&run.stdout, "hle-probe-exe.exe");
+        assert!(hle >= 1 && host >= 1, "{run:#?}");
+        assert_eq!((title_dlls, none), (0, 0), "{run:#?}");
+        assert_eq!(missing(&run.stdout), [""; 0], "{run:#?}");
+
+        // Without a manifest the title has id 0 and no quota.
+        let (_, size) = storage(&run.stdout, "00000000");
+        assert_eq!(size, "0 MB");
+
+        // It stopped there, and said how to go on.
+        assert_eq!(
+            run.stdout.lines().last(),
+            Some("not executing (pass --execute to start the title)"),
+            "{run:#?}"
+        );
+        assert!(!run.stdout.contains("title exited"), "{run:#?}");
+        assert!(!home.title_log().exists(), "the title ran: {run:#?}");
+    }
+
+    #[test]
+    fn run_execute_runs_the_title_to_its_end() {
+        let home = Home::new();
+        let title = install(&home, "hle-probe-exe.exe");
+        std::fs::write(home.path("title").join("MicrosoftGame.config"), MANIFEST).unwrap();
+        let run = home.victory(&["run".as_ref(), "--execute".as_ref(), title.as_os_str()]);
+
+        // The report: what was bound, then how the title ended.
+        assert_eq!(
+            run.stdout.lines().last(),
+            Some(format!("title exited with {EXIT_BASE}").as_str()),
+            "{run:#?}"
+        );
+        let [hle, _, _, none] = bound(&run.stdout, "hle-probe-exe.exe");
+        assert!(hle >= 1, "{run:#?}");
+        assert_eq!(none, 0, "{run:#?}");
+        let bound_at = run.stdout.find("bound          ").unwrap();
+        let ended_at = run.stdout.find("title exited").unwrap();
+        assert!(bound_at < ended_at, "{run:#?}");
+
+        // The title's own account: it called our runtime and got `S_OK`,
+        // its threads each had their copy of its thread-local data, and
+        // it was told that the process ends, last of all.
+        let log = std::fs::read_to_string(home.title_log())
+            .unwrap_or_else(|e| panic!("the title left no log ({e}): {run:#?}"));
+        assert_eq!(seen(&log, "runtime"), Some(0), "{log}");
+        assert_eq!(seen(&log, "main_initial"), Some(TEMPLATE_VALUE), "{log}");
+        assert_eq!(seen(&log, "main_last"), Some(TEMPLATE_VALUE + 1), "{log}");
+        for (thread, adds) in ["a", "b"].iter().zip(WORKER_ADDS) {
+            let last = seen(&log, &format!("{thread}_last"));
+            assert_eq!(last, Some(TEMPLATE_VALUE + adds), "{log}");
+        }
+        assert_eq!(log.lines().last(), Some("detached=1"), "{log}");
+
+        // The manifest's id names the title's folders, which lie under
+        // the data folder and outside the source tree.
+        let data = home.path("data");
+        let (storage, size) = storage(&run.stdout, "0A0B0C0D");
+        assert_eq!(size, "16 MB");
+        assert!(storage.is_dir(), "{}", storage.display());
+        assert_eq!(storage, data.join("0A0B0C0D").join("storage"));
+        assert!(data.join("0A0B0C0D").join("temp").is_dir(), "{run:#?}");
+        let policy = victory_core::ensure_outside_repo(&storage);
+        assert_eq!(policy.map_err(|e| e.to_string()), Ok(()));
+        assert!(!storage.starts_with(repo_root()), "{}", storage.display());
+
+        // The copy of the executable that is mapped lies in the cache, and
+        // nothing was written beside the title.
+        let images = names(&home.path("cache").join("images"));
+        assert!(
+            images
+                .iter()
+                .any(|n| n.starts_with("victory-image-") && n.ends_with(".dll")),
+            "{images:?}"
+        );
+        assert_eq!(
+            names(&home.path("title")),
+            ["MicrosoftGame.config", "hle-probe-exe.exe"]
+        );
+    }
+
+    /// `--strict`: nothing passes through to the host, and the report
+    /// names each import that is then nobody's.
+    #[test]
+    fn run_strict_names_the_host_imports_as_missing() {
+        let home = Home::new();
+        let title = install(&home, "hle-probe-exe.exe");
+        let run = home.victory(&["run".as_ref(), "--strict".as_ref(), title.as_os_str()]);
+        assert_eq!(run.code, Some(0), "{run:#?}");
+        let missing = missing(&run.stdout);
+        for import in [
+            "kernel32.dll!CreateThread",
+            "kernel32.dll!GetCurrentThreadStackLimits",
+        ] {
+            assert!(missing.contains(&import), "{import}: {run:#?}");
+        }
+        // What our runtime implements stays bound.
+        assert!(
+            !missing.iter().any(|m| m.contains("XGameRuntimeInitialize")),
+            "{run:#?}"
+        );
+        let [hle, host, _, none] = bound(&run.stdout, "hle-probe-exe.exe");
+        assert!(hle >= 1, "{run:#?}");
+        assert_eq!(host, 0, "{run:#?}");
+        assert_eq!(none as usize, missing.len(), "{run:#?}");
+        assert!(!home.title_log().exists(), "the title ran: {run:#?}");
+    }
+
+    /// The default for an import nobody has: the first call of one ends
+    /// the run, by name, on the screen and in the crash log.
+    #[test]
+    fn run_execute_stops_at_the_first_call_of_a_missing_import() {
+        let home = Home::new();
+        let title = install(&home, "hle-probe-exe.exe");
+        let args: [&OsStr; 4] = [
+            "run".as_ref(),
+            "--strict".as_ref(),
+            "--execute".as_ref(),
+            title.as_os_str(),
+        ];
+        let run = home.victory(&args);
+        assert!(run.code != Some(0), "{run:#?}");
+        assert!(!run.stdout.contains("title exited"), "{run:#?}");
+        let said = run
+            .stderr
+            .lines()
+            .find_map(|l| l.strip_prefix("VIctory: unimplemented import "))
+            .unwrap_or_else(|| panic!("no import is named: {run:#?}"));
+        let (import, _) = said.split_once(' ').expect("the import, then `called`");
+        assert!(import.starts_with("kernel32.dll!"), "{said}");
+        assert!(missing(&run.stdout).contains(&import), "{import}: {run:#?}");
+        // The crash log is beside the title's folders, under the data
+        // folder.
+        let crashes = home.path("data").join("00000000").join("crashes.log");
+        let crashes = std::fs::read_to_string(&crashes)
+            .unwrap_or_else(|e| panic!("{}: {e}: {run:#?}", crashes.display()));
+        assert!(
+            crashes.contains(&format!("VIctory: unimplemented import {import} called")),
+            "{crashes}"
+        );
+        assert!(!home.title_log().exists(), "{run:#?}");
+    }
+
+    /// `--unimplemented zero`: a missing import returns 0 and the title
+    /// goes on. The stand-in then finds no name for its log (the call that
+    /// reads the environment answers 0) and returns its code for that.
+    #[test]
+    fn run_unimplemented_zero_lets_a_missing_import_return() {
+        let home = Home::new();
+        let title = install(&home, "hle-probe-exe.exe");
+        let args: [&OsStr; 6] = [
+            "run".as_ref(),
+            "--strict".as_ref(),
+            "--unimplemented".as_ref(),
+            "zero".as_ref(),
+            "--execute".as_ref(),
+            title.as_os_str(),
+        ];
+        let run = home.victory(&args);
+        assert_eq!(
+            run.stdout.lines().last(),
+            Some(format!("title exited with {FAILED_NO_LOG}").as_str()),
+            "{run:#?}"
+        );
+        assert!(
+            !run.stderr.contains("VIctory: unimplemented import"),
+            "{run:#?}"
+        );
+        assert!(!home.title_log().exists(), "{run:#?}");
+    }
+
+    #[test]
+    fn run_execute_fails_on_a_title_that_is_not_there() {
+        let home = Home::new();
+        let absent = home.path("title").join("absent.exe");
+        let run = home.victory(&["run".as_ref(), "--execute".as_ref(), absent.as_os_str()]);
+        assert_eq!(run.code, Some(1), "{run:#?}");
+        assert_eq!(run.stdout, "", "{run:#?}");
+        assert!(run.stderr.contains("Error: reading "), "{run:#?}");
+        assert!(run.stderr.contains("absent.exe"), "{run:#?}");
+        // Nothing was made for a title that is not there.
+        assert!(!home.path("data").exists(), "{run:#?}");
+        assert!(!home.path("cache").exists(), "{run:#?}");
+    }
+
+    #[test]
+    fn run_execute_fails_on_a_file_that_is_no_image() {
+        let home = Home::new();
+        let notes = home.path("title").join("notes.exe");
+        std::fs::write(&notes, b"not an image").unwrap();
+        let run = home.victory(&["run".as_ref(), "--execute".as_ref(), notes.as_os_str()]);
+        assert_eq!(run.code, Some(1), "{run:#?}");
+        assert_eq!(run.stdout, "", "{run:#?}");
+        assert!(run.stderr.contains("Error: malformed image"), "{run:#?}");
+        assert!(!home.path("data").exists(), "{run:#?}");
+        assert!(!home.path("cache").exists(), "{run:#?}");
+    }
+
+    /// What a title saves is never put inside the source tree: the run
+    /// ends before the title starts, and the folder is not made.
+    #[test]
+    fn run_refuses_a_data_folder_inside_the_repository() {
+        let home = Home::new();
+        let title = install(&home, "hle-probe-exe.exe");
+        let inside = repo_root().join("target").join("victory-run-test-data");
+        assert!(!inside.exists(), "{} is in the way", inside.display());
+        let args: [&OsStr; 3] = ["run".as_ref(), "--execute".as_ref(), title.as_os_str()];
+        let run = home.victory_with_data(&inside, &args);
+        assert_eq!(run.code, Some(1), "{run:#?}");
+        assert!(
+            run.stderr.contains("it is inside the VIctory source tree"),
+            "{run:#?}"
+        );
+        assert!(!run.stdout.contains("bound "), "{run:#?}");
+        assert!(!run.stdout.contains("title exited"), "{run:#?}");
+        assert!(!home.title_log().exists(), "the title ran: {run:#?}");
+        assert!(!inside.exists(), "{} was made", inside.display());
+    }
+}
