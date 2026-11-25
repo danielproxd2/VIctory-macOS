@@ -926,6 +926,9 @@ fn memory_named(
 }
 
 #[cfg(test)]
+mod isa;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use windows_sys::Win32::System::Diagnostics::Debug::{
