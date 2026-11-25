@@ -374,10 +374,7 @@ pub(crate) fn log(frames: f64) {
 mod tests {
     use super::*;
     use crate::object::{HRESULT, S_OK};
-    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-    use windows::Win32::Graphics::Direct3D::ID3DBlob;
     use windows::Win32::Graphics::Direct3D12::*;
-    use windows::core::s;
 
     /// Reads slots 0 (raw buffer) and 2 (texture) of the heap and writes
     /// slot 1 (raw unordered buffer): through a table over the heap's
@@ -395,45 +392,11 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
-    fn compile() -> (ID3D12RootSignature, ID3D12PipelineState) {
-        let host = crate::host::host().unwrap();
-        let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
-        // SAFETY: the source and names outlive the call.
-        unsafe {
-            D3DCompile(
-                SOURCE.as_ptr().cast(),
-                SOURCE.len(),
-                s!("heap"),
-                None,
-                None,
-                s!("main"),
-                s!("cs_5_1"),
-                0,
-                0,
-                &mut code,
-                Some(&mut errors),
-            )
-            .unwrap();
-        }
-        let code = code.unwrap();
-        // SAFETY: the blob's own bytes.
-        let bytes = unsafe {
-            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
-        };
-        // SAFETY: a compiled shader with its root signature inside.
-        unsafe {
-            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
-            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                pRootSignature: std::mem::transmute_copy(&root),
-                CS: D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: bytes.as_ptr().cast(),
-                    BytecodeLength: bytes.len(),
-                },
-                ..Default::default()
-            };
-            let pso = host.device.CreateComputePipelineState(&desc).unwrap();
-            (root, pso)
-        }
+    /// The shader of `test` ([`SOURCE`]), or `None` after the test's
+    /// "skipped" line where the host's HLSL compiler cannot build it
+    /// (`crate::testing::compute_shader`).
+    fn compile(test: &str) -> Option<(ID3D12RootSignature, ID3D12PipelineState)> {
+        crate::testing::compute_shader(test, SOURCE, 0)
     }
 
     /// A title resource from a description in the console's layout (56
@@ -530,6 +493,8 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// slots come and go; a copy no slot views any more has none.
     #[test]
     fn hulls_follow_the_ranges() {
+        // The copy is a host buffer where there is a device.
+        let _gpu = crate::testing::serial();
         let memory = vec![0u8; 0x1000];
         let at = memory.as_ptr() as u64;
         crate::shadow::register(at as usize, at, 0x1000);
@@ -578,6 +543,9 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// copy.
     #[test]
     fn heap_views_are_current() {
+        let Some(_gpu) = crate::testing::gpu() else {
+            return;
+        };
         let (src, dst) = (resource(1, 256, 1, 0, 1), resource(1, 256, 1, 0, 1));
         let tex = resource(3, 4, 1, 28, LINEAR);
         let write = |base: u32, texel: u8| {
@@ -595,7 +563,7 @@ void main(uint3 id : SV_DispatchThreadID) {
                 std::ptr::write_bytes(tex_bytes.cast_mut(), texel, size);
             }
         };
-        rounds(src, dst, tex, write);
+        rounds("bindless::heap_views_are_current", src, dst, tex, write);
     }
 
     /// The same with the buffer and the texture in one view of physical
@@ -603,6 +571,9 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// heaps through a pool view): every round must reach the shader.
     #[test]
     fn heap_views_follow_writes_through_another_mapping() {
+        let Some(_gpu) = crate::testing::gpu() else {
+            return;
+        };
         let (a, b) = crate::watch::tests::twin_views(2);
         let src = resource_at(a, 1, 256, 1, 0, 1);
         let tex = resource_at(a + PAGE_BYTES, 3, 4, 1, 28, LINEAR);
@@ -621,15 +592,18 @@ void main(uint3 id : SV_DispatchThreadID) {
                 std::ptr::write_bytes((b + PAGE_BYTES) as *mut u8, texel, size);
             }
         };
-        rounds(src, dst, tex, write);
+        const TEST: &str = "bindless::heap_views_follow_writes_through_another_mapping";
+        rounds(TEST, src, dst, tex, write);
     }
 
     const PAGE_BYTES: usize = crate::watch::PAGE;
 
     /// Three rounds of: record a dispatch reading slots 0 and 2 and writing
     /// slot 1, let the title `write` (after recording, before submitting),
-    /// submit, check the output's host copy.
-    fn rounds(src: This, dst: This, tex: This, write: impl Fn(u32, u8)) {
+    /// submit, check the output's host copy. For `test`, which holds the
+    /// device tests' lock; it did not run (its "skipped" line says so)
+    /// where the host's compiler cannot build the shader.
+    fn rounds(test: &str, src: This, dst: This, tex: This, write: impl Fn(u32, u8)) {
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
@@ -657,7 +631,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         crate::descriptor::create_uav(null, dst, null, &uav, slot(1));
         crate::descriptor::create_srv(null, tex, std::ptr::null(), slot(2));
         let heap_host = title_heap.host().expect("a host view heap");
-        let (root, pso) = compile();
+        let Some((root, pso)) = compile(test) else {
+            return;
+        };
         let list = host.new_list().unwrap();
         let (dst_bytes, _) = crate::resource::buffer_bytes(dst).unwrap();
         let out = crate::shadow::find(dst_bytes as u64, 256).expect("the output's host copy");

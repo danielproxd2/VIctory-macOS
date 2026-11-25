@@ -594,62 +594,18 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
-    fn pipeline() -> (
+    /// The shader of `test` ([`SOURCE`]), or `None` after the test's
+    /// "skipped" line where the host's HLSL compiler cannot build it
+    /// (`crate::testing::compute_shader`): the source has an unbounded
+    /// array of views.
+    fn pipeline(
+        test: &str,
+    ) -> Option<(
         windows::Win32::Graphics::Direct3D12::ID3D12RootSignature,
         windows::Win32::Graphics::Direct3D12::ID3D12PipelineState,
-    ) {
-        use windows::Win32::Graphics::Direct3D::Fxc::{
-            D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES, D3DCompile,
-        };
-        use windows::Win32::Graphics::Direct3D::ID3DBlob;
-        use windows::Win32::Graphics::Direct3D12::*;
-        use windows::core::s;
-        let host = crate::host::host().unwrap();
-        let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
-        // SAFETY: the source and names outlive the call; the errors are text.
-        unsafe {
-            let made = D3DCompile(
-                SOURCE.as_ptr().cast(),
-                SOURCE.len(),
-                s!("memory"),
-                None,
-                None,
-                s!("main"),
-                s!("cs_5_1"),
-                D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES,
-                0,
-                &mut code,
-                Some(&mut errors),
-            );
-            let text = errors.map(|e| {
-                String::from_utf8_lossy(std::slice::from_raw_parts(
-                    e.GetBufferPointer().cast::<u8>(),
-                    e.GetBufferSize(),
-                ))
-                .into_owned()
-            });
-            assert!(made.is_ok(), "{text:?}");
-        }
-        let code = code.unwrap();
-        // SAFETY: the blob's own bytes; a compiled shader with its root
-        // signature inside.
-        unsafe {
-            let bytes = std::slice::from_raw_parts(
-                code.GetBufferPointer().cast::<u8>(),
-                code.GetBufferSize(),
-            );
-            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
-            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                pRootSignature: std::mem::transmute_copy(&root),
-                CS: D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: bytes.as_ptr().cast(),
-                    BytecodeLength: bytes.len(),
-                },
-                ..Default::default()
-            };
-            let pso = host.device.CreateComputePipelineState(&desc).unwrap();
-            (root, pso)
-        }
+    )> {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES;
+        crate::testing::compute_shader(test, SOURCE, D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES)
     }
 
     /// A copy's view pair, in view heap `key`'s table.
@@ -670,10 +626,19 @@ void main(uint3 id : SV_DispatchThreadID) {
     #[test]
     fn lists_share_a_table_and_copies_keep_their_views() {
         use crate::watch::PAGE;
-        let (Some(host), Some(views)) = (crate::host::host(), heap()) else {
-            return; // no host GPU here
+        let Some((_gpu, host)) = crate::testing::gpu() else {
+            return;
         };
-        let (root, pso) = pipeline();
+        let Some(views) = heap() else {
+            crate::test_support::skipped(
+                "no shared view heap (memory::lists_share_a_table_and_copies_keep_their_views)",
+            );
+            return;
+        };
+        let Some((root, pso)) = pipeline("memory::lists_share_a_table_and_copies_keep_their_views")
+        else {
+            return;
+        };
         let (out, at) = host.shared_buffer(256).unwrap();
         // SAFETY: a live buffer.
         let out_gpu = unsafe { out.GetGPUVirtualAddress() };

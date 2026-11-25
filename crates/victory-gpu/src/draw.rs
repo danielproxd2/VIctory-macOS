@@ -2133,9 +2133,6 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
 mod tests {
     use super::*;
     use crate::object::{HRESULT, S_OK};
-    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-    use windows::Win32::Graphics::Direct3D::ID3DBlob;
-    use windows::core::s;
 
     /// Rectangle draws are taken only when their vertices lie inside the
     /// bound buffer. The title's first vertex, count and stride are 32 bits
@@ -2318,50 +2315,17 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
-    fn compile() -> (ID3D12RootSignature, ID3D12PipelineState) {
-        compile_cs(SOURCE)
+    /// The shader of `test` ([`SOURCE`]), or `None` after the test's
+    /// "skipped" line where the host's compiler cannot build it.
+    fn compile(test: &str) -> Option<(ID3D12RootSignature, ID3D12PipelineState)> {
+        compile_cs(test, SOURCE)
     }
 
-    /// A compute shader with its root signature inside (`RS`).
-    fn compile_cs(source: &str) -> (ID3D12RootSignature, ID3D12PipelineState) {
-        let host = crate::host::host().unwrap();
-        let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
-        // SAFETY: the source and names outlive the call.
-        unsafe {
-            D3DCompile(
-                source.as_ptr().cast(),
-                source.len(),
-                s!("root"),
-                None,
-                None,
-                s!("main"),
-                s!("cs_5_1"),
-                0,
-                0,
-                &mut code,
-                Some(&mut errors),
-            )
-            .unwrap();
-        }
-        let code = code.unwrap();
-        // SAFETY: the blob's own bytes.
-        let bytes = unsafe {
-            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
-        };
-        // SAFETY: a compiled shader with its root signature inside.
-        unsafe {
-            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
-            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                pRootSignature: std::mem::transmute_copy(&root),
-                CS: D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: bytes.as_ptr().cast(),
-                    BytecodeLength: bytes.len(),
-                },
-                ..Default::default()
-            };
-            let pso = host.device.CreateComputePipelineState(&desc).unwrap();
-            (root, pso)
-        }
+    /// A compute shader with its root signature inside (`RS`), compiled
+    /// for `test`: `None` after the test's "skipped" line where the host's
+    /// HLSL compiler cannot build it (`crate::testing::compute_shader`).
+    fn compile_cs(test: &str, source: &str) -> Option<(ID3D12RootSignature, ID3D12PipelineState)> {
+        crate::testing::compute_shader(test, source, 0)
     }
 
     /// A title buffer of `bytes` in memory of its own.
@@ -2413,8 +2377,8 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// share its view.
     #[test]
     fn root_views_reach_their_copy_and_read_zeros_past_it() {
-        let Some(host) = crate::host::host() else {
-            return; // no host GPU here
+        let Some((_gpu, host)) = crate::testing::gpu() else {
+            return;
         };
         const MIB: u64 = 1 << 20;
         let (src, dst) = (buffer(4 * MIB), buffer(256));
@@ -2437,7 +2401,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         let uav: [u32; 10] = [39, 1, 0, 0, 64, 0, 0, 0, 1, 0];
         crate::descriptor::create_uav(null, dst, null, &uav, title_heap.start + 32);
         let heap_host = title_heap.host().expect("a host view heap");
-        let (root, pso) = compile();
+        let Some((root, pso)) = compile("draw::root_views_reach_their_copy_and_read_zeros_past_it")
+        else {
+            return;
+        };
         let list = host.new_list().unwrap();
         let out = crate::shadow::find(dst_bytes as u64, 256).expect("the output's host copy");
         let src = src_bytes as u64;
@@ -2658,11 +2625,15 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// bridged by a copy at the read.
     #[test]
     fn a_texture_written_in_one_format_reads_in_another_through_a_placed_view() {
-        let Some(host) = crate::host::host() else {
-            return; // no host GPU here
+        let Some((_gpu, host)) = crate::testing::gpu() else {
+            return;
         };
         let slots = Slots::new(4);
-        let read = compile_cs(READ);
+        const TEST: &str =
+            "draw::a_texture_written_in_one_format_reads_in_another_through_a_placed_view";
+        let Some(read) = compile_cs(TEST, READ) else {
+            return;
+        };
         let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
         // Format written and size, what the shader writes, format read and
         // size, the texel expected, whether one host texture.
@@ -2716,9 +2687,14 @@ void main(uint3 id : SV_DispatchThreadID) {
             );
             slots.make(0, &unordered);
             slots.make(1, &view);
-            let write = compile_cs(&format!(
-                "#define RS \"DescriptorTable(UAV(u0))\"\n{put}\n[RootSignature(RS)]\n[numthreads(8, 8, 1)]\nvoid main(uint3 id : SV_DispatchThreadID) {{ put(id.xy); }}"
-            ));
+            let Some(write) = compile_cs(
+                TEST,
+                &format!(
+                    "#define RS \"DescriptorTable(UAV(u0))\"\n{put}\n[RootSignature(RS)]\n[numthreads(8, 8, 1)]\nvoid main(uint3 id : SV_DispatchThreadID) {{ put(id.xy); }}"
+                ),
+            ) else {
+                return;
+            };
             let list = host.new_list().unwrap();
             let copies = crate::texture::ALIAS_COPIES.load(Ordering::Relaxed);
             readable(&list, &used(ResourceType::Uav), &unordered, false);
@@ -2757,8 +2733,8 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// 16 bits.
     #[test]
     fn a_depth_texture_written_through_unordered_views_reads_as_depth() {
-        let Some(host) = crate::host::host() else {
-            return; // no host GPU here
+        let Some((_gpu, host)) = crate::testing::gpu() else {
+            return;
         };
         let slots = Slots::new(4);
         let address = title_memory(1 << 22);
@@ -2776,7 +2752,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         ];
         slots.make(2, &reads[0]);
         slots.make(3, &reads[1]);
+        const TEST: &str = "draw::a_depth_texture_written_through_unordered_views_reads_as_depth";
         let write = compile_cs(
+            TEST,
             r#"
 #define RS "DescriptorTable(UAV(u0, numDescriptors=2))"
 RWTexture2D<float> d : register(u0);
@@ -2789,7 +2767,11 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#,
         );
+        let Some(write) = write else {
+            return;
+        };
         let read = compile_cs(
+            TEST,
             r#"
 #define RS "DescriptorTable(SRV(t0, numDescriptors=2)), UAV(u1)"
 Texture2D<float> d : register(t0);
@@ -2802,6 +2784,9 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#,
         );
+        let Some(read) = read else {
+            return;
+        };
         let (out, data) = host.shared_buffer(64 * 64 * 8).unwrap();
         // The depth texture's planes as bytes, read back after.
         // SAFETY: a live resource.
@@ -2962,8 +2947,8 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// every depth slice, -1), and a shader view reads it.
     #[test]
     fn unordered_1d_and_3d_textures_keep_their_writes() {
-        let Some(host) = crate::host::host() else {
-            return; // no host GPU here
+        let Some((_gpu, host)) = crate::testing::gpu() else {
+            return;
         };
         let slots = Slots::new(2);
         let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
@@ -3007,12 +2992,25 @@ void main(uint3 id : SV_DispatchThreadID) {
             let shader = View::Shader(texture as usize, Some(srv));
             slots.make(0, &unordered);
             slots.make(1, &shader);
-            let write = compile_cs(&format!(
-                "#define RS \"DescriptorTable(UAV(u0))\"\n{put}\n[RootSignature(RS)]\n[numthreads(8, 8, 1)]\nvoid main(uint3 id : SV_DispatchThreadID) {{ for (uint z = 0; z < 64; z++) put(uint3(id.xy, z)); }}"
-            ));
-            let read = compile_cs(&format!(
-                "#define RS \"DescriptorTable(SRV(t0)), UAV(u1)\"\n{get}\nRWByteAddressBuffer o : register(u1);\n[RootSignature(RS)]\n[numthreads(8, 8, 1)]\nvoid main(uint3 id : SV_DispatchThreadID) {{ o.Store4((id.y * 64 + id.x) * 16, asuint(get(id))); }}"
-            ));
+            const TEST: &str = "draw::unordered_1d_and_3d_textures_keep_their_writes";
+            let write = compile_cs(
+                TEST,
+                &format!(
+                    "#define RS \"DescriptorTable(UAV(u0))\"\n{put}\n[RootSignature(RS)]\n[numthreads(8, 8, 1)]\nvoid main(uint3 id : SV_DispatchThreadID) {{ for (uint z = 0; z < 64; z++) put(uint3(id.xy, z)); }}"
+                ),
+            );
+            let Some(write) = write else {
+                return;
+            };
+            let read = compile_cs(
+                TEST,
+                &format!(
+                    "#define RS \"DescriptorTable(SRV(t0)), UAV(u1)\"\n{get}\nRWByteAddressBuffer o : register(u1);\n[RootSignature(RS)]\n[numthreads(8, 8, 1)]\nvoid main(uint3 id : SV_DispatchThreadID) {{ o.Store4((id.y * 64 + id.x) * 16, asuint(get(id))); }}"
+                ),
+            );
+            let Some(read) = read else {
+                return;
+            };
             let list = host.new_list().unwrap();
             readable(&list, &used(ResourceType::Uav), &unordered, false);
             run(&list, &slots, &write, 0, None, groups);
@@ -3031,8 +3029,8 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// bytes; one on an element views the buffer's copy.
     #[test]
     fn structured_views_off_their_buffers_elements_get_their_own_copy() {
-        let Some(host) = crate::host::host() else {
-            return; // no host GPU here
+        let Some((_gpu, host)) = crate::testing::gpu() else {
+            return;
         };
         let src = buffer(1 << 16);
         let (bytes, _) = crate::resource::buffer_bytes(src).unwrap();

@@ -28,6 +28,99 @@ pub(crate) fn serial_with_device() -> (Serial, bool) {
     crate::test_support::serial_with_device()
 }
 
+/// The root signature and pipeline of the compute shader `source` (HLSL,
+/// entry point `main`, with its root signature inside), compiled for
+/// `test` by the system's compiler as shader model 5.1 with `flags`
+/// (`D3DCOMPILE_*`).
+///
+/// Where that compiler cannot build the source (Wine's is vkd3d-shader's,
+/// which lacks parts of the language, and compiles other sources without
+/// their root signature), this is `None` after the line
+/// `skipped: the host HLSL compiler cannot build this test shader
+/// (<test>)` and the compiler's messages, and the test returns: it did
+/// not run. With `VICTORY_REQUIRE_HLSL=1` it fails instead
+/// ([`crate::test_support::no_hlsl`]).
+///
+/// # Panics
+///
+/// If the host refuses the compiled shader: that is the host's fault or
+/// the test's, not the compiler's.
+#[cfg(windows)]
+pub(crate) fn compute_shader(
+    test: &str,
+    source: &str,
+    flags: u32,
+) -> Option<(
+    windows::Win32::Graphics::Direct3D12::ID3D12RootSignature,
+    windows::Win32::Graphics::Direct3D12::ID3D12PipelineState,
+)> {
+    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+    use windows::Win32::Graphics::Direct3D::ID3DBlob;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::core::{PCSTR, s};
+    let host = crate::host::host().expect("a host device: the test holds it");
+    // The messages name the source by the test.
+    let name = std::ffi::CString::new(test).expect("a test name without NUL");
+    let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
+    // SAFETY: the source and names outlive the call; out pointers ours.
+    let compiled = unsafe {
+        D3DCompile(
+            source.as_ptr().cast(),
+            source.len(),
+            PCSTR(name.as_ptr().cast()),
+            None,
+            None,
+            s!("main"),
+            s!("cs_5_1"),
+            flags,
+            0,
+            &mut code,
+            Some(&mut errors),
+        )
+    };
+    // SAFETY: a blob's own bytes, copied while it lives.
+    let bytes_of = |blob: &ID3DBlob| unsafe {
+        std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
+            .to_vec()
+    };
+    let code = match (compiled, code) {
+        (Ok(()), Some(code)) => bytes_of(&code),
+        (result, _) => {
+            let text = errors.as_ref().map(bytes_of).unwrap_or_default();
+            let text = String::from_utf8_lossy(&text);
+            let text = match text.trim_end_matches(['\0', '\n', '\r']) {
+                "" => format!("{test}: {result:?} and no messages"),
+                text => text.to_owned(),
+            };
+            crate::test_support::no_hlsl(test, &text);
+            return None;
+        }
+    };
+    // vkd3d-shader's compiler builds some of these sources and leaves the
+    // `[RootSignature]` attribute out of what it writes, and without that
+    // part there is neither a root signature nor a pipeline to make.
+    if !crate::root::holds_a_root_signature(&code) {
+        let text = "the compiler left the [RootSignature] out: no RTS0 part in the shader";
+        crate::test_support::no_hlsl(test, text);
+        return None;
+    }
+    // SAFETY: a compiled shader with its root signature inside; the bytes
+    // live through both calls.
+    unsafe {
+        let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &code).unwrap();
+        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::transmute_copy(&root),
+            CS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: code.as_ptr().cast(),
+                BytecodeLength: code.len(),
+            },
+            ..Default::default()
+        };
+        let pso = host.device.CreateComputePipelineState(&desc).unwrap();
+        Some((root, pso))
+    }
+}
+
 /// The list method that older lists have at `old_offset`, wherever
 /// `list`'s own layout has it. Lists are made in the layout the device was
 /// last created for (`device::newer`), which another test may switch for
