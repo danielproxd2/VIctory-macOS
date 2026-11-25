@@ -528,19 +528,29 @@ pub fn XTaskQueueUnregisterWaiter(handle: *const Queue, token: u64) {
 /// Waiting for the title's handles, one thread per registration.
 #[cfg(windows)]
 mod waiter {
+    use std::collections::BTreeMap;
     use std::ffi::c_void;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Weak};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, Weak};
 
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
     use windows_sys::Win32::System::Threading::{
         CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects,
     };
 
-    use super::{Queue, S_OK, Task};
+    use super::{Queue, S_OK, Task, lock};
+
+    /// The registrations still alive, by id. A callback on a port names
+    /// its registration by id and holds no reference to it: a port keeps
+    /// what it was given until someone dispatches it, which for a manual
+    /// port may be never (the queue is closed first), and a reference
+    /// queued there would keep the registration and its events for good.
+    static LIVE: Mutex<BTreeMap<usize, Weak<Waiter>>> = Mutex::new(BTreeMap::new());
 
     /// A registration: the title's callback and our two events.
     pub(super) struct Waiter {
+        /// Its key in [`LIVE`], which is what its queued callbacks carry.
+        id: usize,
         task: Task,
         /// Set when the registration ends.
         stopped: AtomicBool,
@@ -552,6 +562,7 @@ mod waiter {
 
     impl Drop for Waiter {
         fn drop(&mut self) {
+            lock(&LIVE).remove(&self.id);
             // SAFETY: our own events, used by nobody else by now.
             unsafe {
                 CloseHandle(self.stop as HANDLE);
@@ -562,10 +573,15 @@ mod waiter {
 
     /// What the queue runs in place of the title's callback: the title's,
     /// unless the registration has ended meanwhile; then the waiter may
-    /// submit the next.
+    /// submit the next. A registration that is gone altogether (its queue
+    /// was closed, and the port lives on in another queue) has nothing to
+    /// run and nobody to tell.
     extern "system" fn run(context: *mut c_void, canceled: bool) {
-        // SAFETY: the reference `Waiter::submit` leaked for this call.
-        let waiter = unsafe { Arc::from_raw(context.cast::<Waiter>()) };
+        // The context is the registration's id, not an address.
+        let found = lock(&LIVE).get(&(context as usize)).and_then(Weak::upgrade);
+        let Some(waiter) = found else {
+            return;
+        };
         if !waiter.stopped.load(Ordering::Acquire) {
             waiter.task.run(canceled);
         }
@@ -597,12 +613,16 @@ mod waiter {
                 }
                 return None;
             }
+            static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
+            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
             let waiter = Arc::new(Waiter {
+                id,
                 task,
                 stopped: AtomicBool::new(false),
                 stop: stop as usize,
                 done: done as usize,
             });
+            lock(&LIVE).insert(id, Arc::downgrade(&waiter));
             // The thread does not keep the queue alive: a queue closed
             // with a waiter still registered ends the wait.
             let (queue, handle) = (Arc::downgrade(queue), handle as usize);
@@ -633,12 +653,9 @@ mod waiter {
                 let Some(queue) = queue.upgrade() else {
                     break;
                 };
-                let context = Arc::into_raw(self.clone()).cast_mut().cast::<c_void>();
+                let context = self.id as *mut c_void;
                 if queue.submit(port, 0, Task::new(context, run)) != S_OK {
-                    // Terminated: the callback will not run, so the
-                    // reference it was to take is taken back.
-                    // SAFETY: the pointer leaked just above.
-                    drop(unsafe { Arc::from_raw(context.cast::<Waiter>()) });
+                    // Terminated: nothing more is submitted.
                     break;
                 }
                 drop(queue);
@@ -2576,7 +2593,11 @@ mod tests {
             slot::<Close>(0x88)(this, q);
 
             // A queue closed with a waiter still registered ends the wait:
-            // unregistering is optional.
+            // unregistering is optional. (The event was left signalled
+            // above; this part is about a waiter that has submitted
+            // nothing, and the test after this one about one that has.)
+            // SAFETY: the test's event.
+            unsafe { ResetEvent(signal) };
             let q = manual_queue();
             register(q, COMPLETION, signal, &seen);
             // SAFETY: a handle this test holds open.
@@ -2587,6 +2608,71 @@ mod tests {
                 "the wait goes on after the queue was closed"
             );
             assert_eq!(times(), 0);
+            // SAFETY: the test's event, waited for by nobody now.
+            unsafe { CloseHandle(signal) };
+        }
+
+        /// A callback submitted to a manual port that nobody dispatches
+        /// before the queue is closed holds nothing: the registration ends
+        /// with its queue. The port may live on in a composite queue, and
+        /// the callback left on it then runs nothing.
+        #[test]
+        fn a_queue_closed_with_a_callback_still_queued_drops_its_waiter() {
+            type Port = extern "system" fn(This, *const Queue, u32, *mut *const c_void) -> HRESULT;
+            type Composite = extern "system" fn(
+                This,
+                *const c_void,
+                *const c_void,
+                *mut *const Queue,
+            ) -> HRESULT;
+            let this: This = &OBJECT;
+            let dispatch = slot::<Dispatch>(0x80);
+            let close = slot::<Close>(0x88);
+            let (signal, seen) = (event(false), Ran::default());
+            // SAFETY (both): a handle this test holds open.
+            let queued = |q: *const Queue| unsafe { lock(&(&(*q).ports)[1].tasks).len() };
+            let waiter_of = |q: *const Queue| unsafe { lock(&(*q).waiters)[0].1.clone() };
+
+            // Closed with the callback queued: the waiter is ours alone.
+            let q = manual_queue();
+            register(q, COMPLETION, signal, &seen);
+            let waiter = waiter_of(q);
+            // SAFETY: the test's event.
+            unsafe { SetEvent(signal) };
+            assert!(eventually(|| queued(q) == 1));
+            close(this, q);
+            assert!(
+                eventually(|| Arc::strong_count(&waiter) == 1),
+                "a callback nobody will run keeps its waiter"
+            );
+            drop(waiter);
+
+            // The same with the ports shared: what the closed queue left
+            // on the port is dispatched through the other queue, and the
+            // title's callback does not run.
+            let q = manual_queue();
+            let (mut work, mut completion) = (std::ptr::null(), std::ptr::null());
+            let get_port = slot::<Port>(0x70);
+            assert_eq!(get_port(this, q, WORK, &mut work), S_OK);
+            assert_eq!(get_port(this, q, COMPLETION, &mut completion), S_OK);
+            let mut sharing = std::ptr::null();
+            let composite = slot::<Composite>(0x68);
+            assert_eq!(composite(this, work, completion, &mut sharing), S_OK);
+            register(q, COMPLETION, signal, &seen);
+            let waiter = waiter_of(q);
+            // SAFETY: as above.
+            unsafe { SetEvent(signal) };
+            assert!(eventually(|| queued(sharing) == 1));
+            close(this, q);
+            assert!(
+                eventually(|| Arc::strong_count(&waiter) == 1),
+                "a callback on a port that lives on keeps its waiter"
+            );
+            drop(waiter);
+            assert!(dispatch(this, sharing, COMPLETION, 0), "it is still queued");
+            assert_eq!(queued(sharing), 0);
+            assert_eq!(seen.times.load(Ordering::SeqCst), 0);
+            close(this, sharing);
             // SAFETY: the test's event, waited for by nobody now.
             unsafe { CloseHandle(signal) };
         }
