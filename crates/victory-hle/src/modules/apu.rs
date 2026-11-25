@@ -521,4 +521,37 @@ mod tests {
         assert_eq!(error, INVALID_STREAM);
         assert_eq!(XApuDisconnect(handle), S_OK);
     }
+
+    /// Only plain Opus decoding is implemented. Connecting for any other
+    /// processing kind (the converting ones) fails with `E_NOTIMPL` before
+    /// anything is allocated: no memory, no event, no handle.
+    #[test]
+    fn conversion_kinds_fail_with_e_notimpl_and_write_nothing() {
+        assert_eq!(E_NOTIMPL as u32, 0x8000_4001);
+        for process in [0, 2, 3, 4, u32::MAX] {
+            let input = ConnectInput {
+                process,
+                streams: 4,
+                commands_per_stream: 2,
+                memory: 0x1000,
+                frames_per_output: 0,
+                options: RESULT_EVENT,
+            };
+            let (memory, event) = (0x1111 as *mut c_void, 0x2222 as HANDLE);
+            let mut output = ConnectOutput {
+                memory,
+                result_event: event,
+            };
+            let mut handle = 0x3333 as *mut Connection;
+            assert_eq!(
+                XApuConnect(&input, &mut output, &mut handle),
+                E_NOTIMPL,
+                "processing kind {process}"
+            );
+            assert_eq!(
+                (output.memory, output.result_event, handle as usize),
+                (memory, event, 0x3333)
+            );
+        }
+    }
 }
