@@ -688,4 +688,216 @@ mod tests {
         assert!(!runtime.is_null());
         assert_eq!(GetModuleHandleW(w("XGameRuntime.dll").as_ptr()), runtime);
     }
+
+    /// Which ending the child process is to take; unset in ordinary runs.
+    const ENDING: &str = "VICTORY_KERNEL_ENDING";
+    /// Where the child's crash log goes.
+    const CRASH_LOG: &str = "VICTORY_KERNEL_CRASH_LOG";
+    /// The exception the child raises: a code nothing else uses.
+    #[cfg(windows)]
+    const RAISED: u32 = 0xE000_0001;
+
+    /// Stands in for a title's unhandled-exception filter: says which
+    /// exception it was given and whether our report was already in the
+    /// crash log, then lets the process end (`EXCEPTION_EXECUTE_HANDLER`).
+    #[cfg(windows)]
+    extern "system" fn title_filter(info: *const c_void) -> i32 {
+        use std::io::Write;
+        // SAFETY: the system's exception pointers; the record comes first
+        // in them and the code first in the record.
+        let code = unsafe { **info.cast::<*const u32>() };
+        let log = std::env::var_os(CRASH_LOG).map(std::fs::read_to_string);
+        let reported = matches!(log, Some(Ok(text)) if text.contains("unhandled exception"));
+        println!("TITLE FILTER code={code:#x} reported={reported}");
+        let _ = std::io::stdout().flush();
+        1
+    }
+
+    #[cfg(windows)]
+    extern "system" fn other_filter(_: *const c_void) -> i32 {
+        0
+    }
+
+    /// Raises an exception nothing handles.
+    #[cfg(windows)]
+    fn crash() {
+        // SAFETY: raises a non-continuable exception with no arguments.
+        unsafe {
+            windows_sys::Win32::System::Diagnostics::Debug::RaiseException(
+                RAISED,
+                1,
+                0,
+                std::ptr::null(),
+            )
+        };
+    }
+
+    /// In a child process of the tests below: ends the process the way
+    /// `VICTORY_KERNEL_ENDING` names, through our overrides, as title
+    /// code would. Does nothing in an ordinary run.
+    #[test]
+    fn ending_child() {
+        let Ok(ending) = std::env::var(ENDING) else {
+            return;
+        };
+        crate::testing::print_logs();
+        match ending.as_str() {
+            "exit" => exit(7),
+            "abort" => abort(),
+            "terminate" => terminate(),
+            "invalid-parameter" => _invalid_parameter_noinfo_noreturn(),
+            "terminate-process" => {
+                // The pseudo handle of the current process.
+                TerminateProcess(usize::MAX as *mut c_void, 9);
+            }
+            #[cfg(windows)]
+            "title-filter" | "no-filter" => {
+                victory_loader::log_crashes_to(std::env::var_os(CRASH_LOG).unwrap().into());
+                // The title sets a filter, replaces it, and (in one child)
+                // takes it away again; each time it gets its last one back.
+                let first = SetUnhandledExceptionFilter(other_filter as *const () as usize);
+                let second = SetUnhandledExceptionFilter(title_filter as *const () as usize);
+                println!(
+                    "PREVIOUS first={first:#x} second_is_the_first_set={}",
+                    second == other_filter as *const () as usize
+                );
+                if ending == "no-filter" {
+                    let third = SetUnhandledExceptionFilter(0);
+                    println!(
+                        "CLEARED returned_the_title_filter={}",
+                        third == title_filter as *const () as usize
+                    );
+                }
+                crash();
+            }
+            _ => {}
+        }
+        println!("STILL RUNNING");
+    }
+
+    /// How the child that takes `ending` ended: its exit status, what it
+    /// printed, what it logged, and its crash log.
+    struct Ended {
+        status: std::process::ExitStatus,
+        #[cfg_attr(not(windows), expect(dead_code, reason = "the filter tests read it"))]
+        printed: String,
+        logged: String,
+        #[cfg_attr(not(windows), expect(dead_code, reason = "the filter tests read it"))]
+        crash_log: String,
+    }
+
+    fn ended(ending: &str) -> Ended {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("crashes.log");
+        let out = crate::testing::child(
+            "modules::kernel::tests::ending_child",
+            &[(ENDING, ending.as_ref()), (CRASH_LOG, log.as_os_str())],
+        );
+        let (printed, logged) = crate::testing::printed(&out);
+        assert!(
+            !printed.contains("STILL RUNNING"),
+            "{ending}: the process went on: {printed}{logged}"
+        );
+        Ended {
+            status: out.status,
+            printed,
+            logged,
+            crash_log: std::fs::read_to_string(&log).unwrap_or_default(),
+        }
+    }
+
+    /// Whether `status` is how the host's `abort` ends a process. The C
+    /// runtime documents exit code 3; the Universal CRT of a release build
+    /// fails fast instead (`STATUS_STACK_BUFFER_OVERRUN`); elsewhere it is
+    /// the abort signal.
+    fn aborted(status: std::process::ExitStatus) -> bool {
+        #[cfg(windows)]
+        {
+            matches!(status.code(), Some(code) if code == 3 || code as u32 == 0xC000_0409)
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            status.signal() == Some(6)
+        }
+    }
+
+    #[test]
+    fn abort_and_exit_are_logged_with_their_codes() {
+        let exit = ended("exit");
+        assert_eq!(exit.status.code(), Some(7), "{}", exit.logged);
+        let line = exit.logged.lines().find(|l| l.contains("title exits"));
+        let line = line.unwrap_or_else(|| panic!("no exit in the log: {}", exit.logged));
+        assert!(
+            line.starts_with("WARN ") && line.contains(" code=7"),
+            "{line}"
+        );
+
+        for (ending, said) in [
+            ("abort", "ERROR title aborts"),
+            ("terminate", "ERROR title calls terminate"),
+            (
+                "invalid-parameter",
+                "ERROR title passed an invalid parameter",
+            ),
+        ] {
+            let end = ended(ending);
+            assert!(end.logged.contains(said), "{ending}: {}", end.logged);
+            assert!(aborted(end.status), "{ending}: {:?}", end.status);
+        }
+    }
+
+    #[test]
+    fn terminate_process_on_self_ends_with_the_code() {
+        let end = ended("terminate-process");
+        assert_eq!(end.status.code(), Some(9), "{}", end.logged);
+        // Only our own process is logged, and only Windows tells them apart.
+        #[cfg(windows)]
+        {
+            let line = end.logged.lines().find(|l| l.contains("title terminates"));
+            let line = line.unwrap_or_else(|| panic!("not logged: {}", end.logged));
+            assert!(
+                line.starts_with("WARN ") && line.contains(" code=9"),
+                "{line}"
+            );
+        }
+    }
+
+    /// An exception nobody handles is reported to the crash log by us
+    /// first; then the title's own filter runs, and its verdict stands.
+    #[cfg(windows)]
+    #[test]
+    fn the_title_filter_runs_after_our_report() {
+        let end = ended("title-filter");
+        let report = format!("VIctory: unhandled exception {RAISED:#010x} at ");
+        assert!(end.crash_log.contains(&report), "{:?}", end.crash_log);
+        assert!(
+            end.printed
+                .contains("PREVIOUS first=0x0 second_is_the_first_set=true"),
+            "{}",
+            end.printed
+        );
+        let filter = format!("TITLE FILTER code={RAISED:#x} reported=true");
+        assert!(end.printed.contains(&filter), "{}", end.printed);
+        assert_eq!(end.printed.matches("TITLE FILTER").count(), 1);
+        // The filter said to end the process: it ends with the exception.
+        assert_eq!(end.status.code(), Some(RAISED as i32));
+    }
+
+    /// A title that takes its filter away again still gets our report.
+    #[cfg(windows)]
+    #[test]
+    fn a_crash_without_a_title_filter_is_still_reported() {
+        let end = ended("no-filter");
+        let report = format!("VIctory: unhandled exception {RAISED:#010x} at ");
+        assert!(end.crash_log.contains(&report), "{:?}", end.crash_log);
+        assert!(
+            end.printed
+                .contains("CLEARED returned_the_title_filter=true"),
+            "{}",
+            end.printed
+        );
+        assert!(!end.printed.contains("TITLE FILTER"), "{}", end.printed);
+        assert!(!end.status.success(), "{:?}", end.status);
+    }
 }

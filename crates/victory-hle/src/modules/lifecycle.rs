@@ -236,6 +236,15 @@ const RELAUNCHED_FROM: &str = "VICTORY_RELAUNCHED_FROM";
 /// Starts `victory` again with `args` (after the title has suspended); the
 /// new process waits until this one has ended.
 pub(crate) fn relaunch(args: Vec<std::ffi::OsString>) {
+    relaunch_with(args, |mut command| command.spawn().map(|child| child.id()));
+}
+
+/// [`relaunch`], with `spawn` starting the process it has described and
+/// returning its id.
+fn relaunch_with(
+    args: Vec<std::ffi::OsString>,
+    spawn: impl FnOnce(std::process::Command) -> std::io::Result<u32>,
+) {
     use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
     let mut me: HANDLE = std::ptr::null_mut();
     // SAFETY: an inheritable duplicate of our own process handle.
@@ -256,10 +265,10 @@ pub(crate) fn relaunch(args: Vec<std::ffi::OsString>) {
         if duplicated {
             command.env(RELAUNCHED_FROM, (me as usize).to_string());
         }
-        command.spawn()
+        spawn(command)
     });
     match spawned {
-        Ok(child) => tracing::info!(pid = child.id(), ?args, "relaunched"),
+        Ok(pid) => tracing::info!(pid, ?args, "relaunched"),
         Err(e) => tracing::warn!(%e, "relaunch failed; the title just ends"),
     }
 }
@@ -434,5 +443,209 @@ mod tests {
         }
         let seen = COMMANDS.with(|c| c.borrow().clone());
         assert_eq!(seen, [wm::SC_MINIMIZE as usize]);
+    }
+
+    /// Which part the child process plays; unset in ordinary runs.
+    const PART: &str = "VICTORY_LIFECYCLE_CHILD";
+
+    /// A suspend routine that takes `context` milliseconds, then says it
+    /// is done.
+    extern "system" fn suspending(quiesced: u8, context: *mut c_void) {
+        std::thread::sleep(Duration::from_millis(context as u64));
+        println!("SUSPENDED quiesced={quiesced}");
+    }
+
+    /// In a child process of the tests below; does nothing otherwise.
+    /// `close` and `slow-close`: a title with one suspend routine (0.3 s,
+    /// or 3 s) whose window the user closes. `previous`: a process that
+    /// lives 2.5 s. `relaunched`: a new `victory` that waits for the one
+    /// it replaces.
+    #[test]
+    fn lifecycle_child() {
+        let Ok(part) = std::env::var(PART) else {
+            return;
+        };
+        crate::testing::print_logs();
+        match part.as_str() {
+            "close" | "slow-close" => {
+                let takes: usize = if part == "close" { 300 } else { 3000 };
+                let mut id = 0;
+                let registered = RegisterAppStateChangeNotification(
+                    Some(suspending),
+                    takes as *mut c_void,
+                    &mut id,
+                );
+                let null = std::ptr::null_mut();
+                let hwnd = CreateWindowExW(
+                    0,
+                    w!("STATIC"),
+                    w!("title"),
+                    0,
+                    0,
+                    0,
+                    10,
+                    10,
+                    null,
+                    null,
+                    null,
+                    std::ptr::null(),
+                );
+                println!("CLOSING registered={registered} window={}", !hwnd.is_null());
+                // SAFETY: our window, owned by this thread.
+                let answer =
+                    unsafe { wm::SendMessageW(hwnd, wm::WM_SYSCOMMAND, wm::SC_CLOSE as usize, 0) };
+                // The close is taken at once; the title goes on meanwhile.
+                println!("CLOSE RETURNED {answer}");
+                std::thread::sleep(Duration::from_secs(10));
+                println!("STILL RUNNING");
+            }
+            "previous" => std::thread::sleep(Duration::from_millis(2500)),
+            "relaunched" => {
+                wait_for_previous();
+                println!(
+                    "WAITED handle_left={}",
+                    std::env::var(RELAUNCHED_FROM).is_ok()
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn child(part: &str) -> (std::process::ExitStatus, String, String) {
+        let test = "modules::lifecycle::tests::lifecycle_child";
+        let out = crate::testing::child(test, &[(PART, part.as_ref())]);
+        let (printed, logged) = crate::testing::printed(&out);
+        (out.status, printed, logged)
+    }
+
+    /// Closing the window suspends the title (its routines run to their
+    /// end, told that the title is quiesced) and then ends the process
+    /// with code 0; the title itself never hears of the close.
+    #[test]
+    fn close_suspends_then_exits() {
+        let (status, printed, logged) = child("close");
+        let all = format!("{printed}{logged}");
+        assert!(
+            printed.contains("CLOSING registered=0 window=true"),
+            "{all}"
+        );
+        assert!(printed.contains("CLOSE RETURNED 0"), "{all}");
+        assert!(printed.contains("SUSPENDED quiesced=1"), "{all}");
+        assert!(!printed.contains("STILL RUNNING"), "{all}");
+        assert_eq!(status.code(), Some(0), "{all}");
+        assert!(
+            logged.contains("window closed: suspending the title routines=1"),
+            "{all}"
+        );
+        assert!(
+            logged.contains("title suspended; ending the title"),
+            "{all}"
+        );
+        assert!(!logged.contains("did not finish suspending"), "{all}");
+    }
+
+    /// A routine that outlasts the deadline does not keep the title
+    /// alive: the process ends, with code 0, before the routine is done.
+    #[test]
+    fn a_slow_suspend_routine_is_cut_off_at_the_deadline() {
+        assert!(
+            SUSPEND_DEADLINE < Duration::from_secs(3),
+            "the routine must be slower"
+        );
+        let (status, printed, logged) = child("slow-close");
+        let all = format!("{printed}{logged}");
+        assert!(printed.contains("CLOSE RETURNED 0"), "{all}");
+        assert!(!printed.contains("SUSPENDED"), "{all}");
+        assert!(!printed.contains("STILL RUNNING"), "{all}");
+        assert_eq!(status.code(), Some(0), "{all}");
+        let late = "title did not finish suspending in time; ending the title";
+        assert!(logged.contains(late), "{all}");
+        assert!(!logged.contains("title suspended;"), "{all}");
+    }
+
+    /// A relaunch asks for our own executable with the arguments given
+    /// and an inheritable handle of this process in its environment. The
+    /// process is described, not started.
+    #[test]
+    fn a_relaunch_asks_for_us_again_with_a_handle_of_this_process() {
+        use windows_sys::Win32::Foundation::{CloseHandle, GetHandleInformation, HANDLE};
+        use windows_sys::Win32::System::Threading::GetProcessId;
+        let mut asked = None;
+        relaunch_with(vec!["run".into(), "G:/game.exe".into()], |command| {
+            let args: Vec<_> = command.get_args().map(|a| a.to_owned()).collect();
+            let handle = command
+                .get_envs()
+                .find(|(name, _)| *name == RELAUNCHED_FROM)
+                .and_then(|(_, value)| value.map(|v| v.to_owned()));
+            asked = Some((command.get_program().to_owned(), args, handle));
+            Ok(0)
+        });
+        let (program, args, handle) = asked.expect("the process was asked for");
+        assert_eq!(program, std::env::current_exe().unwrap());
+        assert_eq!(args, ["run", "G:/game.exe"]);
+        let handle = handle.expect("the handle is in the environment");
+        let handle = handle.to_str().unwrap().parse::<usize>().unwrap() as HANDLE;
+        let mut flags = 0;
+        // SAFETY: the handle `relaunch_with` duplicated, closed here.
+        unsafe {
+            assert_eq!(GetProcessId(handle), std::process::id());
+            assert_ne!(GetHandleInformation(handle, &mut flags), 0);
+            assert_ne!(flags & 1, 0, "inheritable");
+            CloseHandle(handle);
+        }
+    }
+
+    /// The relaunched process goes on only once the one it replaces has
+    /// ended, and takes the handle out of its environment.
+    #[test]
+    fn a_relaunched_process_waits_for_the_one_it_replaces() {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE,
+        };
+        let test = "modules::lifecycle::tests::lifecycle_child";
+        let mut previous = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(PART, "previous")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut inherited: HANDLE = std::ptr::null_mut();
+        // SAFETY: an inheritable duplicate of the child's process handle.
+        let duplicated = unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                previous.as_raw_handle(),
+                GetCurrentProcess(),
+                &mut inherited,
+                0,
+                1,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        assert_ne!(duplicated, 0);
+        let handle = (inherited as usize).to_string();
+        let out = crate::testing::child(
+            test,
+            &[
+                (PART, "relaunched".as_ref()),
+                (RELAUNCHED_FROM, handle.as_ref()),
+            ],
+        );
+        let ended = previous.try_wait().unwrap();
+        // SAFETY: our duplicate.
+        unsafe { CloseHandle(inherited) };
+        let _ = previous.kill();
+        let _ = previous.wait();
+        let (printed, logged) = crate::testing::printed(&out);
+        assert!(
+            printed.contains("WAITED handle_left=false"),
+            "{printed}{logged}"
+        );
+        assert!(
+            ended.is_some(),
+            "the new process went on beside the old one"
+        );
     }
 }
