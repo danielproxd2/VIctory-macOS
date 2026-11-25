@@ -507,7 +507,7 @@ fn va_to_rva(va: u64, image_base: u64) -> Result<u32, PeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{DELAYLOAD_RVA_BASED, Export, PeBuilder, scn};
+    use crate::testing::{DELAYLOAD_RVA_BASED, Export, PeBuilder, XorShift64, mutate, reloc, scn};
 
     fn by_name(hint: u16, name: &str) -> ImportSymbol {
         ImportSymbol::Name {
@@ -1139,5 +1139,135 @@ mod tests {
             ImageInfo::parse(&data),
             Err(PeError::Malformed(_))
         ));
+    }
+
+    /// What every image the parser accepts must satisfy, because the loader
+    /// acts on these values without looking again. Written out from the
+    /// section list, not with the parser's own helpers.
+    fn assert_safe_to_load(info: &ImageInfo, case: &str) {
+        let size_of_image = u64::from(info.size_of_image);
+        let executable = |rva: u32| {
+            u64::from(rva) < size_of_image
+                && info.sections.iter().any(|s| {
+                    let size = if s.virtual_size == 0 {
+                        s.file_size
+                    } else {
+                        s.virtual_size
+                    };
+                    s.characteristics & 0x2000_0000 != 0
+                        && rva >= s.rva
+                        && u64::from(rva) < u64::from(s.rva) + u64::from(size)
+                })
+        };
+        for module in info.imports.iter().chain(&info.delay_imports) {
+            for entry in &module.entries {
+                let slot = u64::from(entry.iat_slot_rva);
+                assert!(slot + 8 <= size_of_image, "{case}: IAT slot {slot:#x}");
+                assert_eq!(slot % 8, 0, "{case}: IAT slot {slot:#x}");
+            }
+            if let Some(handle) = module.module_handle_rva {
+                assert!(u64::from(handle) + 8 <= size_of_image, "{case}: handle");
+            }
+        }
+        assert!(info.imports.iter().all(|m| m.module_handle_rva.is_none()));
+        assert!(
+            info.entry_rva == 0 || executable(info.entry_rva),
+            "{case}: entry point {:#x}",
+            info.entry_rva
+        );
+        if let Some(tls) = &info.tls {
+            assert!(tls.callback_rvas.len() <= MAX_TLS_CALLBACKS, "{case}");
+            assert!(tls.callbacks_va != 0 || tls.callback_rvas.is_empty());
+            for &rva in &tls.callback_rvas {
+                assert!(executable(rva), "{case}: TLS callback {rva:#x}");
+            }
+        }
+        // Total over the whole RVA range: no panic, and an offset only for
+        // an RVA inside a section.
+        for rva in [0, 0x1000, info.entry_rva, info.size_of_image, u32::MAX] {
+            if let Some(offset) = info.rva_to_file_offset(rva) {
+                assert!(
+                    info.sections
+                        .iter()
+                        .any(|s| rva >= s.rva && offset >= s.file_offset),
+                    "{case}: RVA {rva:#x}"
+                );
+            }
+        }
+    }
+
+    /// Images with every table the builder can write, for the mutation
+    /// tests: an executable and a DLL.
+    fn mutation_seeds() -> Vec<Vec<u8>> {
+        let executable = sample()
+            .delay_import(
+                "late.dll",
+                DELAYLOAD_RVA_BASED,
+                &[by_name(1, "Later"), ImportSymbol::Ordinal(9)],
+            )
+            .tls_callbacks(&[0x1000, 0x1020])
+            .codeview([7; 16], 1, "seed.pdb")
+            .reloc_block(0x5000, &[(reloc::DIR64, 0x18), (reloc::HIGHLOW, 0x20)])
+            .reloc_block(0x1000, &[(reloc::DIR64, 8)]);
+        let dll = code()
+            .dll(true)
+            .entry_rva(0x1008)
+            .import("alpha.dll", &[by_name(0, "First")])
+            .tls_callbacks(&[0x1010])
+            .exports(
+                "seed.dll",
+                3,
+                vec![
+                    Export::named("gamma", 0x1010),
+                    Export::unused(),
+                    Export::forwarder("alpha", "other.Target"),
+                ],
+            );
+        vec![
+            executable.build().unwrap().bytes,
+            dll.build().unwrap().bytes,
+            sample_image(),
+        ]
+    }
+
+    /// The stand-in for a fuzzer: seeded, so a failure is the same failure
+    /// everywhere. Overflow checks make the debug run the stricter one, but
+    /// the invariants are about returned values and hold in release too.
+    #[test]
+    fn mutated_headers_never_panic() {
+        let seeds = mutation_seeds();
+        for (i, seed) in seeds.iter().enumerate() {
+            let info = ImageInfo::parse(seed).unwrap();
+            assert_safe_to_load(&info, &format!("seed {i}"));
+        }
+        // The first seed's TLS directory is where its relocation says.
+        let first = ImageInfo::parse(&seeds[0]).unwrap();
+        assert_eq!(first.tls.as_ref().unwrap().directory_rva, 0x5000);
+        assert!(first.has_relocations && !first.delay_imports.is_empty());
+
+        let mut rng = XorShift64::new(0x5EED_0001);
+        let (mut accepted, mut refused) = (0u32, 0u32);
+        for i in 0..10_000 {
+            let mut data = seeds[i % seeds.len()].clone();
+            mutate(&mut data, 0x400, &mut rng);
+            // Now and then the file is cut short as well.
+            if rng.below(16) == 0 {
+                data.truncate(rng.below(data.len()));
+            }
+            match ImageInfo::parse(&data) {
+                Ok(info) => {
+                    accepted += 1;
+                    assert_safe_to_load(&info, &format!("mutation {i}"));
+                }
+                Err(PeError::Malformed(why) | PeError::Unsupported(why)) => {
+                    refused += 1;
+                    assert!(!why.is_empty(), "mutation {i}");
+                }
+            }
+        }
+        // Both outcomes occur, so the loop tests the parser and not only
+        // the first header check.
+        assert!(accepted > 0, "no mutation was accepted");
+        assert!(refused > 0, "no mutation was refused");
     }
 }

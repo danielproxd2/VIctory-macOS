@@ -239,4 +239,59 @@ mod tests {
             Err(PeError::Malformed(_))
         ));
     }
+
+    /// Seeded mutations of a small archive: every outcome is a value. What
+    /// the parser accepts is sorted, free of duplicates and no larger than
+    /// the archive it came from.
+    #[test]
+    fn mutated_archives_never_panic() {
+        use crate::testing::{XorShift64, mutate};
+
+        let function = import_object("Function", "one.dll", 4, CODE, BY_NAME);
+        let seed = Archive::new()
+            .member("x.obj", &regular_object())
+            .member("one.dll", &function)
+            .member(
+                "one.dll",
+                &import_object("Variable", "one.dll", 0, DATA, BY_NAME),
+            )
+            .member(
+                "two.dll",
+                &import_object("Unnamed", "two.dll", 17, CODE, BY_ORDINAL),
+            )
+            .member("odd", b"odd")
+            .member("one.dll", &function)
+            .0;
+        let whole = ImportLibrary::parse(&seed).unwrap();
+        assert_eq!((whole.imports.len(), whole.other_members), (3, 2));
+
+        let mut rng = XorShift64::new(0x5EED_0003);
+        let (mut accepted, mut refused) = (0u32, 0u32);
+        for i in 0..10_000 {
+            let mut data = seed.clone();
+            // Member headers are spread over the file: no part is special.
+            mutate(&mut data, seed.len(), &mut rng);
+            if rng.below(8) == 0 {
+                data.truncate(rng.below(data.len()));
+            }
+            match ImportLibrary::parse(&data) {
+                Ok(lib) => {
+                    accepted += 1;
+                    assert!(
+                        lib.imports.windows(2).all(|pair| pair[0] < pair[1]),
+                        "mutation {i}: sorted, no duplicates"
+                    );
+                    // A member is at least its 60-byte header.
+                    let members = lib.imports.len() + lib.other_members;
+                    assert!(members <= data.len() / 60, "mutation {i}: {members}");
+                }
+                Err(PeError::Malformed(why) | PeError::Unsupported(why)) => {
+                    refused += 1;
+                    assert!(!why.is_empty(), "mutation {i}");
+                }
+            }
+        }
+        assert!(accepted > 0, "no mutation was accepted");
+        assert!(refused > 0, "no mutation was refused");
+    }
 }
