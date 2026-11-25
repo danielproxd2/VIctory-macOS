@@ -146,13 +146,6 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
     shader
 }
 
-/// One GPU test at a time. With these tests on the hardware adapter and WARP
-/// from several test threads at once, now and then none of their dispatches
-/// ever completes and the test binary hangs; and two GPU tests at once on
-/// WARP can end the test process with an access violation. Other GPU test
-/// modules take this lock too.
-pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// Runs `shader` on every available SM 6.6 host (hardware GPU and WARP) for
 /// each 4-dword input set and invokes `check(backend, case_index, inputs, result_dword)`.
 /// A host that is missing is a printed skip, or a failure with
@@ -166,7 +159,7 @@ fn run_cases(
     cases: &[[u32; 4]],
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
-    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let _one = crate::testing::one_gpu_test_at_a_time();
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Some(host) = crate::testing::host(warp) else {
             continue;

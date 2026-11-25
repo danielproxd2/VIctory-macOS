@@ -71,6 +71,20 @@ pub(crate) fn skip_unless_required(var: &str, reason: &str) {
     skip(reason);
 }
 
+/// One GPU test at a time. With device tests on the hardware adapter and
+/// WARP from several test threads at once, now and then none of their
+/// dispatches ever completes and the test binary hangs; and two GPU tests
+/// at once on WARP can end the test process with an access violation
+/// (7 of 24 runs of the four waterfall tests). Every test that creates a
+/// device holds this for as long as it uses the device. Not reentrant: a
+/// test takes it once, before its first [`host`] call. A test that
+/// failed while holding it does not stop the others.
+#[cfg(windows)]
+pub(crate) fn one_gpu_test_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+    ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// The host's SM 6.6 device for a test: the hardware adapter, or WARP
 /// with `warp`. Without one the test goes on without it after a skip
 /// line; `VICTORY_REQUIRE_GPU=1` (hardware) and `VICTORY_REQUIRE_WARP=1`

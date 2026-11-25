@@ -731,6 +731,7 @@ fn translated_shaders_draw_as_pc_ones() {
     let Some((console, pc)) = tools() else {
         return;
     };
+    let _one = crate::testing::one_gpu_test_at_a_time();
     let Some(host) = crate::testing::host(false) else {
         return;
     };
@@ -880,6 +881,7 @@ fn translated_mesh_shaders_draw_as_pc_ones() {
     let Some((console, pc)) = tools() else {
         return;
     };
+    let _one = crate::testing::one_gpu_test_at_a_time();
     let Some(host) = crate::testing::host(false) else {
         return;
     };
@@ -990,6 +992,7 @@ fn float_semantics_are_the_consoles() {
     let Some((console, _)) = tools() else {
         return;
     };
+    let _one = crate::testing::one_gpu_test_at_a_time();
     let Some(host) = crate::testing::host(false) else {
         return;
     };
@@ -1077,6 +1080,7 @@ fn translated_compute_matches_pc() {
     let Some((console, pc)) = tools() else {
         return;
     };
+    let _one = crate::testing::one_gpu_test_at_a_time();
     let Some(host) = crate::testing::host(false) else {
         return;
     };

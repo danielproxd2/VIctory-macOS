@@ -641,6 +641,7 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn stub_pipeline_is_created() {
+        let _one = crate::testing::one_gpu_test_at_a_time();
         let Some(host) = crate::testing::host(false) else {
             return;
         };
@@ -684,8 +685,12 @@ mod tests {
         .is_some();
         let mut wrong = ps.dxil[4..20].to_vec();
         wrong[0] ^= 1;
-        let digests: &[&[u8]] = if wine { &[] } else { &[&[0u8; 16], &wrong] };
-        for &digest in digests {
+        if wine {
+            // Said aloud: this half proves nothing here.
+            crate::testing::skip("container hash refusal: D3DMetal does not check the hash");
+            return;
+        }
+        for digest in [&[0u8; 16][..], &wrong] {
             let mut other = ps.clone();
             other.dxil[4..20].copy_from_slice(digest);
             assert!(
