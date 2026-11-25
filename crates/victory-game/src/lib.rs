@@ -19,7 +19,68 @@ pub const KNOWN_BUILDS: &[KnownBuild] = &[];
 
 /// Looks up a build by the BLAKE3 hash of its executable.
 pub fn identify(blake3_hex: &str) -> Option<&'static KnownBuild> {
-    KNOWN_BUILDS
+    identify_in(KNOWN_BUILDS, blake3_hex)
+}
+
+/// The lookup behind [`identify`], over any table: the build whose hash is
+/// `blake3_hex`, whole, in either case of hex digits.
+pub fn identify_in<'a>(builds: &'a [KnownBuild], blake3_hex: &str) -> Option<&'a KnownBuild> {
+    builds
         .iter()
         .find(|b| b.blake3.eq_ignore_ascii_case(blake3_hex))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Hashes of our own strings, not of any executable.
+    const BUILDS: &[KnownBuild] = &[
+        KnownBuild {
+            label: "first",
+            blake3: "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+        },
+        KnownBuild {
+            label: "second",
+            blake3: "FFEEDDCCBBAA99887766554433221100FFEEDDCCBBAA99887766554433221100",
+        },
+    ];
+
+    #[test]
+    fn identify_matches_hex_in_either_case() {
+        for build in BUILDS {
+            for hex in [
+                build.blake3.to_owned(),
+                build.blake3.to_ascii_lowercase(),
+                build.blake3.to_ascii_uppercase(),
+            ] {
+                assert_eq!(
+                    identify_in(BUILDS, &hex).map(|b| b.label),
+                    Some(build.label)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_unknown_build_is_none() {
+        let known = BUILDS[0].blake3;
+        let one_off = format!("{}e", &known[..63]);
+        for hex in [
+            "",
+            "00",
+            // A prefix, the hash with more after it, one digit changed.
+            &known[..32],
+            &format!("{known}00"),
+            &one_off,
+            &format!(" {known}"),
+            "not hex at all",
+        ] {
+            assert!(identify_in(BUILDS, hex).is_none(), "{hex:?}");
+            // The shipped table knows no build yet.
+            assert!(identify(hex).is_none(), "{hex:?}");
+        }
+        assert!(identify_in(&[], known).is_none());
+        assert!(identify(known).is_none());
+    }
 }

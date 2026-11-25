@@ -126,6 +126,213 @@ mod tests {
         assert!(!is_sgd5(&archive[..0x1000]));
     }
 
+    fn xorshift(seed: &mut u64) -> u64 {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        *seed
+    }
+
+    /// The fields around a marker: `n` twice, the unpacked size, `packed`.
+    fn raw_record(before: &[u8], n: [u32; 2], unpacked: u32, packed: &[u8]) -> Vec<u8> {
+        let mut out = before.to_vec();
+        for v in [n[0], 0x000D_DCE7, n[1], unpacked] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.extend_from_slice(packed);
+        out
+    }
+
+    /// Walks every record a file gives and unpacks it: whatever comes out
+    /// has the size the record states, within the limit.
+    fn walk(file: &[u8]) -> usize {
+        let mut found = 0;
+        for r in records(file) {
+            found += 1;
+            assert_eq!(&file[r.offset..r.offset + 4], &MARKER);
+            if let Some(out) = r.unpack() {
+                assert_eq!(out.len(), r.unpacked_size);
+                assert!(out.len() <= MAX_UNPACKED);
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn noise_around_the_marker_never_panics_or_over_allocates() {
+        let packed = miniz_oxide::deflate::compress_to_vec(&[7; 64], 6);
+        let n = packed.len() as u32 + 12;
+
+        // The marker at every offset too near the start for the fields
+        // before it, and the file cut at every length.
+        for lead in 0..12 {
+            let mut file = vec![0x41u8; lead];
+            file.extend_from_slice(&MARKER);
+            file.extend_from_slice(&n.to_le_bytes());
+            file.extend_from_slice(&64u32.to_le_bytes());
+            file.extend_from_slice(&packed);
+            for cut in 0..=file.len() {
+                walk(&file[..cut]);
+            }
+            if lead < 6 {
+                assert_eq!(walk(&file), 0, "no room for a record before offset 6");
+            }
+        }
+        let whole = record_bytes("PS_x_Wrapped", 0x32, &[7; 64]);
+        assert_eq!(walk(&whole), 1);
+        for cut in 0..whole.len() {
+            assert_eq!(walk(&whole[..cut]), 0, "cut at {cut}");
+        }
+
+        // Sizes at the edges: a packed size smaller than its own fields,
+        // one with nothing packed, and the largest a u32 holds.
+        let before = [0u8, 0x32];
+        for (n, records) in [(11, 0), (12, 1), (u32::MAX, 0)] {
+            let file = raw_record(&before, [n, n], 64, &packed);
+            assert_eq!(walk(&file), records, "n = {n}");
+        }
+        let empty = raw_record(&before, [12, 12], 0, &[]);
+        assert_eq!(walk(&empty), 1);
+        assert_eq!(super::records(&empty).next().unwrap().unpack(), None);
+
+        // Unpacked sizes around the limit. At the limit the record stands
+        // but its 64 bytes are not what it states, so nothing unpacks;
+        // past it there is no record.
+        let max = MAX_UNPACKED as u32;
+        for (unpacked, records) in [(max - 1, 1), (max, 1), (max + 1, 0), (u32::MAX, 0)] {
+            let file = raw_record(&before, [n, n], unpacked, &packed);
+            assert_eq!(walk(&file), records, "unpacked = {unpacked:#x}");
+            assert!(super::records(&file).all(|r| r.unpack().is_none()));
+        }
+
+        // A stream that unpacks to far more than the record states stops
+        // at the stated size.
+        let bomb = miniz_oxide::deflate::compress_to_vec(&vec![0; 4 << 20], 6);
+        assert!(bomb.len() < 64 << 10);
+        let n = bomb.len() as u32 + 12;
+        for unpacked in [0, 1, 1000, (4 << 20) - 1, (4 << 20) + 1, max] {
+            let file = raw_record(&before, [n, n], unpacked, &bomb);
+            assert_eq!(walk(&file), 1);
+            assert_eq!(super::records(&file).next().unwrap().unpack(), None);
+        }
+        let file = raw_record(&before, [n, n], 4 << 20, &bomb);
+        assert_eq!(
+            super::records(&file)
+                .next()
+                .unwrap()
+                .unpack()
+                .map(|v| v.len()),
+            Some(4 << 20)
+        );
+
+        // Noise with markers dropped in, and a good file with bytes
+        // changed: every walk returns.
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut good = MAGIC.to_vec();
+        good.extend(record_bytes("VS_a_Wrapped", 0x32, b"first container"));
+        good.extend(record_bytes(&"n".repeat(40), 0x41, &[9; 500]));
+        assert_eq!(walk(&good), 2);
+        for round in 0..2000 {
+            let len = xorshift(&mut seed) as usize % 600;
+            let mut file: Vec<u8> = (0..len).map(|_| xorshift(&mut seed) as u8).collect();
+            for _ in 0..round % 5 {
+                let at = xorshift(&mut seed) as usize % (file.len() + 1);
+                let n = (xorshift(&mut seed) % 64) as u32;
+                // Sizes that agree, so the record is taken further.
+                let record = raw_record(&[], [n, n], xorshift(&mut seed) as u32 % 4096, &[]);
+                file.splice(at..at, record);
+            }
+            walk(&file);
+
+            let mut file = good.clone();
+            for _ in 0..1 + round % 4 {
+                let at = xorshift(&mut seed) as usize % file.len();
+                file[at] = xorshift(&mut seed) as u8;
+            }
+            let cut = file.len() - xorshift(&mut seed) as usize % 8;
+            assert!(walk(&file[..cut]) <= 2);
+        }
+    }
+
+    #[test]
+    fn a_marker_in_other_data_is_not_a_record() {
+        let marker = 0x000D_DCE7u32;
+        // Alone, at the start, at the end, twice in a row.
+        assert_eq!(records(&MARKER).count(), 0);
+        assert_eq!(records(&[MARKER, MARKER].concat()).count(), 0);
+        let mut file = vec![0x5a; 64];
+        file.extend_from_slice(&MARKER);
+        assert_eq!(records(&file).count(), 0);
+        file.extend_from_slice(&[0x5a; 64]);
+        assert_eq!(records(&file).count(), 0, "the sizes are 0x5a5a5a5a");
+
+        let before = [0u8, 0x32];
+        // The two packed sizes disagree.
+        let file = raw_record(&before, [16, 17], 4, &[0; 16]);
+        assert_eq!(records(&file).count(), 0);
+        // They agree but the file ends before the packed bytes do.
+        let file = raw_record(&before, [16, 16], 4, &[0; 3]);
+        assert_eq!(records(&file).count(), 0);
+        let file = raw_record(&before, [16, 16], 4, &[0; 4]);
+        assert_eq!(records(&file).count(), 1);
+        // A marker as the unpacked size of a record is not a second one.
+        let file = raw_record(&before, [16, 16], marker, &[0; 4]);
+        let found: Vec<_> = records(&file).collect();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].offset, before.len() + 4);
+        // Markers inside a real record's packed bytes do not add records
+        // unless sizes around them agree, and the real one is still found.
+        let mut file = record_bytes("CS_y", 0x3c, &[3; 32]);
+        file.extend_from_slice(&MARKER);
+        file.extend_from_slice(&[0; 2]);
+        file.extend(record_bytes("CS_z", 0x3c, &[4; 32]));
+        let found: Vec<_> = records(&file).collect();
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].unpack(), Some(vec![3; 32]));
+        assert_eq!(found[1].unpack(), Some(vec![4; 32]));
+        assert_eq!(found[1].name, Some("CS_z"));
+    }
+
+    /// The length byte counts the name and its NUL. Up to 31 characters it
+    /// is a control character or a space; from 32 on it is printable and
+    /// reads like one more character of the name.
+    #[test]
+    fn names_of_31_32_and_33_bytes() {
+        for len in [
+            1usize, 2, 30, 31, 32, 33, 34, 93, 94, 95, 126, 127, 200, 254,
+        ] {
+            let name: String = (0..len).map(|i| (b'a' + (i % 26) as u8) as char).collect();
+            let file = record_bytes(&name, 0x32, b"x");
+            let found: Vec<_> = records(&file).collect();
+            assert_eq!(found.len(), 1, "{len}");
+            assert_eq!(found[0].name, Some(name.as_str()), "{len}");
+            assert_eq!(found[0].kind, 0x32);
+
+            // With printable bytes right before the length byte the
+            // name's start is a guess among the bytes that could be its
+            // length: the name found then still ends with the real one.
+            let mut archive = b"other data, printable".to_vec();
+            archive.extend_from_slice(&file[4..]);
+            let found: Vec<_> = records(&archive).collect();
+            assert_eq!(found.len(), 1, "{len} after text");
+            assert!(
+                found[0].name.is_some_and(|n| n.ends_with(name.as_str())),
+                "{len} after text: {:?}",
+                found[0].name
+            );
+        }
+        // No NUL where the name should end: a record without a name.
+        let mut file = record_bytes("PS_named", 0x32, b"x");
+        let nul = 4 + 1 + "PS_named".len();
+        assert_eq!(file[nul], 0);
+        file[nul] = b'!';
+        assert_eq!(records(&file).next().unwrap().name, None);
+        // A length byte that does not fit the name: no name either.
+        let mut file = record_bytes("PS_named", 0x32, b"x");
+        file[4] += 1;
+        assert_eq!(records(&file).next().unwrap().name, None);
+    }
+
     #[test]
     fn corrupt_stream_does_not_unpack() {
         let mut file = record_bytes("CS_x", 0x3c, &[1; 64]);
