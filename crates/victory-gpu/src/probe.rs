@@ -31,6 +31,7 @@ pub(crate) const STORED: u32 = 0x5AFE_C0DE;
 /// texture whose descriptor the table at s4 names, then
 /// `buffer_store_dword` of s2 to dword 0 of the raw buffer the table at s6
 /// names. Lowered as a title's program is.
+#[cfg(test)]
 pub(crate) fn atomics64_program() -> Result<HostShader, ShaderError> {
     parts(true).map(|(shader, _)| shader)
 }

@@ -1,6 +1,7 @@
-# Compiles the argument clamp shader with Microsoft's compilers. Wine's HLSL
-# compiler cannot build it, so the macOS port embeds this output through
-# `cargo xtask embed-clamp`.
+# Compiles the argument clamp and the depth conversion shaders with
+# Microsoft's compilers. Wine's HLSL compiler cannot build them, so the macOS
+# port embeds this output through `cargo xtask embed-clamp` and
+# `cargo xtask embed-depth`.
 name: clamp bytecode
 
 on:
@@ -8,6 +9,7 @@ on:
   push:
     paths:
       - crates/victory-gpu/src/clamp.hlsl
+      - crates/victory-gpu/src/depth.hlsl
       - .github/workflows/clamp-bytecode.yml
 
 jobs:
@@ -27,6 +29,10 @@ jobs:
           & $fxc.FullName /nologo /T cs_5_1 /E main /Fo out/clamp.dxbc crates/victory-gpu/src/clamp.hlsl
           if ($LASTEXITCODE -ne 0) { exit 1 }
           & $dxc.FullName -T cs_6_0 -E main -Fo out/clamp.dxil crates/victory-gpu/src/clamp.hlsl
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          & $fxc.FullName /nologo /T cs_5_1 /E main /Fo out/depth.dxbc crates/victory-gpu/src/depth.hlsl
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          & $dxc.FullName -T cs_6_0 -E main -Fo out/depth.dxil crates/victory-gpu/src/depth.hlsl
           if ($LASTEXITCODE -ne 0) { exit 1 }
           Get-ChildItem out
       - uses: actions/upload-artifact@v4
