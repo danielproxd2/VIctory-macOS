@@ -499,6 +499,21 @@ fn flags_of(process: HANDLE, host: &MEMORY_BASIC_INFORMATION) -> Option<u64> {
     Some(region.flags)
 }
 
+/// The XMem flags of the region the host describes as `host`: committed
+/// memory has those `recorded` knows for it, or graphics memory's; memory
+/// that is free or only reserved has none, whatever is recorded for its
+/// address, and `recorded` is not asked.
+fn flags_for(
+    host: &MEMORY_BASIC_INFORMATION,
+    recorded: impl FnOnce(&MEMORY_BASIC_INFORMATION) -> Option<u64>,
+) -> u64 {
+    if host.State == MEM_COMMIT {
+        recorded(host).unwrap_or(GRAPHICS)
+    } else {
+        0
+    }
+}
+
 /// `MEMORY_BASIC_INFORMATION` (the console's first 0x30 bytes are the
 /// same), then the XMem flags and tag.
 #[repr(C)]
@@ -533,11 +548,7 @@ pub extern "system" fn XMemVirtualQuery(
             return 0;
         }
         let info = &mut *out;
-        info.flags = if info.host.State == MEM_COMMIT {
-            flags_of(process, &info.host).unwrap_or(GRAPHICS)
-        } else {
-            0
-        };
+        info.flags = flags_for(&info.host, |host| flags_of(process, host));
         info.tag_code = 0;
         info.tag = [0; 4];
     }
@@ -1473,7 +1484,7 @@ pub(crate) fn module() -> HleModule {
 
 #[cfg(test)]
 mod tests {
-    use windows_sys::Win32::System::Memory::PAGE_READONLY;
+    use windows_sys::Win32::System::Memory::{MEM_FREE, PAGE_READONLY};
 
     use super::*;
 
@@ -1494,6 +1505,68 @@ mod tests {
         info
     }
 
+    /// Tries `attempt` until it gives something. It gives `None` when the
+    /// address it had just released was taken before it looked again: the
+    /// tests of this crate run side by side in one process and all of them
+    /// allocate, so nothing may be asserted of a released address without
+    /// this. 64 losses running fail the test.
+    fn until_not_taken<T>(what: &str, mut attempt: impl FnMut() -> Option<T>) -> T {
+        for _ in 0..64 {
+            if let Some(result) = attempt() {
+                return result;
+            }
+        }
+        panic!("{what}: 64 addresses running were taken meanwhile, or never came free");
+    }
+
+    /// What a query answers for an address whose memory was released, from
+    /// records as the host gives them: no test may ask the host itself,
+    /// which hands the address to another thread whenever it likes.
+    #[test]
+    fn memory_that_is_not_committed_reads_no_flags() {
+        let asked = std::cell::Cell::new(0);
+        let recorded = |flags: Option<u64>| {
+            let asked = &asked;
+            move |_: &MEMORY_BASIC_INFORMATION| {
+                asked.set(asked.get() + 1);
+                flags
+            }
+        };
+        let base = 0x2_4000_0000usize as *mut c_void;
+        // Released: the host has nothing there, and a record that is still
+        // kept for the address (the title's `VirtualFree` is not seen)
+        // gives its flags to nothing.
+        let released = MEMORY_BASIC_INFORMATION {
+            BaseAddress: base,
+            RegionSize: 2 * PAGE,
+            State: MEM_FREE,
+            Protect: PAGE_NOACCESS,
+            ..Default::default()
+        };
+        assert_eq!(flags_for(&released, recorded(Some(1 | 6 << 12))), 0);
+        // Reserved and never committed, or decommitted.
+        let reserved = MEMORY_BASIC_INFORMATION {
+            AllocationBase: base,
+            AllocationProtect: PAGE_READWRITE,
+            State: MEM_RESERVE,
+            Type: MEM_PRIVATE,
+            ..released
+        };
+        assert_eq!(flags_for(&reserved, recorded(Some(GRAPHICS | 7 << 12))), 0);
+        assert_eq!(asked.get(), 0, "no record is looked up for such memory");
+        // Committed: the record's flags, bit for bit, or graphics memory's.
+        let committed = MEMORY_BASIC_INFORMATION {
+            State: MEM_COMMIT,
+            Protect: PAGE_READWRITE,
+            ..reserved
+        };
+        for flags in [0, 1, GRAPHICS | 7 << 12, 2 | 5 << 12 | 1 << 20] {
+            assert_eq!(flags_for(&committed, recorded(Some(flags))), flags);
+        }
+        assert_eq!(flags_for(&committed, recorded(None)), GRAPHICS);
+        assert_eq!(asked.get(), 5);
+    }
+
     #[test]
     fn alloc_honours_alignment_and_frees() {
         for (field, align) in [(0, 16), (4, 16), (0xc, 4096), (0x10, 64 * 1024)] {
@@ -1512,7 +1585,6 @@ mod tests {
 
     #[test]
     fn aligned_32bit_default_allocations() {
-        const FREE: u32 = 0x1_0000; // MEM_FREE
         // Alignments above what the host gives unasked: 128 KiB, 2 MiB and
         // 16 MiB. Three blocks of each, held together: one could be aligned
         // by chance.
@@ -1529,8 +1601,16 @@ mod tests {
             }
             for p in blocks {
                 XMemFreeDefault(p, attributes);
-                assert_eq!(query(p).host.State, FREE, "{p:p}");
             }
+            // A freed block's address is the host's again. The host may
+            // give it to another thread before it is looked at, so a block
+            // more is freed until one is seen free.
+            until_not_taken("a freed 32-bit block", || {
+                let p = XMemAllocDefault(3 * PAGE, attributes);
+                assert!(!p.is_null(), "field {field:#x}");
+                XMemFreeDefault(p, attributes);
+                (query(p).host.State == MEM_FREE).then_some(())
+            });
         }
         // Alignments the host gives anyway still allocate.
         for field in [0u64, 4, 0xc, 0x10] {
@@ -2094,19 +2174,31 @@ mod tests {
 
         // A reservation at an address of the title's choice is made there
         // or not at all: the address limits of the flags are for addresses
-        // we choose. `r` was above 4 GiB; 32-bit memory is asked for.
-        assert!(r as usize >= 1 << 32);
-        let kind = MEM_RESERVE | MEM_COMMIT;
-        let fixed = XMemVirtualAlloc(r, 4 * PAGE, kind, ADDRESS_32BIT, PAGE_READWRITE);
-        // Other tests reserve meanwhile, so the address may be taken.
-        if fixed.is_null() {
-            eprintln!("skipped: {r:p} was taken meanwhile");
-            return;
-        }
-        assert_eq!(fixed, r);
-        assert_eq!(query(r).flags, ADDRESS_32BIT);
-        // SAFETY: our own reservation.
-        assert_ne!(unsafe { VirtualFree(r, 0, MEM_RELEASE) }, 0);
+        // we choose. An address above 4 GiB that was free a moment ago;
+        // 32-bit memory is asked for. Other tests reserve meanwhile and may
+        // take the address, so it is tried with another until one is free.
+        until_not_taken("a reservation at a fixed base", || {
+            let r = XMemVirtualAlloc(
+                std::ptr::null_mut(),
+                4 * PAGE,
+                MEM_RESERVE,
+                GRAPHICS,
+                PAGE_NOACCESS,
+            );
+            assert!(!r.is_null() && r as usize >= 1 << 32, "{r:p}");
+            // SAFETY: our own reservation.
+            assert_ne!(unsafe { VirtualFree(r, 0, MEM_RELEASE) }, 0);
+            let kind = MEM_RESERVE | MEM_COMMIT;
+            let fixed = XMemVirtualAlloc(r, 4 * PAGE, kind, ADDRESS_32BIT, PAGE_READWRITE);
+            if fixed.is_null() {
+                return None;
+            }
+            assert_eq!(fixed, r);
+            assert_eq!(query(r).flags, ADDRESS_32BIT);
+            // SAFETY: our own reservation.
+            assert_ne!(unsafe { VirtualFree(r, 0, MEM_RELEASE) }, 0);
+            Some(())
+        });
     }
 
     #[test]
@@ -2140,9 +2232,10 @@ mod tests {
             )
         };
         assert_eq!(watched, 0);
+        // What the released address answers is the host's to change at once:
+        // `memory_that_is_not_committed_reads_no_flags`.
         // SAFETY: our own reservation.
         assert_ne!(unsafe { VirtualFree(p, 0, MEM_RELEASE) }, 0);
-        assert_eq!(query(p).flags, 0);
         // No address field: above the 32-bit range and below 2^40, where
         // the console keeps it.
         let p = XMemVirtualAlloc(
@@ -2203,22 +2296,44 @@ mod tests {
         );
         assert_eq!(query(second).flags, flags);
         assert_eq!(query(p).flags, 0, "still reserved only");
-        // Freed, the addresses answer for no memory; the same range handed
-        // out again answers with its new flags.
+        // Freed, the addresses answer for no memory: from the host's own
+        // records in `memory_that_is_not_committed_reads_no_flags`, since
+        // the host may give a freed address away before it is asked.
         for q in regions.into_iter().chain([p]) {
             // SAFETY: our own reservations.
             assert_ne!(unsafe { VirtualFree(q, 0, MEM_RELEASE) }, 0);
-            assert_eq!(query(q).flags, 0);
         }
-        // Other tests reserve meanwhile, so the address may be taken.
-        let again = XMemVirtualAlloc(p, 4 * PAGE, MEM_RESERVE | MEM_COMMIT, 2, PAGE_READWRITE);
-        if again == p {
+        // The same range handed out again answers with its new flags.
+        // Other tests reserve meanwhile and may take the released base, so
+        // it is tried with another region until the base is still free.
+        until_not_taken("a region at a released base", || {
+            let p = XMemVirtualAlloc(
+                std::ptr::null_mut(),
+                4 * PAGE,
+                MEM_RESERVE,
+                flags,
+                PAGE_READWRITE,
+            );
+            assert!(!p.is_null());
+            let second = p.wrapping_byte_add(PAGE);
+            assert_eq!(
+                XMemVirtualAlloc(second, PAGE, MEM_COMMIT, GRAPHICS, PAGE_READWRITE),
+                second
+            );
+            assert_eq!(query(second).flags, flags);
+            // SAFETY: our own reservation.
+            assert_ne!(unsafe { VirtualFree(p, 0, MEM_RELEASE) }, 0);
+            let kind = MEM_RESERVE | MEM_COMMIT;
+            let again = XMemVirtualAlloc(p, 4 * PAGE, kind, 2, PAGE_READWRITE);
+            if again.is_null() {
+                return None;
+            }
+            assert_eq!(again, p, "a fixed base is that base or nothing");
             assert_eq!(query(second).flags, 2);
             // SAFETY: our own reservation.
             assert_ne!(unsafe { VirtualFree(p, 0, MEM_RELEASE) }, 0);
-        } else {
-            assert!(again.is_null(), "a fixed base is that base or nothing");
-        }
+            Some(())
+        });
     }
 
     /// Reserves two 64 KiB pages with `XMemVirtualAlloc`, frees them with
@@ -2299,9 +2414,10 @@ mod tests {
         let flags = 1 | 6 << 12;
         let p = reallocated_by_the_host(flags, 2 * PAGE, PAGE_READWRITE);
         assert_eq!(query(p).flags, flags);
+        // Released, the address reads no flags, from whatever record: see
+        // `memory_that_is_not_committed_reads_no_flags`.
         // SAFETY: the host's allocation.
         assert_ne!(unsafe { VirtualFree(p, 0, MEM_RELEASE) }, 0);
-        assert_eq!(query(p).flags, 0);
     }
 
     /// Pins what a 32-bit default block reads back today: the flags of the
