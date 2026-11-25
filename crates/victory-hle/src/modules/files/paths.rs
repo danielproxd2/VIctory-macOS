@@ -91,6 +91,66 @@ pub(crate) fn translate(drives: &[(u16, Vec<u16>)], path: &[u16]) -> Option<Vec<
     Some(out)
 }
 
+/// `path` without the `\\?\` prefix (`\\?\UNC\server` as `\\server`) and
+/// without trailing separators.
+fn plain(path: &[u16]) -> Vec<u16> {
+    let backslash = u16::from(b'\\');
+    let unc: Vec<u16> = "UNC\\".encode_utf16().collect();
+    let mut out = match path.strip_prefix(&VERBATIM[..]) {
+        Some(rest) => match rest.get(..4) {
+            Some(head) if same(head, &unc) => [&[backslash; 2][..], &rest[4..]].concat(),
+            _ => rest.to_vec(),
+        },
+        None => path.to_vec(),
+    };
+    while out.last().is_some_and(|c| SEPARATORS.contains(c)) {
+        out.pop();
+    }
+    out
+}
+
+/// Whether two stretches of a host path name the same thing as far as can
+/// be told without the host: ASCII letters in either case, either
+/// separator. Other letters must match exactly.
+fn same(a: &[u16], b: &[u16]) -> bool {
+    let fold = |c: u16| match u8::try_from(c) {
+        Ok(b'/') => u16::from(b'\\'),
+        Ok(c) => u16::from(c.to_ascii_uppercase()),
+        Err(_) => c,
+    };
+    a.len() == b.len() && a.iter().zip(b).all(|(&x, &y)| fold(x) == fold(y))
+}
+
+/// The title's path (`X:\tail`, no NUL) for the host path `host` (no NUL)
+/// if it lies in the folder behind one of `drives`: the reverse of
+/// [`translate`], for what the host hands back (the current directory, a
+/// full path, the path of an open file). The deepest folder wins. A host
+/// path in the `\\?\` form is recognised; the answer never has the prefix.
+pub(crate) fn untranslate(drives: &[(u16, Vec<u16>)], host: &[u16]) -> Option<Vec<u16>> {
+    let ends_in_separator = host.last().is_some_and(|c| SEPARATORS.contains(c));
+    let host = plain(host);
+    let (letter, tail) = drives
+        .iter()
+        .filter_map(|(letter, root)| {
+            let root = plain(root);
+            let head = host.get(..root.len())?;
+            let tail = &host[root.len()..];
+            let inside = tail.first().is_none_or(|c| SEPARATORS.contains(c));
+            (!root.is_empty() && inside && same(head, &root)).then_some((root.len(), *letter, tail))
+        })
+        .max_by_key(|(len, ..)| *len)
+        .map(|(_, letter, tail)| (letter, tail))?;
+    let backslash = u16::from(b'\\');
+    let mut out = vec![letter, u16::from(b':'), backslash];
+    out.extend(tail.iter().skip_while(|c| SEPARATORS.contains(c)));
+    // A trailing separator says "folder" (the host's temporary folder ends
+    // in one); the root has its own.
+    if ends_in_separator && out.len() > 3 {
+        out.push(backslash);
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,6 +265,73 @@ mod tests {
                 expected,
                 "{root:?} + {tail:?}"
             );
+        }
+    }
+
+    /// `host` against the table of [`tr`], back to the title's path.
+    fn back(host: &str) -> Option<String> {
+        let drives = [
+            (u16::from(b'T'), w(ROOT)),
+            (u16::from(b'G'), w(r"\\server\share\game")),
+            (u16::from(b'S'), w(r"C:\host\root\saves")),
+        ];
+        untranslate(&drives, &w(host)).map(|path| String::from_utf16(&path).unwrap())
+    }
+
+    #[test]
+    fn host_roots_map_back_to_drives() {
+        let some = |s: &str| Some(s.to_owned());
+        assert_eq!(back(r"C:\host\root"), some(r"T:\"));
+        assert_eq!(back(r"C:\host\root\"), some(r"T:\"));
+        assert_eq!(back(r"C:\host\root\a\b.txt"), some(r"T:\a\b.txt"));
+        // As the host compares ASCII names, and with either separator.
+        assert_eq!(back(r"c:/HOST/Root/a"), some(r"T:\a"));
+        // A trailing separator is kept: it says "folder".
+        assert_eq!(back(r"C:\host\root\tmp\"), some(r"T:\tmp\"));
+        // The form GetFinalPathNameByHandleW answers in, also for a share.
+        assert_eq!(back(r"\\?\C:\host\root\a"), some(r"T:\a"));
+        assert_eq!(back(r"\\?\UNC\server\share\game\a"), some(r"G:\a"));
+        assert_eq!(back(r"\\server\share\game"), some(r"G:\"));
+        // The deepest mounted folder wins.
+        assert_eq!(back(r"C:\host\root\saves\slot1"), some(r"S:\slot1"));
+        assert_eq!(back(r"C:\host\root\savesx"), some(r"T:\savesx"));
+    }
+
+    #[test]
+    fn host_paths_outside_every_drive_stay_host_paths() {
+        for host in [
+            "",
+            r"C:\",
+            r"C:\host",
+            // A folder whose name only starts like the root's.
+            r"C:\host\rootx\a",
+            r"D:\host\root\a",
+            r"\\server\share",
+            r"\\server\share\gamex",
+            r"\\?\C:\host",
+            "relative",
+        ] {
+            assert_eq!(back(host), None, "{host:?}");
+        }
+        assert_eq!(untranslate(&[], &w(r"C:\host\root")), None);
+        // Letters outside ASCII are compared as written.
+        let drives = [(u16::from(b'T'), w("C:\\\u{e9}"))];
+        assert_eq!(untranslate(&drives, &w("C:\\\u{c9}\\a")), None);
+        assert_eq!(untranslate(&drives, &w("C:\\\u{e9}\\a")), Some(w(r"T:\a")));
+    }
+
+    /// What `translate` makes of a title path maps back to it.
+    #[test]
+    fn untranslate_reverses_translate() {
+        let drives = [
+            (u16::from(b'T'), w(ROOT)),
+            (u16::from(b'G'), w(r"\\server\share\game")),
+        ];
+        let long = format!(r"T:\{}\f", "d".repeat(250));
+        for path in [r"T:\", r"T:\a\b.txt", r"G:\data.bin", long.as_str()] {
+            let host = translate(&drives, &w(path)).unwrap();
+            let host = &host[..host.len() - 1];
+            assert_eq!(untranslate(&drives, host), Some(w(path)), "{path}");
         }
     }
 }

@@ -11,10 +11,16 @@
 //! time when its drive letter is mounted too. Letters are chosen among
 //! those the host does not use, so no host drive is hidden.
 //!
+//! The other direction: where the host hands a path back (the current
+//! directory, a full path, the path of an open file, the temporary
+//! folder), a path inside a mounted folder is given to the title as the
+//! path on its drive, so the title never learns the host folder from
+//! those calls.
+//!
 //! Not bound, and so answered by the host as they are: the narrow
 //! `FindFirstFile` family of the C runtime (`_findfirst64` and its
-//! siblings), the short and long path-name conversions, and the
-//! transacted functions.
+//! siblings), `GetTempPathA`, `GetFinalPathNameByHandleA`, the short and
+//! long path-name conversions, and the transacted functions.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 #![allow(clippy::too_many_arguments)]
@@ -56,12 +62,18 @@ pub(crate) const HOST_IMPORTS: &[(&str, &str)] = &[
     ("kernel32.dll", "FindFirstFileExA"),
     ("kernel32.dll", "FindFirstFileExW"),
     ("kernel32.dll", "FindFirstFileW"),
+    ("kernel32.dll", "GetCurrentDirectoryA"),
+    ("kernel32.dll", "GetCurrentDirectoryW"),
     ("kernel32.dll", "GetDiskFreeSpaceExW"),
     ("kernel32.dll", "GetDiskFreeSpaceW"),
     ("kernel32.dll", "GetFileAttributesA"),
     ("kernel32.dll", "GetFileAttributesExA"),
     ("kernel32.dll", "GetFileAttributesExW"),
     ("kernel32.dll", "GetFileAttributesW"),
+    ("kernel32.dll", "GetFinalPathNameByHandleW"),
+    ("kernel32.dll", "GetFullPathNameA"),
+    ("kernel32.dll", "GetFullPathNameW"),
+    ("kernel32.dll", "GetTempPathW"),
     ("kernel32.dll", "GetVolumeInformationW"),
     ("kernel32.dll", "MoveFileExA"),
     ("kernel32.dll", "MoveFileExW"),
@@ -166,6 +178,12 @@ fn root_wide(root: &Path) -> Vec<u16> {
 /// a virtual drive.
 pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
     paths::translate(&drives(), path)
+}
+
+/// The title's path (no NUL) for the host path `host` (no NUL) if it lies
+/// in the folder behind a virtual drive.
+fn untranslate(host: &[u16]) -> Option<Vec<u16>> {
+    paths::untranslate(&drives(), host)
 }
 
 /// Takes a drive letter back. Tests run side by side in one process and
@@ -292,6 +310,53 @@ fn ptr(path: &Option<Vec<u16>>) -> *const u16 {
     path.as_ref().map_or(std::ptr::null(), |p| p.as_ptr())
 }
 
+/// What a host query for a path answers, without NUL. `ask(buffer, units)`
+/// is the query: it returns the length it wrote or, for a buffer too
+/// small, the size it needs; 0 says it failed.
+fn asked(mut ask: impl FnMut(*mut u16, u32) -> u32) -> Option<Vec<u16>> {
+    // No path the host names is longer than 32767 units.
+    const LONGEST: usize = 0x8000;
+    let mut buffer = vec![0u16; 520];
+    for _ in 0..3 {
+        let n = ask(buffer.as_mut_ptr(), buffer.len() as u32) as usize;
+        if n == 0 || n > LONGEST {
+            return None;
+        }
+        if n < buffer.len() {
+            buffer.truncate(n);
+            return Some(buffer);
+        }
+        buffer = vec![0; n + 1];
+    }
+    None
+}
+
+/// Hands `text` (no NUL) to a title's buffer of `len` units the way the
+/// host's path queries do, by their public references: the length written,
+/// not counting the NUL; or, where it does not fit, the size needed with
+/// the NUL, and nothing written.
+fn answer<T: Copy + Default>(text: &[T], buffer: *mut T, len: u32) -> u32 {
+    let Ok(needed) = u32::try_from(text.len() + 1) else {
+        return 0;
+    };
+    if buffer.is_null() || len < needed {
+        return needed;
+    }
+    // SAFETY: the title's buffer holds `len` units, which is enough.
+    unsafe {
+        std::ptr::copy_nonoverlapping(text.as_ptr(), buffer, text.len());
+        buffer.add(text.len()).write(T::default());
+    }
+    needed - 1
+}
+
+/// Where the last name of a full path starts; None if it ends in a
+/// separator (a folder), as `GetFullPathName` reports its file part.
+fn name_start(path: &[u16]) -> Option<usize> {
+    let start = path.iter().rposition(|c| SEPARATORS.contains(c))? + 1;
+    (start < path.len()).then_some(start)
+}
+
 /// A name the host found (up to its NUL) in the ANSI code page with its
 /// NUL, into the field of the narrow record. False if it does not fit.
 fn narrow_name(wide: &[u16], out: &mut [u8]) -> bool {
@@ -306,8 +371,10 @@ fn narrow_name(wide: &[u16], out: &mut [u8]) -> bool {
     }
 }
 
+const ERROR_PATH_NOT_FOUND: u32 = 3;
 const ERROR_INVALID_PARAMETER: u32 = 87;
 const ERROR_MORE_DATA: u32 = 234;
+const ERROR_NO_UNICODE_TRANSLATION: u32 = 1113;
 const INVALID_HANDLE: Handle = std::ptr::without_provenance_mut(usize::MAX);
 
 /// What the host's wide search found, for a title that asked with a narrow
@@ -843,6 +910,201 @@ pub extern "system" fn GetVolumeInformationW(
     )
 }
 
+// Paths the host hands back. One inside a mounted folder is given to the
+// title as the path on its drive; any other as the host gave it, by the
+// host's own call with the title's arguments.
+
+pub extern "system" fn GetCurrentDirectoryW(len: u32, buffer: *mut u16) -> u32 {
+    let get =
+        host!("kernel32.dll", "GetCurrentDirectoryW": extern "system" fn(u32, *mut u16) -> u32);
+    match asked(|b, n| get(n, b)).and_then(|path| untranslate(&path)) {
+        Some(path) => answer(&path, buffer, len),
+        None => get(len, buffer),
+    }
+}
+
+pub extern "system" fn GetCurrentDirectoryA(len: u32, buffer: *mut u8) -> u32 {
+    let wide =
+        host!("kernel32.dll", "GetCurrentDirectoryW": extern "system" fn(u32, *mut u16) -> u32);
+    match asked(|b, n| wide(n, b)).and_then(|path| untranslate(&path)) {
+        Some(path) => match encode(&path) {
+            Some(path) => answer(&path, buffer, len),
+            None => fail(ERROR_NO_UNICODE_TRANSLATION),
+        },
+        None => {
+            host!("kernel32.dll", "GetCurrentDirectoryA": extern "system" fn(u32, *mut u8) -> u32)(
+                len, buffer,
+            )
+        }
+    }
+}
+
+/// Fails a call that returns 0 for failure, with `error` for the thread.
+fn fail(error: u32) -> u32 {
+    // SAFETY: the thread's last error.
+    unsafe { SetLastError(error) };
+    0
+}
+
+/// The host works on the text alone, so a path on a virtual drive comes
+/// back on that drive without our doing. A relative path is completed with
+/// the current directory, which may be a mounted folder.
+pub extern "system" fn GetFullPathNameW(
+    path: *const u16,
+    len: u32,
+    buffer: *mut u16,
+    file_part: *mut *mut u16,
+) -> u32 {
+    let get = host!("kernel32.dll", "GetFullPathNameW": extern "system" fn(*const u16, u32, *mut u16, *mut *mut u16) -> u32);
+    let none = std::ptr::null_mut();
+    let full = if path.is_null() {
+        None
+    } else {
+        asked(|b, n| get(path, n, b, none)).and_then(|full| untranslate(&full))
+    };
+    let Some(full) = full else {
+        return get(path, len, buffer, file_part);
+    };
+    let written = answer(&full, buffer, len);
+    if written as usize == full.len() && !file_part.is_null() {
+        // SAFETY: an offset inside the path just written; the title's
+        // place for the pointer, checked for null.
+        unsafe {
+            file_part
+                .write(name_start(&full).map_or(std::ptr::null_mut(), |start| buffer.add(start)))
+        };
+    }
+    written
+}
+
+pub extern "system" fn GetFullPathNameA(
+    path: *const c_char,
+    len: u32,
+    buffer: *mut u8,
+    file_part: *mut *mut u8,
+) -> u32 {
+    let none = std::ptr::null_mut();
+    let full = decoded(path).and_then(|path| {
+        let get = host!("kernel32.dll", "GetFullPathNameW": extern "system" fn(*const u16, u32, *mut u16, *mut *mut u16) -> u32);
+        asked(|b, n| get(path.as_ptr(), n, b, none)).and_then(|full| untranslate(&full))
+    });
+    let Some(full) = full else {
+        return host!("kernel32.dll", "GetFullPathNameA": extern "system" fn(*const c_char, u32, *mut u8, *mut *mut u8) -> u32)(
+            path, len, buffer, file_part,
+        );
+    };
+    // The file part is found in the wide text: in a narrow one, the second
+    // byte of a character can look like a separator.
+    let start = name_start(&full);
+    let (Some(text), Some(start)) = (
+        encode(&full),
+        start.map_or(Some(None), |start| {
+            encode(&full[..start]).map(|head| Some(head.len()))
+        }),
+    ) else {
+        return fail(ERROR_NO_UNICODE_TRANSLATION);
+    };
+    let written = answer(&text, buffer, len);
+    if written as usize == text.len() && !file_part.is_null() {
+        // SAFETY: as in the wide twin.
+        unsafe { file_part.write(start.map_or(std::ptr::null_mut(), |start| buffer.add(start))) };
+    }
+    written
+}
+
+/// The host's temporary folder, which the console does not have: named by
+/// its drive where it lies in a mounted folder, else as the host names it.
+pub extern "system" fn GetTempPathW(len: u32, buffer: *mut u16) -> u32 {
+    let get = host!("kernel32.dll", "GetTempPathW": extern "system" fn(u32, *mut u16) -> u32);
+    match asked(|b, n| get(n, b)).and_then(|path| untranslate(&path)) {
+        Some(path) => answer(&path, buffer, len),
+        None => get(len, buffer),
+    }
+}
+
+const FILE_NAME_OPENED: u32 = 8;
+const VOLUME_NAME_DOS: u32 = 0;
+const VOLUME_NAME_GUID: u32 = 1;
+const VOLUME_NAME_NT: u32 = 2;
+const VOLUME_NAME_NONE: u32 = 4;
+
+type FinalPath = extern "system" fn(Handle, *mut u16, u32, u32) -> u32;
+
+/// The mounted drives by the names the host gives their folders as open
+/// files (links and short names resolved, the `\\?\` form), then by the
+/// names they were mounted with.
+fn final_roots(get: FinalPath, opened: u32) -> Vec<(u16, Vec<u16>)> {
+    const SHARE_ALL: u32 = 7;
+    const OPEN_EXISTING: u32 = 3;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let open = host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle);
+    let close = host!("kernel32.dll", "CloseHandle": extern "system" fn(Handle) -> i32);
+    let mounted = drives().clone();
+    let mut roots = Vec::new();
+    for (letter, root) in &mounted {
+        let name: Vec<u16> = root.iter().copied().chain([0]).collect();
+        let (none, null) = (std::ptr::null(), std::ptr::null_mut());
+        let flags = FILE_FLAG_BACKUP_SEMANTICS;
+        let folder = open(
+            name.as_ptr(),
+            0,
+            SHARE_ALL,
+            none,
+            OPEN_EXISTING,
+            flags,
+            null,
+        );
+        if folder != INVALID_HANDLE {
+            roots.extend(asked(|b, n| get(folder, b, n, opened)).map(|path| (*letter, path)));
+            close(folder);
+        }
+    }
+    roots.extend(mounted);
+    roots
+}
+
+/// The path of an open file. For a file in a mounted folder: with the
+/// drive letter (the default) it is the path on the virtual drive, in the
+/// `\\?\` form this function answers in; with no volume name, the path below
+/// the drive's root. A virtual drive has no volume GUID path and no NT
+/// device, so those two fail with `ERROR_PATH_NOT_FOUND`, the documented
+/// error for a volume that has no name of the kind asked for.
+/// <https://learn.microsoft.com/windows/win32/api/fileapi/nf-fileapi-getfinalpathnamebyhandlew>
+pub extern "system" fn GetFinalPathNameByHandleW(
+    file: Handle,
+    buffer: *mut u16,
+    len: u32,
+    flags: u32,
+) -> u32 {
+    let get: FinalPath = host!("kernel32.dll", "GetFinalPathNameByHandleW": extern "system" fn(Handle, *mut u16, u32, u32) -> u32);
+    const VOLUME_NAMES: u32 = VOLUME_NAME_GUID | VOLUME_NAME_NT | VOLUME_NAME_NONE;
+    let opened = flags & FILE_NAME_OPENED;
+    let volume = flags & VOLUME_NAMES;
+    let known = flags & !(VOLUME_NAMES | FILE_NAME_OPENED) == 0
+        && matches!(
+            volume,
+            VOLUME_NAME_DOS | VOLUME_NAME_GUID | VOLUME_NAME_NT | VOLUME_NAME_NONE
+        );
+    let path = if known {
+        asked(|b, n| get(file, b, n, opened))
+            .and_then(|path| paths::untranslate(&final_roots(get, opened), &path))
+    } else {
+        None
+    };
+    let Some(path) = path else {
+        return get(file, buffer, len, flags);
+    };
+    match volume {
+        VOLUME_NAME_DOS => {
+            let prefix: Vec<u16> = r"\\?\".encode_utf16().collect();
+            answer(&[prefix, path].concat(), buffer, len)
+        }
+        // `X:\tail` without `X:`.
+        VOLUME_NAME_NONE => answer(&path[2..], buffer, len),
+        _ => fail(ERROR_PATH_NOT_FOUND),
+    }
+}
+
 // The C runtime (ucrtbase, which the title's CRT imports bind to).
 
 pub extern "C" fn _wfopen(path: *const u16, mode: *const u16) -> File {
@@ -1179,6 +1441,12 @@ pub(crate) fn module() -> HleModule {
             hle_export!(CreateHardLinkW),
             hle_export!(SetCurrentDirectoryW),
             hle_export!(GetVolumeInformationW),
+            hle_export!(GetCurrentDirectoryW),
+            hle_export!(GetCurrentDirectoryA),
+            hle_export!(GetFullPathNameW),
+            hle_export!(GetFullPathNameA),
+            hle_export!(GetTempPathW),
+            hle_export!(GetFinalPathNameByHandleW),
             hle_export!(_wfopen),
             hle_export!(_wfopen_s),
             hle_export!(_wfsopen),
@@ -1520,6 +1788,11 @@ mod tests {
         }
     }
 
+    /// The first `n` units of a buffer a path query filled.
+    fn units(buffer: &[u16], n: u32) -> String {
+        String::from_utf16_lossy(&buffer[..n as usize])
+    }
+
     /// Each wide function bound for a title, called with paths on a
     /// virtual drive, by what it leaves in the host folder. Every one that
     /// fails is named.
@@ -1773,6 +2046,183 @@ mod tests {
         assert_eq!(unsafe { GetLastError() }, ERROR_INVALID_PARAMETER);
     }
 
+    #[test]
+    fn final_path_names_use_the_drive_letter() {
+        use windows_sys::Win32::Foundation::GetLastError;
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const SHARE_ALL: u32 = 7;
+        const OPEN_EXISTING: u32 = 3;
+        let d = Drive::new();
+        std::fs::create_dir(d.host("sub")).unwrap();
+        std::fs::write(d.host("sub/f.bin"), b"x").unwrap();
+        let close = host!("kernel32.dll", "CloseHandle": extern "system" fn(Handle) -> i32);
+        let null = std::ptr::null_mut();
+        let open = |path: &[u16]| {
+            let (access, share) = (GENERIC_READ, SHARE_ALL);
+            CreateFileW(path.as_ptr(), access, share, null, OPEN_EXISTING, 0, null)
+        };
+        let file = open(&d.wide(r"sub\f.bin"));
+        assert_ne!(file, INVALID_HANDLE);
+
+        // With the drive letter (the default), in the `\\?\` form.
+        let mut buffer = [0u16; 600];
+        let n = GetFinalPathNameByHandleW(file, buffer.as_mut_ptr(), 600, 0);
+        let full = format!(r"\\?\{}:\sub\f.bin", d.letter);
+        assert_eq!(units(&buffer, n), full);
+        assert_eq!(buffer[n as usize], 0, "NUL-terminated");
+        // A buffer too small by the NUL: the size needed, nothing written.
+        buffer[0] = 7;
+        assert_eq!(
+            GetFinalPathNameByHandleW(file, buffer.as_mut_ptr(), n, 0),
+            n + 1
+        );
+        assert_eq!(buffer[0], 7);
+        assert_eq!(
+            GetFinalPathNameByHandleW(file, std::ptr::null_mut(), 0, 0),
+            n + 1
+        );
+        // The name it was opened by is on the drive too.
+        let n = GetFinalPathNameByHandleW(file, buffer.as_mut_ptr(), 600, FILE_NAME_OPENED);
+        assert_eq!(units(&buffer, n), full);
+        // Without a volume name: the path below the drive's root.
+        let n = GetFinalPathNameByHandleW(file, buffer.as_mut_ptr(), 600, VOLUME_NAME_NONE);
+        assert_eq!(units(&buffer, n), r"\sub\f.bin");
+        // A virtual drive has no volume GUID path and no NT device.
+        for flags in [
+            VOLUME_NAME_GUID,
+            VOLUME_NAME_NT,
+            VOLUME_NAME_GUID | FILE_NAME_OPENED,
+        ] {
+            // SAFETY: the thread's last error.
+            unsafe { SetLastError(0) };
+            let n = GetFinalPathNameByHandleW(file, buffer.as_mut_ptr(), 600, flags);
+            // SAFETY: as above.
+            assert_eq!((n, unsafe { GetLastError() }), (0, 3), "flags {flags}");
+        }
+        // The answer names the file for the file layer.
+        let again = open(&w(&full));
+        assert_ne!(again, INVALID_HANDLE);
+        close(again);
+        close(file);
+
+        // A file outside every drive: the host's own answer.
+        let exe: Vec<u16> = std::env::current_exe()
+            .unwrap()
+            .as_os_str()
+            .encode_wide()
+            .chain([0])
+            .collect();
+        let file = open(&exe);
+        assert_ne!(file, INVALID_HANDLE);
+        let get = host!("kernel32.dll", "GetFinalPathNameByHandleW": extern "system" fn(Handle, *mut u16, u32, u32) -> u32);
+        let mut theirs = [0u16; 600];
+        let theirs_n = get(file, theirs.as_mut_ptr(), 600, 0);
+        let n = GetFinalPathNameByHandleW(file, buffer.as_mut_ptr(), 600, 0);
+        close(file);
+        assert_ne!(theirs_n, 0);
+        assert_eq!(units(&buffer, n), units(&theirs, theirs_n));
+    }
+
+    /// Puts the process's current directory back.
+    struct Cwd(std::path::PathBuf);
+
+    impl Drop for Cwd {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
+    #[test]
+    fn current_directory_round_trips_on_a_virtual_drive() {
+        let d = Drive::new();
+        std::fs::create_dir(d.host("sub")).unwrap();
+        // Dropped before `d`: the folder cannot go while the process is in it.
+        let _back = Cwd(std::env::current_dir().unwrap());
+        let sub = format!(r"{}:\sub", d.letter);
+        assert_ne!(SetCurrentDirectoryW(w(&sub).as_ptr()), 0);
+        assert!(
+            std::env::current_dir().unwrap().ends_with("sub"),
+            "the host is in the folder"
+        );
+        assert!(std::fs::write("relative.txt", b"r").is_ok());
+        assert!(d.host("sub/relative.txt").is_file());
+
+        // The title is told its own path, not the host's.
+        let mut buffer = [0u16; 300];
+        let n = GetCurrentDirectoryW(300, buffer.as_mut_ptr());
+        assert_eq!(units(&buffer, n), sub);
+        assert_eq!(buffer[n as usize], 0, "NUL-terminated");
+        assert_eq!(GetCurrentDirectoryW(0, std::ptr::null_mut()), n + 1);
+        buffer[0] = 7;
+        assert_eq!(GetCurrentDirectoryW(n, buffer.as_mut_ptr()), n + 1);
+        assert_eq!(buffer[0], 7, "nothing written to a buffer too small");
+        let mut narrow = [0u8; 300];
+        let n = GetCurrentDirectoryA(300, narrow.as_mut_ptr());
+        assert_eq!(std::str::from_utf8(&narrow[..n as usize]), Ok(sub.as_str()));
+        assert_eq!(GetCurrentDirectoryA(n, narrow.as_mut_ptr()), n + 1);
+
+        // A relative path is completed on the drive; the file part points
+        // at the name.
+        let mut part = std::ptr::null_mut();
+        let rel = w("rel.txt");
+        let n = GetFullPathNameW(rel.as_ptr(), 300, buffer.as_mut_ptr(), &mut part);
+        assert_eq!(units(&buffer, n), format!(r"{sub}\rel.txt"));
+        assert_eq!(part, buffer[n as usize - 7..].as_mut_ptr());
+        assert_eq!(
+            GetFullPathNameW(rel.as_ptr(), n, buffer.as_mut_ptr(), &mut part),
+            n + 1,
+            "too small by the NUL"
+        );
+        // A folder has no file part.
+        let n = GetFullPathNameW(w(r".\").as_ptr(), 300, buffer.as_mut_ptr(), &mut part);
+        assert_eq!(units(&buffer, n), format!(r"{sub}\"));
+        assert!(part.is_null());
+        // A path on the drive is completed by its text.
+        let dotted = w(&format!(r"{}:\a\..\b\c.txt", d.letter));
+        let n = GetFullPathNameW(dotted.as_ptr(), 300, buffer.as_mut_ptr(), &mut part);
+        assert_eq!(units(&buffer, n), format!(r"{}:\b\c.txt", d.letter));
+        // A host path stays one.
+        let host = w(r"C:\Windows\..\x.txt");
+        let n = GetFullPathNameW(host.as_ptr(), 300, buffer.as_mut_ptr(), &mut part);
+        assert_eq!(units(&buffer, n), r"C:\x.txt");
+
+        let mut part = std::ptr::null_mut();
+        let n = GetFullPathNameA(c"rel.txt".as_ptr(), 300, narrow.as_mut_ptr(), &mut part);
+        let expected = format!(r"{sub}\rel.txt");
+        assert_eq!(
+            std::str::from_utf8(&narrow[..n as usize]),
+            Ok(expected.as_str())
+        );
+        assert_eq!(part, narrow[n as usize - 7..].as_mut_ptr());
+        let n = GetFullPathNameA(c".\\".as_ptr(), 300, narrow.as_mut_ptr(), &mut part);
+        assert_eq!(narrow[n as usize - 1], b'\\');
+        assert!(part.is_null());
+
+        // The drive's root, set through the narrow function.
+        assert_ne!(SetCurrentDirectoryA(d.narrow("").as_ptr()), 0);
+        let n = GetCurrentDirectoryW(300, buffer.as_mut_ptr());
+        assert_eq!(units(&buffer, n), format!(r"{}:\", d.letter));
+    }
+
+    #[test]
+    fn the_temporary_folder_is_named_by_its_drive_when_mounted() {
+        let get = host!("kernel32.dll", "GetTempPathW": extern "system" fn(u32, *mut u16) -> u32);
+        let (mut theirs, mut ours) = ([0u16; 600], [0u16; 600]);
+        let n = get(600, theirs.as_mut_ptr());
+        assert_ne!(n, 0);
+        // No test mounts the folder that holds every test's own: the
+        // host's answer passes through.
+        let m = GetTempPathW(600, ours.as_mut_ptr());
+        assert_eq!(units(&ours, m), units(&theirs, n));
+
+        let letter = mount(Path::new(&units(&theirs, n))).expect("a free drive letter");
+        let m = GetTempPathW(600, ours.as_mut_ptr());
+        let too_small = GetTempPathW(3, ours[300..].as_mut_ptr());
+        unmount(letter);
+        assert_eq!(units(&ours, m), format!(r"{letter}:\"));
+        assert_eq!(too_small, 4, "the size with the NUL");
+    }
+
     /// Each function this file binds for a title resolves to it, under the
     /// DLL names a title imports it by.
     #[test]
@@ -1793,12 +2243,18 @@ mod tests {
             "FindFirstFileExA",
             "FindFirstFileExW",
             "FindFirstFileW",
+            "GetCurrentDirectoryA",
+            "GetCurrentDirectoryW",
             "GetDiskFreeSpaceExW",
             "GetDiskFreeSpaceW",
             "GetFileAttributesA",
             "GetFileAttributesExA",
             "GetFileAttributesExW",
             "GetFileAttributesW",
+            "GetFinalPathNameByHandleW",
+            "GetFullPathNameA",
+            "GetFullPathNameW",
+            "GetTempPathW",
             "GetVolumeInformationW",
             "MoveFileExA",
             "MoveFileExW",
@@ -1831,13 +2287,18 @@ mod tests {
         ];
         // The API sets are the ones the functions' reference pages name.
         const API_SETS: &[(&str, &str)] = &[
+            ("api-ms-win-core-file-l1-2-2.dll", "GetFullPathNameW"),
+            (
+                "api-ms-win-core-file-l1-2-2.dll",
+                "GetFinalPathNameByHandleW",
+            ),
             ("api-ms-win-core-file-l2-1-2.dll", "CopyFileW"),
             ("api-ms-win-core-kernel32-legacy-l1-1-0.dll", "CopyFileW"),
             ("api-ms-win-core-kernel32-legacy-l1-1-0.dll", "MoveFileW"),
             ("api-ms-win-core-kernel32-legacy-l1-1-0.dll", "MoveFileExA"),
             (
                 "api-ms-win-core-processenvironment-l1-2-0.dll",
-                "SetCurrentDirectoryW",
+                "GetCurrentDirectoryW",
             ),
         ];
         let resolver = crate::HleResolver::default();
