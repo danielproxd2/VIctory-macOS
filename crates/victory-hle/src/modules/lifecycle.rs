@@ -1047,8 +1047,13 @@ mod tests {
         assert!(printed.contains("SUSPENDED quiesced=1"), "{all}");
         assert!(!printed.contains("STILL RUNNING"), "{all}");
         assert_eq!(status.code(), Some(0), "{all}");
+        // The facts, not the wording: which other fields the line carries,
+        // and in what order, is the log's business.
+        let suspending = logged
+            .lines()
+            .find(|line| line.contains("window closed: suspending the title"));
         assert!(
-            logged.contains("window closed: suspending the title routines=1"),
+            suspending.is_some_and(|line| line.split(' ').any(|field| field == "routines=1")),
             "{all}"
         );
         assert!(
