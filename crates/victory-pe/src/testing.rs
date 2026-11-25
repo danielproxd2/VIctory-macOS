@@ -526,18 +526,22 @@ impl PeBuilder {
     }
 
     /// Descriptors, then every IAT (contiguous, as the IAT directory wants),
-    /// then per DLL its name table, hint/name entries and name.
+    /// then per DLL its name table, hint/name entries and name. Thunk
+    /// tables are 8-byte aligned, as linkers place them.
     fn import_section(&self, rva: u32, dirs: &mut Dirs) -> Result<Vec<u8>, BuildError> {
         const DESCRIPTOR: usize = 20;
         let mut b = Blob::new(rva);
         let table = b.zeros(table_len(self.imports.len(), DESCRIPTOR)?)?;
         let table_end = b.here()?;
+        b.align(8)?;
+        let iat_start = b.here()?;
         let mut iats = Vec::with_capacity(self.imports.len());
         for m in &self.imports {
             iats.push(b.zeros(table_len(m.symbols.len(), 8)?)?);
         }
         let iat_end = b.here()?;
         for (i, (m, &iat)) in self.imports.iter().zip(&iats).enumerate() {
+            b.align(8)?;
             let int = b.zeros(table_len(m.symbols.len(), 8)?)?;
             for (j, symbol) in m.symbols.iter().enumerate() {
                 let thunk = thunk(&mut b, symbol)?;
@@ -551,18 +555,20 @@ impl PeBuilder {
             b.set_u32(desc, 16, iat)?; // FirstThunk
         }
         dirs[dir::IMPORT] = (table, table_end - table);
-        dirs[dir::IAT] = (table_end, iat_end - table_end);
+        dirs[dir::IAT] = (iat_start, iat_end - iat_start);
         Ok(b.bytes)
     }
 
     /// `IMAGE_DELAYLOAD_DESCRIPTOR`s, then per DLL its module handle slot,
-    /// IAT, name table, hint/name entries and name.
+    /// IAT, name table, hint/name entries and name. The slot and the
+    /// tables are 8-byte aligned.
     fn delay_section(&self, rva: u32, dirs: &mut Dirs) -> Result<Vec<u8>, BuildError> {
         const DESCRIPTOR: usize = 32;
         let mut b = Blob::new(rva);
         let table = b.zeros(table_len(self.delay_imports.len(), DESCRIPTOR)?)?;
         let table_end = b.here()?;
         for (i, m) in self.delay_imports.iter().enumerate() {
+            b.align(8)?;
             let handle = b.zeros(8)?;
             let iat = b.zeros(table_len(m.symbols.len(), 8)?)?;
             let int = b.zeros(table_len(m.symbols.len(), 8)?)?;
@@ -631,6 +637,118 @@ const SECTION_HEADER_SIZE: usize = 40;
 const DIRECTORY_COUNT: usize = 16;
 
 type Dirs = [(u32, u32); DIRECTORY_COUNT];
+
+/// File offset of section header `index` in an image built here, for tests
+/// that overwrite a header field. `None` if the image has fewer sections.
+/// In the 40-byte header, `VirtualSize` is at offset 8, `VirtualAddress` at
+/// 12, `SizeOfRawData` at 16, `PointerToRawData` at 20 and
+/// `Characteristics` at 36.
+pub fn section_header_offset(bytes: &[u8], index: usize) -> Option<usize> {
+    let count = bytes.get(NT_HEADERS + layout::NT_SIGNATURE_SIZE + 2..)?;
+    let count = usize::from(u16::from_le_bytes([*count.first()?, *count.get(1)?]));
+    if index >= count {
+        return None;
+    }
+    index
+        .checked_mul(SECTION_HEADER_SIZE)?
+        .checked_add(SECTION_TABLE)
+}
+
+/// A xorshift64 generator: the whole of the "fuzzer" behind the mutation
+/// tests. The sequence depends on the seed alone, so a failure names an
+/// iteration that fails again on every host and in every build profile.
+#[derive(Debug, Clone)]
+pub struct XorShift64(u64);
+
+impl XorShift64 {
+    /// A generator for `seed`. The state must not be 0, so 0 is replaced.
+    pub fn new(seed: u64) -> Self {
+        XorShift64(if seed == 0 {
+            0x9E37_79B9_7F4A_7C15
+        } else {
+            seed
+        })
+    }
+
+    pub fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+
+    /// A number below `bound`; 0 if `bound` is 0.
+    pub fn below(&mut self, bound: usize) -> usize {
+        match u64::try_from(bound) {
+            // The high bits of xorshift are the better ones.
+            Ok(bound) if bound != 0 => ((self.next_u64() >> 11) % bound) as usize,
+            _ => 0,
+        }
+    }
+}
+
+/// Values that sit on the edges parsers get wrong.
+const EDGE_VALUES: [u64; 16] = [
+    0,
+    1,
+    4,
+    7,
+    8,
+    0x18,
+    0xFFF,
+    0x1000,
+    0x1004,
+    0x7FFF_FFFF,
+    0x8000_0000,
+    0xFFFF_FFE8,
+    0xFFFF_FFF8,
+    0xFFFF_FFFF,
+    0x8000_0000_0000_0000,
+    u64::MAX,
+];
+
+/// Overwrites one to three fields of `bytes` in place: a 1, 2, 4 or 8 byte
+/// little-endian value at a random offset becomes an edge value, a random
+/// one, or the old one moved by a small step. Most offsets are taken from
+/// the first `header_len` bytes and from bytes that are not zero, because
+/// that is where an image keeps its sizes, counts, offsets and pointers.
+pub fn mutate(bytes: &mut [u8], header_len: usize, rng: &mut XorShift64) {
+    if bytes.is_empty() {
+        return;
+    }
+    for _ in 0..1 + rng.below(3) {
+        let mut at = 0;
+        for _ in 0..8 {
+            at = if rng.below(2) == 0 {
+                rng.below(header_len.clamp(1, bytes.len()))
+            } else {
+                rng.below(bytes.len())
+            };
+            if bytes[at] != 0 {
+                break;
+            }
+        }
+        let width = 1usize << rng.below(4);
+        if rng.below(2) == 0 {
+            at -= at % width.min(4);
+        }
+        let Some(field) = bytes.get_mut(at..).and_then(|b| b.get_mut(..width)) else {
+            continue;
+        };
+        let mut old = [0u8; 8];
+        old[..width].copy_from_slice(field);
+        let old = u64::from_le_bytes(old);
+        let new = match rng.below(4) {
+            0 => EDGE_VALUES[rng.below(EDGE_VALUES.len())],
+            1 => rng.next_u64(),
+            2 => old.wrapping_add(1 << rng.below(13)),
+            _ => old.wrapping_sub(1 << rng.below(13)),
+        };
+        field.copy_from_slice(&new.to_le_bytes()[..width]);
+    }
+}
 
 /// One past the largest export ordinal.
 const EXPORT_ORDINAL_END: u64 = 0x1_0000;
@@ -983,6 +1101,107 @@ mod tests {
         assert!(none.tls_directory_rva.is_some());
         assert_eq!(none.tls_callbacks_rva, None);
         assert_eq!(PeBuilder::new().build().unwrap().tls_callbacks_rva, None);
+    }
+
+    /// Linkers align thunk tables and the delay module handle to 8 bytes;
+    /// the parser relies on it, so the builder has to do it too.
+    #[test]
+    fn thunk_tables_are_8_byte_aligned() {
+        let symbol = |name: &str| ImportSymbol::Name {
+            hint: 0,
+            name: name.to_owned(),
+        };
+        // Odd name lengths and two DLLs each: nothing is aligned by luck.
+        let data = PeBuilder::new()
+            .import("a.dll", &[symbol("A"), ImportSymbol::Ordinal(1)])
+            .import("bb.dll", &[symbol("Bb")])
+            .delay_import("c.dll", DELAYLOAD_RVA_BASED, &[symbol("C")])
+            .delay_import("dd.dll", DELAYLOAD_RVA_BASED, &[symbol("Dd")])
+            .build()
+            .unwrap()
+            .bytes;
+        let info = crate::ImageInfo::parse(&data).unwrap();
+        assert_eq!((info.imports.len(), info.delay_imports.len()), (2, 2));
+        for entry in info
+            .imports
+            .iter()
+            .chain(&info.delay_imports)
+            .flat_map(|m| &m.entries)
+        {
+            assert_eq!(entry.iat_slot_rva % 8, 0, "{:?}", entry.symbol);
+        }
+        // Field `field` of descriptor `i` in the table of directory `index`.
+        let read = |index: usize, stride: u32, i: u32, field: usize| {
+            let directory = layout::data_directory_offset(&data, index).unwrap();
+            let table = layout::read_u32(&data, directory).unwrap();
+            let at = info.rva_to_file_offset(table + i * stride).unwrap() as usize;
+            layout::read_u32(&data, at + field).unwrap()
+        };
+        for i in 0..2 {
+            // OriginalFirstThunk of an import descriptor.
+            assert_eq!(read(dir::IMPORT, 20, i, 0) % 8, 0);
+            // ModuleHandleRVA and ImportNameTableRVA of a delay descriptor.
+            let handle = read(dir::DELAY_IMPORT, 32, i, 8);
+            assert_ne!(handle, 0);
+            assert_eq!(handle % 8, 0);
+            assert_eq!(read(dir::DELAY_IMPORT, 32, i, 16) % 8, 0);
+        }
+        let iat = layout::data_directory_offset(&data, dir::IAT).unwrap();
+        assert_eq!(layout::read_u32(&data, iat).unwrap() % 8, 0);
+    }
+
+    #[test]
+    fn section_headers_are_found_by_index() {
+        let data = PeBuilder::new()
+            .section(".text", scn::CODE, &[0xC3; 0x40])
+            .section(".data", scn::DATA, &[1; 0x10])
+            .build()
+            .unwrap()
+            .bytes;
+        let at = section_header_offset(&data, 1).unwrap();
+        assert_eq!(&data[at..at + 5], b".data");
+        assert_eq!(layout::read_u32(&data, at + 8), Some(0x10));
+        assert_eq!(layout::read_u32(&data, at + 12), Some(0x2000));
+        assert_eq!(layout::read_u32(&data, at + 36), Some(scn::DATA));
+        assert_eq!(section_header_offset(&data, 2), None);
+        assert_eq!(section_header_offset(&[], 0), None);
+    }
+
+    #[test]
+    fn mutations_are_reproducible_and_stay_in_bounds() {
+        let original = PeBuilder::new()
+            .section(".text", scn::CODE, &[0xC3; 0x40])
+            .build()
+            .unwrap()
+            .bytes;
+        let run = |seed| {
+            let mut rng = XorShift64::new(seed);
+            let mut all = Vec::new();
+            for _ in 0..200 {
+                let mut bytes = original.clone();
+                mutate(&mut bytes, 0x200, &mut rng);
+                assert_eq!(bytes.len(), original.len());
+                all.push(bytes);
+            }
+            all
+        };
+        let (a, b) = (run(1), run(1));
+        assert_eq!(a, b, "the same seed gives the same mutations");
+        assert_ne!(a, run(2));
+        assert!(a.iter().any(|bytes| *bytes != original));
+        // Known answer for xorshift64 with shifts 13, 7, 17 from state 1.
+        assert_eq!(XorShift64::new(1).next_u64(), 0x4082_2041);
+        assert_ne!(XorShift64::new(0).next_u64(), 0);
+        assert_eq!(XorShift64::new(7).below(0), 0);
+        // Buffers too small for a field are left alone, not indexed past.
+        let mut rng = XorShift64::new(3);
+        for len in 0..9 {
+            let mut small = vec![0xAAu8; len];
+            for _ in 0..50 {
+                mutate(&mut small, 0, &mut rng);
+            }
+            assert_eq!(small.len(), len);
+        }
     }
 
     #[test]
