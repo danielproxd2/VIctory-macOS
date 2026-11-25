@@ -217,7 +217,11 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                         row: i.row,
                         channel,
                     };
-                    loaded.push((Reg::V(i.vgpr + channel), input));
+                    // The first VGPR is a byte of the title's stage data.
+                    let vgpr = i.vgpr.checked_add(channel).ok_or(ShaderError::Malformed(
+                        "a vertex input past the vector registers",
+                    ))?;
+                    loaded.push((Reg::V(vgpr), input));
                 }
             }
             (loaded, &[][..], &outputs[..])
@@ -564,6 +568,46 @@ mod tests {
             },
             code: vec![],
         }
+    }
+
+    /// A vertex input's channels arrive in consecutive VGPRs from the one
+    /// its stage data names, a byte. Channel 3 of an input at v254 would be
+    /// v257: the sum overflowed (a panic with overflow checks, v1 without;
+    /// found by random-input testing). There is no such register, so the
+    /// stage data is malformed.
+    #[test]
+    fn a_vertex_input_past_the_vector_registers_is_malformed() {
+        let vertex = |vgpr: u8, mask: u8| NativeProgram {
+            io: StageIo::Vs {
+                inputs: vec![crate::native::VsInput {
+                    usage: Usage::Generic,
+                    row: 0,
+                    mask,
+                    vgpr,
+                }],
+                outputs: vec![],
+            },
+            ..pixel(vec![], 0)
+        };
+        // v_mov_b32 v4, v1 (the register the sum wrapped to); s_endpgm.
+        let p = program(&[0x7E08_0301, S_ENDPGM]);
+        let raise = |vgpr: u8, mask: u8| {
+            let native = NativeProgram {
+                stage: HwStage::Vs,
+                ..vertex(vgpr, mask)
+            };
+            raise(&p, &native).map(|io| io.inputs.len())
+        };
+        let malformed = Err(ShaderError::Malformed(
+            "a vertex input past the vector registers",
+        ));
+        assert_eq!(raise(254, 0b1111), malformed);
+        assert_eq!(raise(255, 0b0010), malformed);
+        // Channels that are not there take no register.
+        assert_eq!(raise(254, 0b0011), Ok(0));
+        assert_eq!(raise(252, 0b1111), Ok(0));
+        // v1 is the y channel of an input at v0.
+        assert_eq!(raise(0, 0b1111), Ok(1));
     }
 
     const TEXCOORD: PsInput = PsInput {
