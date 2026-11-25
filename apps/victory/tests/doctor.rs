@@ -141,6 +141,41 @@ fn doctor_names_the_example_game_dir_and_goes_on() {
     item(&report, "depth bytecode");
 }
 
+/// A problem is the command's exit status 1, on every host: the report is
+/// still whole, and the finding is a line of it, not an error of the
+/// command. check-all.sh reads this status.
+#[test]
+fn doctor_exits_with_1_when_a_line_is_a_problem() {
+    let _device = child_may_make_a_device();
+    let home = tempfile::tempdir().unwrap();
+    let missing = home.path().join("no-such-victory.toml");
+    let out = doctor_command(home.path())
+        .env("VICTORY_CONFIG", &missing)
+        .output()
+        .expect("victory starts");
+    let report = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{report}\n{stderr}");
+    assert!(!stderr.contains("Error:"), "{stderr}");
+
+    let (mark, said) = item(&report, "config file");
+    assert_eq!(mark, "PROBLEM", "{report}");
+    assert!(said.starts_with("cannot be used: "), "{said}");
+    assert!(said.contains("no-such-victory.toml"), "{said}");
+    // The line as it is printed, and the one problem counted.
+    assert!(
+        report
+            .lines()
+            .any(|l| l.starts_with("PROBLEM     config file: ")),
+        "{report}"
+    );
+    assert!(report.contains(", 1 PROBLEM,"), "{report}");
+    // It went on past the problem to the last item.
+    item(&report, "depth bytecode");
+    // Nothing was made for a configuration that cannot be used.
+    assert!(!missing.exists());
+}
+
 /// Under Wine with D3DMetal, or on Windows: the lines about the device are
 /// measurements of the real one.
 #[cfg(windows)]
