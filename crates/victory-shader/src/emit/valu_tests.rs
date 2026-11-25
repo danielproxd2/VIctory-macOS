@@ -157,7 +157,10 @@ pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(()
 /// each 4-dword input set and invokes `check(backend, case_index, inputs, result_dword)`.
 /// A host that is missing is a printed skip, or a failure with
 /// `VICTORY_REQUIRE_GPU=1` (hardware) or `VICTORY_REQUIRE_WARP=1` (WARP):
-/// with neither host and neither switch, `check` is never called.
+/// with neither host and neither switch, `check` is never called and the
+/// test passes having compared nothing. So a run that is meant to prove
+/// these tests' results must set `VICTORY_REQUIRE_GPU=1`; without it, a
+/// green result says only that the hosts that were there agreed.
 fn run_cases(
     shader: &HostShader,
     cases: &[[u32; 4]],
