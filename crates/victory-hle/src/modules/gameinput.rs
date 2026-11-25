@@ -1053,12 +1053,23 @@ extern "system" fn raw_feature(_: *const Device, id: u32, out: Out) -> HRESULT {
     tracing::warn!(id, "raw input device features not implemented");
     fail(out, E_NOTIMPL)
 }
+/// `AcquireExclusiveRawDeviceAccess`, which the v0 interface declares
+/// `bool` (no page of the current public reference has it): raw device
+/// access is not implemented, so it is never acquired. `E_NOTIMPL` in the
+/// result register would read as `true`, its low byte being 1.
+extern "system" fn acquire_exclusive_raw_access(_: *const Device, _timeout: u64) -> bool {
+    tracing::warn!("exclusive raw input device access not implemented");
+    false
+}
 // The remaining device methods are in no page of the current public
 // reference (battery state, haptic motor state, input synchronization,
-// power off, raw output with response, raw I/O control and exclusive raw
-// access were removed after GameInput v0), so nothing establishes what
-// they answer. They write nothing and return `E_NOTIMPL` in the result
-// register, also where the method is declared `void` or `bool`
+// power off, raw output with response and raw I/O control were removed
+// after GameInput v0), so nothing establishes what they answer. They write
+// nothing and return `E_NOTIMPL` in the result register. Where the v0
+// method is declared `void` (battery state 0x28, force feedback gain 0x40,
+// input synchronization 0x58 and 0x60, power off 0x68, releasing exclusive
+// raw access 0xa8) the caller reads no result, so the value says nothing
+// wrong; none of them is declared `bool`
 // (`device_methods_without_a_documented_answer_write_nothing`).
 extern "system" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
     tracing::warn!(
@@ -1089,7 +1100,7 @@ static DEVICE: Table<22> = Table([
     unsupported::<0x88> as *const (),             //
     unsupported::<0x90> as *const (),             //
     unsupported::<0x98> as *const (),             //
-    unsupported::<0xa0> as *const (),             // exclusive raw access
+    acquire_exclusive_raw_access as *const (),    // 0xa0
     // The v0 interface ends with the release of that access, by the
     // public GameInput.h of that version (not in the online reference):
     // without a slot a call would run whatever follows the table.
@@ -1785,8 +1796,8 @@ mod tests {
         let (hub, _host) = fake();
         for device in &hub.devices {
             let device = device as *const Device;
-            // The whole result register, as a title's `bool` test may read
-            // more than the low byte.
+            // A `bool` is the low byte of the result register; the rest
+            // of the register is not part of the answer.
             type Powered = extern "system" fn(*const Device, u32) -> usize;
             let powered = slot::<Powered, _>(device, 0x38);
             for motor in [0, 1, u32::MAX] {
@@ -1846,7 +1857,7 @@ mod tests {
         assert_eq!(response as usize, 0x1234);
         // Scalar arguments only, or none.
         type Scalar = extern "system" fn(*const Device, u64) -> HRESULT;
-        for at in [0x40, 0x48, 0x58, 0x60, 0x68, 0x98, 0xa0, 0xa8] {
+        for at in [0x40, 0x48, 0x58, 0x60, 0x68, 0x98, 0xa8] {
             assert_eq!(
                 slot::<Scalar, _>(device, at)(device, 0),
                 E_NOTIMPL,
@@ -1855,6 +1866,67 @@ mod tests {
         }
         // None of it reached the host.
         assert!(host.lock().unwrap().rumble.is_empty());
+    }
+
+    /// `AcquireExclusiveRawDeviceAccess` returns `bool`: access that is
+    /// not implemented is not acquired, whatever the time-out. As a title
+    /// reads it, the low byte of the result register.
+    #[test]
+    fn exclusive_raw_device_access_is_never_acquired() {
+        let (hub, host) = fake();
+        type Acquire = extern "system" fn(*const Device, u64) -> usize;
+        for device in &hub.devices {
+            let device = device as *const Device;
+            let acquire = slot::<Acquire, _>(device, 0xa0);
+            for timeout in [0, 1_000, u64::MAX] {
+                assert_eq!(acquire(device, timeout) & 0xff, 0, "time-out {timeout}");
+            }
+        }
+        assert!(host.lock().unwrap().rumble.is_empty());
+    }
+
+    /// No method that returns `bool` answers with an `HRESULT`: a failure
+    /// code's low byte is not zero for most codes (`E_NOTIMPL` ends in
+    /// 01), so it would read as `true`. The `bool` methods of the three
+    /// interfaces, by the public v0 header: unregistering a callback,
+    /// the force feedback motor's power, exclusive raw access, and a
+    /// reading's raw report and per-kind states.
+    #[test]
+    fn no_bool_method_answers_with_a_failure_code() {
+        let (hub, host) = fake();
+        host.lock().unwrap().pads[0] = Some(PadState::default());
+        hub.poll();
+        let this: This = &hub.object;
+        // IGameInput::UnregisterCallback for a token that never existed:
+        // nothing of it runs, so there is nothing to wait for.
+        type Unregister = extern "system" fn(This, u64, u64) -> usize;
+        assert_eq!(slot::<Unregister, _>(this, 0x68)(this, 0x7777, 0) & 0xff, 1);
+
+        let device = &hub.devices[0] as *const Device;
+        type OfDevice = extern "system" fn(*const Device, u64) -> usize;
+        for at in [0x38, 0xa0] {
+            let answer = slot::<OfDevice, _>(device, at)(device, 0);
+            assert_eq!(answer & 0xff, 0, "device slot {at:#x}");
+        }
+
+        // A keyboard reading has none of the other kinds' states, and no
+        // state call writes to its output.
+        type Current = extern "system" fn(This, u32, *const Device, Out) -> HRESULT;
+        let mut reading = std::ptr::null();
+        let keyboard = &hub.devices[KEYBOARD] as *const Device;
+        assert_eq!(
+            slot::<Current, _>(this, 0x20)(this, KEYBOARD_KIND, keyboard, &mut reading),
+            S_OK
+        );
+        let reading = reading as *const Reading;
+        type State = extern "system" fn(*const Reading, *mut [u8; 64]) -> usize;
+        for at in [0x38, 0x80, 0x98, 0xa0, 0xa8, 0xb0, 0xb8, 0xc0] {
+            let mut state = [0xa5_u8; 64];
+            let answer = slot::<State, _>(reading, at)(reading, &mut state);
+            assert_eq!(answer & 0xff, 0, "reading slot {at:#x}");
+            assert_eq!(state, [0xa5; 64], "reading slot {at:#x}");
+        }
+        slot::<extern "system" fn(*const Reading) -> u32, _>(reading, 0x10)(reading);
     }
 
     #[test]
