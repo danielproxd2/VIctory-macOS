@@ -653,6 +653,7 @@ dependencies = [
  "memchr",
  "miniz_oxide",
  "tempfile",
+ "tracing",
  "victory-core",
  "victory-game",
  "victory-gpu",

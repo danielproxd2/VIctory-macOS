@@ -11,6 +11,7 @@ pub fn run(file: &Path, list_imports: bool, list_exports: bool, out: &mut dyn Wr
     let info = ImageInfo::parse(&data).with_context(|| format!("parsing {}", file.display()))?;
 
     writeln!(out, "file           {}", file.display())?;
+    writeln!(out, "file size      {} bytes", data.len())?;
     writeln!(out, "blake3         {}", blake3::hash(&data).to_hex())?;
     if let Some(cv) = &info.codeview {
         writeln!(

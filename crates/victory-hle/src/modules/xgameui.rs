@@ -1,6 +1,6 @@
 //! System dialogs a title opens (XGameUi). A profile card has nothing to
 //! show and closes at once. Text entry opens a small host dialog (title,
-//! description, default text, the length limit) on a thread of its own and
+//! description, default text, the console's length limit) on a thread of its own and
 //! completes the call with what the user typed, or as cancelled (`E_ABORT`)
 //! when the dialog is dismissed or cannot open. A message dialog is a host
 //! dialog too, with the title's buttons: the call completes with the
@@ -66,11 +66,12 @@ extern "system" fn text_entry_async(
     title: *const c_char,
     description: *const c_char,
     default: *const c_char,
-    _scope: u32,
+    scope: u32,
     max_length: u32,
 ) -> HRESULT {
     let [title, description, default] =
         [title, description, default].map(|t| text(t).unwrap_or_default());
+    let max_length = max_length_for(scope, max_length);
     tracing::info!(title, description, max_length, "text entry");
     xasync::pending_with(block, (&raw const TEXT).cast(), move || {
         match ask(&title, &description, &default, max_length) {
@@ -239,12 +240,24 @@ extern "system" fn notification_position(_: This, position: u32) -> HRESULT {
     S_OK
 }
 
-/// At most `max` characters (0: no limit).
-fn limit(typed: &str, max: u32) -> String {
-    match max {
-        0 => typed.to_owned(),
-        max => typed.chars().take(max as usize).collect(),
+/// The console's most characters for a text entry.
+const MAX_LENGTH: u32 = 1024;
+/// `XGameUiTextEntryInputScope::Password`.
+const PASSWORD: u32 = 31;
+
+/// The limit the console applies, as documented: the title's, at most
+/// 1024; 1024 for 0 and for a password, whatever the title asks.
+fn max_length_for(scope: u32, max: u32) -> u32 {
+    if max == 0 || scope == PASSWORD {
+        MAX_LENGTH
+    } else {
+        max.min(MAX_LENGTH)
     }
+}
+
+/// At most `max` characters.
+fn limit(typed: &str, max: u32) -> String {
+    typed.chars().take(max as usize).collect()
 }
 
 /// Asks the user in a modal host dialog; `None` if dismissed.
@@ -621,10 +634,11 @@ mod dialog {
                     0 // focus set here
                 }
                 wm::WM_COMMAND => {
-                    let entry = wm::GetWindowLongPtrW(dialog, wm::GWLP_USERDATA) as *mut Entry;
-                    let Some(entry) = entry.as_mut() else {
-                        return 0; // before WM_INITDIALOG
-                    };
+                    let user_data = wm::GetWindowLongPtrW(dialog, wm::GWLP_USERDATA);
+                    if user_data == 0 {
+                        return 0;
+                    }
+                    let entry = &mut *(user_data as *mut Entry);
                     match (wparam & 0xffff) as i32 {
                         wm::IDOK => {
                             let mut buffer =
@@ -772,6 +786,19 @@ mod dialog {
         };
         let template = ask_template(title, description, default);
         Hidden::create(&template, procedure, entry)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn command_before_init_is_ignored() {
+            assert_eq!(
+                procedure(std::ptr::null_mut(), wm::WM_COMMAND, wm::IDOK as WPARAM, 0,),
+                0
+            );
+        }
     }
 }
 
@@ -1309,5 +1336,47 @@ mod tests {
         let presser = press(&title, IDCANCEL);
         assert_eq!(dialog::ask(&title, "Description", "default", 16), None);
         assert!(presser.join().unwrap());
+    }
+
+    /// 0 and limits over 1024 mean 1024; a password ignores the title's.
+    #[test]
+    fn text_entry_limits_follow_the_console() {
+        assert_eq!(max_length_for(0, 0), 1024);
+        assert_eq!(max_length_for(0, 5000), 1024);
+        assert_eq!(max_length_for(0, 16), 16);
+        assert_eq!(max_length_for(PASSWORD, 8), 1024);
+
+        type Entry = extern "system" fn(
+            This,
+            *mut AsyncBlock,
+            *const c_char,
+            *const c_char,
+            *const c_char,
+            u32,
+            u32,
+        ) -> HRESULT;
+        type Size = extern "system" fn(This, *mut AsyncBlock, *mut u32) -> HRESULT;
+        type Result_ =
+            extern "system" fn(This, *mut AsyncBlock, u32, *mut c_char, *mut u32) -> HRESULT;
+        let this: This = &OBJECT;
+        let entry = method::<Entry>(&OBJECT, 0x88);
+        let null = std::ptr::null();
+        let long = std::ffi::CString::new("a".repeat(2000)).unwrap();
+        for (scope, max, default, expect) in [
+            (0, 0, long.as_ptr(), 1025),
+            (PASSWORD, 8, c"abc".as_ptr(), 9),
+        ] {
+            let mut b = block();
+            let title = c"Type".as_ptr();
+            assert_eq!(entry(this, &mut b, title, null, default, scope, max), S_OK);
+            assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
+            let mut size = 0;
+            assert_eq!(method::<Size>(&OBJECT, 0x90)(this, &mut b, &mut size), S_OK);
+            assert_eq!(size, expect, "scope {scope}, max {max}");
+            let mut out = vec![0 as c_char; size as usize];
+            let result = method::<Result_>(&OBJECT, 0x98);
+            let used = std::ptr::null_mut();
+            assert_eq!(result(this, &mut b, size, out.as_mut_ptr(), used), S_OK);
+        }
     }
 }

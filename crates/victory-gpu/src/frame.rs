@@ -110,10 +110,12 @@ impl<T: Time> Pacer<T> {
     }
 
     /// The next tick after now and after the last one a wait for `kind`
-    /// ended on (an event happens once per tick: a wait woken a little
-    /// early must not let the next one end on the same tick), and how long
-    /// until it.
-    fn next_tick(&self, kind: u32) -> (u64, Duration) {
+    /// took (an event happens once per tick: a wait woken a little early
+    /// must not let the next one end on the same tick), and how long until
+    /// it. A wait that comes within `limit` takes the tick here, under the
+    /// clock's lock, so two threads waiting for one kind never take the
+    /// same tick.
+    fn next_tick(&self, kind: u32, limit: Duration) -> (u64, Duration) {
         let now = self.time.now();
         let mut clock = self.clock();
         let c = clock.get_or_insert_with(|| Clock {
@@ -126,10 +128,11 @@ impl<T: Time> Pacer<T> {
         let tick = (c.first + (elapsed / interval + 1) as u64)
             .max(self.last(kind).load(Ordering::Relaxed) + 1);
         let at = u128::from(tick - c.first) * interval;
-        (
-            tick,
-            Duration::from_nanos(at.saturating_sub(elapsed) as u64),
-        )
+        let wait = Duration::from_nanos(at.saturating_sub(elapsed) as u64);
+        if wait <= limit {
+            self.last(kind).fetch_max(tick, Ordering::Relaxed);
+        }
+        (tick, wait)
     }
 
     /// Blocks until the next tick (or the time-out); an origin wait then
@@ -138,14 +141,15 @@ impl<T: Time> Pacer<T> {
     /// comes back late (the thread was not run) leaves the ticks it slept
     /// through unused, and the next wait ends on the first tick after it.
     fn wait(&self, kind: u32, timeout_ms: u32, flags: u32) -> (HRESULT, Option<u64>) {
-        let (tick, wait) = self.next_tick(kind);
         let limit = Duration::from_millis(u64::from(timeout_ms));
+        // The tick is only logged (diagnostics); taking it is what counts.
+        #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
+        let (tick, wait) = self.next_tick(kind, limit);
         let hr = if wait > limit {
             self.time.sleep(limit);
             TIMEOUT
         } else {
             self.time.sleep(wait);
-            self.last(kind).fetch_max(tick, Ordering::Relaxed);
             S_OK
         };
         // A frame begun on a time-out takes no tick: its flip still does.
@@ -331,7 +335,7 @@ mod tests {
             [(5, 13 * MS), (6, 18 * MS), (7, 23 * MS), (8, 28 * MS)]
         );
         // Even when a flip wait begins on the tick another just ended on.
-        assert_eq!(p.next_tick(FLIP), (9, 5 * MS));
+        assert_eq!(p.next_tick(FLIP, Duration::ZERO), (9, 5 * MS));
     }
 
     /// A sleep may end before its time (timers are coarse). The wait still
@@ -346,9 +350,9 @@ mod tests {
         assert_eq!((p.now(), p.ended_on(FLIP)), (4 * MS, 1));
         // By the clock tick 1 is still ahead: another kind's event at it
         // has not been waited for and is 1 ms away.
-        assert_eq!(p.next_tick(VBLANK), (1, MS));
+        assert_eq!(p.next_tick(VBLANK, Duration::ZERO), (1, MS));
         // The flip's is tick 2.
-        assert_eq!(p.next_tick(FLIP), (2, 6 * MS));
+        assert_eq!(p.next_tick(FLIP, Duration::ZERO), (2, 6 * MS));
         assert_eq!(p.wait(FLIP, u32::MAX, 0), (S_OK, None));
         assert_eq!((p.now(), p.ended_on(FLIP)), (10 * MS, 2));
     }
@@ -374,7 +378,7 @@ mod tests {
         // Asked to sleep to 10 ms, run again at 22 ms: past ticks 3 and 4.
         assert_eq!(frame(12 * MS), (Some(2), 2, 22 * MS));
         // The next flip is tick 5 at 25 ms, 3 ms away, not tick 3 at once.
-        assert_eq!(p.next_tick(FLIP), (5, 3 * MS));
+        assert_eq!(p.next_tick(FLIP, Duration::ZERO), (5, 3 * MS));
         assert_eq!(frame(on_time), (Some(3), 5, 25 * MS));
         assert_eq!(frame(on_time), (Some(4), 6, 30 * MS));
         // Late by less than an interval: the very next tick, on time.
@@ -417,7 +421,7 @@ mod tests {
         for _ in 0..4 {
             let _ = wait(null, ORIGIN, 0, list, TOKEN_ON_TIMEOUT, &mut token);
             let frame = token;
-            let (tick, _) = PACER.next_tick(FLIP);
+            let (tick, _) = PACER.next_tick(FLIP, Duration::ZERO);
             assert_eq!(wait(null, FLIP, u32::MAX, list, 0, &mut token), S_OK);
             assert_eq!(token, frame, "a flip wait keeps the title's token");
             let flip = PACER.ended_on_flip();
@@ -439,5 +443,19 @@ mod tests {
         fn ended_on_flip(&self) -> u64 {
             self.last(FLIP).load(Ordering::Relaxed)
         }
+    }
+
+    /// Two waits for one kind that begin together (two threads) take two
+    /// ticks: the first takes its tick before it sleeps. A time-out takes
+    /// none. The old code marked the tick after the sleep, so both got it.
+    #[test]
+    fn waits_begun_together_take_different_ticks() {
+        let p = Pacer::stepped();
+        let long = Duration::from_secs(1);
+        let (first, _) = p.next_tick(VBLANK, long);
+        let (second, _) = p.next_tick(VBLANK, long);
+        assert!(second > first, "{second} after {first}");
+        p.next_tick(VBLANK, Duration::ZERO);
+        assert_eq!(p.ended_on(VBLANK), second);
     }
 }

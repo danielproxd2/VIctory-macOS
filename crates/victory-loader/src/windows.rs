@@ -242,40 +242,26 @@ impl ImportResolver for WithTitleDlls<'_> {
 /// the same bytes at the same moment (the name says what is in the file),
 /// or may have the file mapped already.
 fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<()> {
-    let there = || std::fs::read(path).is_ok_and(|existing| existing == bytes);
-    if there() {
-        return Ok(());
-    }
-    // Written under a name no other writer has, then renamed, so that the
-    // file at `path` is whole at every moment: two writers that shared one
-    // temporary file wrote into each other's, and one of them then renamed
-    // a file the other was still writing.
-    static WRITES: AtomicU64 = AtomicU64::new(0);
-    let unique = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = path.with_extension(format!("{}-{unique}.tmp", std::process::id()));
-    std::fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
+    // Each try stages into a file of its own and renames it into place
+    // (see `publish`), so the file at `path` is whole at every moment.
+    //
     // A file that is open or mapped elsewhere may refuse to be replaced.
     // That is no failure once it holds these bytes, and a reader that was
     // comparing it is gone a moment later.
+    let there = || std::fs::read(path).is_ok_and(|existing| existing == bytes);
     let mut tries = 0;
-    let renamed = loop {
-        match std::fs::rename(&tmp, path) {
-            Err(_) if there() => {
-                let _ = std::fs::remove_file(&tmp);
-                break Ok(());
-            }
+    let published = loop {
+        match crate::publish::write_if_changed(path, bytes) {
+            Ok(()) => break Ok(()),
+            Err(_) if there() => break Ok(()),
             Err(_) if tries < RENAME_TRIES => {
                 tries += 1;
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            Err(error) => {
-                let _ = std::fs::remove_file(&tmp);
-                break Err(error);
-            }
-            Ok(()) => break Ok(()),
+            Err(error) => break Err(error),
         }
     };
-    renamed.with_context(|| format!("renaming to {}", path.display()))
+    published.with_context(|| format!("publishing {}", path.display()))
 }
 
 /// How often [`write_if_changed`] tries again to replace a file in use.

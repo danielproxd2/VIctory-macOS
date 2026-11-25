@@ -70,6 +70,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        view_marks: false,
     })
     .expect("lower");
     // One access with each lane's own heap index, no wave operation.
@@ -83,14 +84,23 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        memory: lowered.memory,
+        memory_writes: lowered.memory_writes,
+        view_addresses: lowered.view_addresses,
+        heap: lowered.heap,
+        heap_writes: lowered.heap_writes,
+        view_marks: lowered.view_marks,
     };
     validator::check(&shader.dxil);
     shader
 }
 
 /// Runs `shader` with `views` at heap indices 0.. (the UAV last) on the
-/// hardware GPU and on WARP (each a printed skip without a device) and returns,
-/// per one that ran, the UAV's 32 dwords.
+/// hardware GPU and on WARP (each a printed skip without a device, or a
+/// failure with its `VICTORY_REQUIRE_*` switch), returning the UAV's 32
+/// dwords for each device that ran. At least one device must produce a
+/// readback.
 fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
     let samplers = [D3D12_SAMPLER_DESC {
         Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
@@ -132,6 +142,10 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
         out.push((label, words[0].clone()));
     }
+    assert!(
+        !out.is_empty(),
+        "neither hardware nor WARP SM 6.6 device available"
+    );
     out
 }
 
@@ -215,9 +229,7 @@ fn lanes_load_from_the_buffer_their_nested_arms_chose() {
 fn lanes_sample_the_entry_their_offset_names_in_the_console_waterfall() {
     use crate::resource::tests::WATERFALL_INDEXED_WAVE32;
     let shader = build(WATERFALL_INDEXED_WAVE32, false);
-    let results = sampled(&shader);
-    assert!(!results.is_empty());
-    for (label, red) in results {
+    for (label, red) in sampled(&shader) {
         // Even lanes hold entry 0's offset, odd lanes entry 1's.
         let want: Vec<f32> = (0..32).map(|l| [1.0, 2.0][l & 1]).collect();
         assert_eq!(red, want, "{label}");
@@ -231,9 +243,7 @@ fn lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx() {
     let want: Vec<f32> = (0..32).map(|l| if l < 16 { 1.0 } else { 2.0 }).collect();
     for folded in [false, true] {
         let shader = build(&cmpx_waterfall(false, folded), false);
-        let results = sampled(&shader);
-        assert!(!results.is_empty());
-        for (label, red) in results {
+        for (label, red) in sampled(&shader) {
             assert_eq!(red, want, "{label}, folded {folded}");
         }
     }

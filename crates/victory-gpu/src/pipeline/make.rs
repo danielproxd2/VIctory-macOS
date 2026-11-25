@@ -11,11 +11,14 @@
 //! frame, so the cheap ones (menus, one-off passes such as a colour-grading
 //! bake) are there at once as before; past the budget a draw or dispatch
 //! whose pipeline is not ready is dropped, as an untranslated one is.
+//! Pipelines a draw waits for go ahead of those started early (at the
+//! title's creation, because an earlier run drew them).
 //!
 //! shortcut: the budget (half a second of waiting per title frame) is a
 //! guess; a pass the title runs only once and whose pipeline takes longer
 //! is lost.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -28,15 +31,19 @@ pub(crate) struct Pending {
     shaders: Vec<Arc<Shader>>,
     pub(crate) graphics: Option<Box<GraphicsState>>,
     queued: AtomicBool,
+    /// Whether it went into the queue of pipelines a draw waits for, and
+    /// whether a worker took it (it may be in both queues).
+    now: AtomicBool,
+    taken: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw has used it yet.
-    key: String,
+    pub(crate) key: String,
     used: AtomicBool,
     /// Makes [`Pending::make`] panic where the host pipeline would be made.
     #[cfg(test)]
     panics: AtomicBool,
-    /// Makes a worker's turn ([`work`]) panic after the pipeline is made,
+    /// Makes a worker's turn ([`turn`]) panic after the pipeline is made,
     /// outside what [`Pending::make`] contains.
     #[cfg(test)]
     panics_later: AtomicBool,
@@ -53,24 +60,20 @@ unsafe impl Sync for Pending {}
 
 impl Pending {
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
-        let mut key = blake3::Hasher::new();
-        for s in &shaders {
-            key.update(s.stage.as_bytes());
-            key.update(s.hash.as_bytes());
-        }
-        key.update(
-            graphics
-                .as_ref()
-                .map(|g| g.describe())
-                .unwrap_or_default()
-                .as_bytes(),
-        );
+        let key = key(&shaders, graphics.as_deref());
+        #[cfg(feature = "diagnostics")]
+        log("created", &key, || {
+            let state = graphics.as_ref().map(|g| g.describe()).unwrap_or_default();
+            format!("{shaders:?}\t{state}")
+        });
         Pending {
+            key,
             shaders,
             graphics,
             queued: AtomicBool::new(false),
+            now: AtomicBool::new(false),
+            taken: AtomicBool::new(false),
             made: OnceLock::new(),
-            key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
             #[cfg(test)]
             panics: AtomicBool::new(false),
@@ -90,13 +93,20 @@ impl Pending {
     /// This relies on panics unwinding (no profile of the workspace sets
     /// `panic = "abort"`; with it nothing here is contained).
     fn make(&self) {
+        // (Not `OnceLock::get_or_init`: it would leave the cell empty after
+        // a panic. One thread makes a pipeline: a worker that took it, or
+        // the queueing thread without workers.)
         if self.made.get().is_none() {
+            let (started, cpu) = (Instant::now(), super::thread_cpu());
             let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 #[cfg(test)]
                 if self.panics.load(Ordering::Relaxed) {
                     panic!("test: making a host pipeline panics");
                 }
-                HostPipeline::new(&self.shaders, self.graphics.as_deref())
+                let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+                #[cfg(feature = "diagnostics")]
+                log_built(&self.key);
+                made
             }))
             .unwrap_or_else(|_| {
                 tracing::warn!(
@@ -106,19 +116,42 @@ impl Pending {
                 );
                 None
             });
+            let (user, kernel) = super::thread_cpu_since(cpu);
+            tracing::debug!(
+                shaders = ?self.shaders,
+                ms = started.elapsed().as_millis() as u64,
+                user_ms = user,
+                kernel_ms = kernel,
+                "pipeline made"
+            );
             // Before `made`: a test that sees the pipeline made reads this.
             #[cfg(test)]
             let _ = self
                 .made_by
                 .set(std::thread::current().name().unwrap_or("").to_owned());
-            // `OnceLock::get_or_init` would leave the cell empty after a
-            // panic; this fills it either way.
             let _ = self.made.set(made);
         }
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
     }
+}
+
+/// What identifies a title pipeline across runs: its shader containers
+/// and graphics state.
+pub(crate) fn key(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) -> String {
+    let mut key = blake3::Hasher::new();
+    for s in shaders {
+        key.update(s.stage.as_bytes());
+        key.update(s.hash.as_bytes());
+    }
+    key.update(
+        graphics
+            .map(|g| g.describe())
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    key.finalize().to_hex()[..32].to_owned()
 }
 
 /// Why a pipeline has no host pipeline (diagnostics): its shaders that do
@@ -144,6 +177,45 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
     }
 }
 
+/// Logs the library name of the host pipeline this thread just made or
+/// loaded for `key` (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn log_built(key: &str) {
+    if let Some((name, loaded)) = super::library::LAST.take() {
+        log("built", key, || {
+            format!("{name}\t{}", if loaded { "loaded" } else { "made" })
+        });
+    }
+}
+
+/// `VICTORY_PIPELINE_LOG=<file>` (diagnostics): a line per title pipeline
+/// key created (`created`, its shaders, its state as described) and first
+/// drawn or dispatched with (`used`), and its host pipeline's library name
+/// once made or loaded (`built`, also from the pre-build), to compare what
+/// a run creates with what the pre-build makes.
+#[cfg(feature = "diagnostics")]
+fn log(what: &str, key: &str, rest: impl FnOnce() -> String) {
+    use std::collections::HashSet;
+    use std::io::Write;
+    static LOG: Mutex<Option<(std::fs::File, HashSet<String>)>> = Mutex::new(None);
+    static PATH: OnceLock<Option<std::ffi::OsString>> = OnceLock::new();
+    let Some(path) = PATH.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_LOG")) else {
+        return;
+    };
+    let mut log = LOG.lock().unwrap_or_else(|e| e.into_inner());
+    if log.is_none() {
+        *log = std::fs::File::create(path)
+            .ok()
+            .map(|f| (f, HashSet::new()));
+    }
+    let Some((file, seen)) = log.as_mut() else {
+        return;
+    };
+    if seen.insert(format!("{what} {key}")) {
+        let _ = writeln!(file, "{what}\t{key}\t{}", rest());
+    }
+}
+
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
@@ -161,34 +233,48 @@ pub(crate) fn waiting() -> u64 {
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+    // Listed for an early start in later runs from its first use, made or
+    // not: one a run never got made is the one it should start early.
+    if !p.used.swap(true, Ordering::Relaxed) {
+        super::library::note_used(&p.key);
+        #[cfg(feature = "diagnostics")]
+        log("used", &p.key, String::new);
+    }
     if p.made.get().is_none() {
-        start(p);
+        start(p, true);
         wait(p, crate::frame::current());
     }
-    let made = p.made.get()?.as_ref();
-    if made.is_some() && !p.used.swap(true, Ordering::Relaxed) {
-        super::library::note_used(&p.key);
-    }
-    made
+    p.made.get()?.as_ref()
 }
 
-/// Queues `p` for the workers, once.
-fn start(p: &Arc<Pending>) {
-    if !p.queued.swap(true, Ordering::Relaxed) {
+/// Queues `p` for the workers: once, and once more ahead of the early
+/// starts if a draw waits for it (`now`) while it is still queued.
+fn start(p: &Arc<Pending>, now: bool) {
+    if let Some(now) = enqueue(p, now) {
+        queue(p.clone(), now);
+    }
+}
+
+/// Which queue `p` goes into now (true: the one draws wait for), if any.
+fn enqueue(p: &Pending, now: bool) -> Option<bool> {
+    let first = !p.queued.swap(true, Ordering::Relaxed);
+    if first {
         PEAK.fetch_max(
             WAITING.fetch_add(1, Ordering::Relaxed) + 1,
             Ordering::Relaxed,
         );
-        queue(p.clone());
     }
+    let ahead = now && !p.now.swap(true, Ordering::Relaxed);
+    (first || ahead && !p.taken.load(Ordering::Relaxed)).then_some(ahead)
 }
 
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
+    super::library::note_created(&p.key);
     if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
-        start(p);
+        start(p, false);
     }
 }
 
@@ -234,10 +320,10 @@ impl Drop for Counted {
     }
 }
 
-/// A worker's turn for one pipeline. Nothing in it ends the worker: a
-/// panic (which [`Pending::make`] already contains for the pipeline
-/// itself) is logged and the worker takes the next pipeline.
-fn work(p: &Pending) {
+/// A worker's turn for one pipeline it took. Nothing in it ends the
+/// worker: a panic (which [`Pending::make`] already contains for the
+/// pipeline itself) is logged and the worker takes the next pipeline.
+fn turn(p: &Pending) {
     let turn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let counted = Counted;
         p.make();
@@ -258,42 +344,77 @@ fn work(p: &Pending) {
     }
 }
 
+/// Pipelines for the workers: those draws wait for, then those started
+/// early.
+static QUEUES: (Mutex<[VecDeque<Arc<Pending>>; 2]>, Condvar) = (
+    Mutex::new([VecDeque::new(), VecDeque::new()]),
+    Condvar::new(),
+);
+
 /// Hands `p` to the workers (half the logical processors, 2 to 8), started
 /// on first use.
-fn queue(p: Arc<Pending>) {
-    static SENDER: OnceLock<std::sync::mpsc::Sender<Arc<Pending>>> = OnceLock::new();
-    let sender = SENDER.get_or_init(|| {
-        let (sender, receiver) = std::sync::mpsc::channel::<Arc<Pending>>();
-        let receiver = Arc::new(Mutex::new(receiver));
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
-        for i in 0..workers {
-            let receiver = receiver.clone();
-            let spawned = std::thread::Builder::new()
-                .name(format!("victory-pipelines-{i}"))
-                .spawn(move || {
-                    // Below the title's own threads (loading, recording).
-                    // SAFETY: a plain call on our own thread.
-                    unsafe {
-                        use windows::Win32::System::Threading::*;
-                        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-                    }
-                    loop {
-                        let next = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
-                        let Ok(p) = next else { return };
-                        work(&p);
-                    }
-                });
-            if let Err(e) = spawned {
-                tracing::warn!(error = %e, "no pipeline worker");
-            }
-        }
-        sender
+fn queue(p: Arc<Pending>, now: bool) {
+    static WORKERS: OnceLock<usize> = OnceLock::new();
+    let workers = *WORKERS.get_or_init(|| {
+        let n = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        (0..n)
+            .filter(|i| {
+                let spawned = std::thread::Builder::new()
+                    .name(format!("victory-pipelines-{i}"))
+                    .spawn(work);
+                if let Err(e) = &spawned {
+                    tracing::warn!(error = %e, "no pipeline worker");
+                }
+                spawned.is_ok()
+            })
+            .count()
     });
-    if let Err(e) = sender.send(p) {
+    if workers == 0 {
         // No worker: made here instead.
-        let counted = Counted;
-        e.0.make();
-        drop(counted);
+        if !p.taken.swap(true, Ordering::Relaxed) {
+            let counted = Counted;
+            p.make();
+            drop(counted);
+        }
+        return;
+    }
+    let (lock, work) = &QUEUES;
+    lock.lock().unwrap_or_else(|e| e.into_inner())[usize::from(!now)].push_back(p);
+    work.notify_one();
+}
+
+/// A worker: makes queued pipelines, those draws wait for first, and saves
+/// the cache when idle (first uses of pipelines made before).
+fn work() {
+    // Below the title's own threads (loading, recording).
+    // SAFETY: a plain call on our own thread.
+    unsafe {
+        use windows::Win32::System::Threading::*;
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
+    let (lock, work) = &QUEUES;
+    loop {
+        let p = {
+            let mut queues = lock.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                if let Some(p) = queues.iter_mut().find_map(VecDeque::pop_front) {
+                    break p;
+                }
+                let (held, waited) = work
+                    .wait_timeout(queues, Duration::from_secs(20))
+                    .unwrap_or_else(|e| e.into_inner());
+                queues = held;
+                if waited.timed_out() {
+                    drop(queues);
+                    super::library::save(false);
+                    queues = lock.lock().unwrap_or_else(|e| e.into_inner());
+                }
+            }
+        };
+        if p.taken.swap(true, Ordering::Relaxed) {
+            continue; // its other queue entry
+        }
+        turn(&p);
     }
 }
 
@@ -318,6 +439,26 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An early start is queued once; a draw waiting for it puts it ahead,
+    /// once, unless a worker has taken it.
+    #[test]
+    fn draws_go_ahead_of_early_starts() {
+        let p = Pending::new(Vec::new(), None);
+        assert_eq!(enqueue(&p, false), Some(false));
+        assert_eq!(enqueue(&p, false), None);
+        assert_eq!(enqueue(&p, true), Some(true));
+        assert_eq!(enqueue(&p, true), None);
+        let q = Pending::new(Vec::new(), None);
+        assert_eq!(enqueue(&q, false), Some(false));
+        q.taken.store(true, Ordering::Relaxed);
+        assert_eq!(enqueue(&q, true), None);
+        let r = Pending::new(Vec::new(), None);
+        assert_eq!(enqueue(&r, true), Some(true));
+        assert_eq!(enqueue(&r, false), None);
+        // Counted as waiting by `enqueue`, never handed to a worker.
+        WAITING.fetch_sub(3, Ordering::Relaxed);
+    }
 
     /// A first use queues the pipeline and, within the budget, gets the
     /// worker's answer (here: no host pipeline for no shaders).
@@ -374,7 +515,7 @@ mod tests {
     /// Whether an ordinary pipeline queued now is made by a worker.
     fn a_worker_is_left() -> Result<(), String> {
         let good = Arc::new(Pending::new(Vec::new(), None));
-        start(&good);
+        start(&good, true);
         if !made_soon(&good) {
             return Err("an ordinary pipeline was never made".into());
         }
@@ -398,7 +539,7 @@ mod tests {
         // 3 x the most workers there can be.
         let bad: Vec<Arc<Pending>> = (0..24).map(|_| panicking()).collect();
         for p in &bad {
-            start(p);
+            start(p, true);
         }
         for (i, p) in bad.iter().enumerate() {
             assert!(made_soon(p), "panicking pipeline {i} was never made");
@@ -410,13 +551,13 @@ mod tests {
 
     /// A panic in a worker's turn outside [`Pending::make`] (after the
     /// pipeline is made, where the turn logs and saves the cache) ends
-    /// neither the worker nor the count of the pipeline: [`work`] contains
+    /// neither the worker nor the count of the pipeline: [`turn`] contains
     /// it and the turn's [`Counted`] guard takes the pipeline off the
     /// count as the panic unwinds. After three times as many such turns
     /// as there can be workers, a worker still makes an ordinary pipeline
     /// and nothing is counted as waiting.
     ///
-    /// Shown by mutation: without the `catch_unwind` in `work` every
+    /// Shown by mutation: without the `catch_unwind` in `turn` every
     /// worker ends at its first such turn and this fails on "never made";
     /// without `Counted`'s `Drop` it fails on the count.
     #[test]
@@ -431,7 +572,7 @@ mod tests {
             })
             .collect();
         for p in &bad {
-            start(p);
+            start(p, true);
         }
         for (i, p) in bad.iter().enumerate() {
             assert!(made_soon(p), "pipeline {i} was never made");

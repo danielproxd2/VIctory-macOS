@@ -5,6 +5,9 @@
 
 mod census;
 mod inspect;
+// The D3D12 runtime it drives is built for Windows only.
+#[cfg(windows)]
+mod prebuild;
 mod run;
 mod shader;
 #[cfg(test)]
@@ -60,15 +63,21 @@ enum Command {
         list: bool,
     },
     /// Find shader containers in files or directories (also inside engine
-    /// archives, if uncompressed) and report their layout.
+    /// archives, if uncompressed) and report their layout. Shader packs
+    /// among the paths are listed last, their stages named from the
+    /// containers found.
     ShaderInfo {
         paths: Vec<PathBuf>,
-        /// Print one line per container found.
+        /// Print one line per container found (and per pack pipeline).
         #[arg(long)]
         verbose: bool,
         /// Also list the decoded native instructions (implies --verbose).
         #[arg(long)]
         disasm: bool,
+        /// Instead list the effects of shader databases: technique, pass,
+        /// shaders (name, container hash, engine hash) and pass state.
+        #[arg(long)]
+        effects: bool,
     },
     /// Run every shader found (containers, SGD5 files) through the
     /// translator and report what it cannot handle yet.
@@ -78,7 +87,10 @@ enum Command {
         /// else the newest Windows SDK's).
         #[arg(long)]
         validate: bool,
-        /// Also create a host D3D12 pipeline for each emitted shader.
+        /// Also create a host D3D12 pipeline for each emitted shader. With
+        /// `--cache`: then make every pipeline of the title's shader pack
+        /// into the host pipeline library `run` reads (on this GPU and
+        /// driver; a second time only what is not there yet).
         #[arg(long)]
         pipelines: bool,
         /// Print one line per program and outcome.
@@ -87,6 +99,11 @@ enum Command {
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
+        /// Only translate into the shader cache `run` reads (the warm-up):
+        /// every container found, once, nothing else checked or listed
+        /// (with `--pipelines`, then the shader pack's pipelines).
+        #[arg(long, conflicts_with_all = ["validate", "list"])]
+        cache: bool,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -128,6 +145,9 @@ enum Console {
 /// An error ends the process with status 1 (and clap, which refuses the
 /// arguments, with 2). A title that ran to the end of its entry point ends
 /// it with what that returned; everything else that succeeds, with 0.
+///
+/// Upstream ends a title's nonzero status with `std::process::exit`; here
+/// it is [`end_with`], for the reason given there.
 fn main() -> Result<()> {
     victory_core::logging::init("info");
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
@@ -137,8 +157,9 @@ fn main() -> Result<()> {
     }
     // Not locked: a running title's threads log while `run` is in here.
     match dispatch(Cli::parse(), &mut std::io::stdout())? {
-        Some(code) => end_with(code),
-        None => Ok(()),
+        0 => Ok(()),
+        // All 32 bits of the Windows process status.
+        code => end_with(code),
     }
 }
 
@@ -159,8 +180,9 @@ fn end_with(code: u32) -> ! {
 }
 
 /// Runs the command; its report goes to `out`. Returns the exit code of
-/// the title, if `run --execute` ran one to the end of its entry point.
-fn dispatch(cli: Cli, out: &mut dyn Write) -> Result<Option<u32>> {
+/// the title `run --execute` ran to the end of its entry point, and 0 for
+/// everything else that succeeds.
+fn dispatch(cli: Cli, out: &mut dyn Write) -> Result<u32> {
     match cli.command {
         Command::Inspect {
             file,
@@ -177,13 +199,22 @@ fn dispatch(cli: Cli, out: &mut dyn Write) -> Result<Option<u32>> {
             paths,
             verbose,
             disasm,
-        } => shader::run(paths, verbose || disasm, disasm, out)?,
+            effects,
+        } => shader::run(paths, verbose || disasm, disasm, effects, out)?,
+        Command::Translate {
+            paths,
+            jobs,
+            pipelines,
+            cache: true,
+            ..
+        } => translate::warm(paths, jobs, pipelines)?,
         Command::Translate {
             paths,
             validate,
             pipelines,
             list,
             jobs,
+            cache: false,
         } => {
             let options = translate::Options {
                 validate,
@@ -193,6 +224,7 @@ fn dispatch(cli: Cli, out: &mut dyn Write) -> Result<Option<u32>> {
                 pairs: translate::Options::pairs_of(
                     &std::env::var("VICTORY_PAIRS").unwrap_or_default(),
                 ),
+                emit_dump: std::env::var_os("VICTORY_EMIT_DUMP").map(PathBuf::from),
             };
             translate::run(paths, &options, out)?
         }
@@ -210,7 +242,7 @@ fn dispatch(cli: Cli, out: &mut dyn Write) -> Result<Option<u32>> {
             out,
         )?,
     }
-    Ok(None)
+    Ok(0)
 }
 
 /// Prints `cfg` in full, then fails if it cannot be used as it is: a path
@@ -242,6 +274,13 @@ fn show_config(
     )?;
     writeln!(out, "cache_dir   : {}", cfg.cache_dir.display())?;
     writeln!(out, "data_dir    : {}", cfg.data_dir.display())?;
+    writeln!(
+        out,
+        "fidelityfx  : {}",
+        cfg.fidelityfx_dir
+            .as_ref()
+            .map_or("(not set)".into(), status)
+    )?;
     for t in &cfg.test_titles {
         writeln!(out, "test_title  : {}", status(t))?;
     }
@@ -407,11 +446,21 @@ mod tests {
             paths,
             verbose: true,
             disasm: true,
+            effects: false,
         }) = parse(&["victory", "shader-info", "dir", "--verbose", "--disasm"])
         else {
             panic!("shader-info with flags")
         };
         assert_eq!(paths, [Path::new("dir")]);
+        assert!(matches!(
+            parse(&["victory", "shader-info", "dir", "--effects"]),
+            Ok(Command::ShaderInfo {
+                verbose: false,
+                disasm: false,
+                effects: true,
+                ..
+            })
+        ));
 
         // translate
         assert!(matches!(
@@ -421,6 +470,7 @@ mod tests {
                 pipelines: false,
                 list: false,
                 jobs: None,
+                cache: false,
                 ..
             })
         ));
@@ -430,6 +480,7 @@ mod tests {
             pipelines: true,
             list: true,
             jobs: Some(3),
+            cache: false,
         }) = parse(&[
             "victory",
             "translate",
@@ -444,6 +495,17 @@ mod tests {
             panic!("translate with flags")
         };
         assert_eq!(paths, [Path::new("dir")]);
+        // The warm-up, alone or with the pipeline pre-build.
+        assert!(matches!(
+            parse(&["victory", "translate", "dir", "--cache", "--pipelines"]),
+            Ok(Command::Translate {
+                validate: false,
+                pipelines: true,
+                list: false,
+                cache: true,
+                ..
+            })
+        ));
 
         // run: the defaults, then every flag.
         let Ok(Command::Run {
@@ -575,6 +637,14 @@ mod tests {
             refused(&["victory", "census", "--list"]),
             ErrorKind::UnknownArgument
         );
+        // The warm-up checks and lists nothing.
+        for with in ["--validate", "--list"] {
+            assert_eq!(
+                refused(&["victory", "translate", "--cache", with]),
+                ErrorKind::ArgumentConflict,
+                "{with}"
+            );
+        }
     }
 
     /// A command's report goes where `dispatch` is told, and its failure
@@ -615,6 +685,7 @@ mod tests {
             cache_dir: root.join("cache"),
             data_dir: root.join("data"),
             test_titles: vec![root.join("titles")],
+            fidelityfx_dir: None,
             source: Some(root.join("victory.toml")),
         }
     }
@@ -659,6 +730,18 @@ mod tests {
         let text = report_of(|out| show_config(&cfg, &outside(&repo), out));
         assert_eq!(line(&text, "config file : "), "config file : (none)");
         assert_eq!(line(&text, "game_dir    : "), "game_dir    : (not set)");
+        assert_eq!(line(&text, "fidelityfx  : "), "fidelityfx  : (not set)");
+
+        // The host's FidelityFX folder is shown like the game directory.
+        let cfg = Config {
+            fidelityfx_dir: Some(tmp.path().join("ffx")),
+            ..cfg
+        };
+        let text = report_of(|out| show_config(&cfg, &outside(&repo), out));
+        assert_eq!(
+            line(&text, "fidelityfx  : "),
+            format!("fidelityfx  : {}  (does not exist)", shown("ffx"))
+        );
     }
 
     #[test]
@@ -778,5 +861,11 @@ mod tests {
             );
             assert_eq!(text, "");
         }
+        // The warm-up fills the caches of the Windows runtime.
+        let cli = Cli::try_parse_from(["victory", "translate", "--cache", folder]).unwrap();
+        let (text, result) = report(|out| dispatch(cli, out).map(drop));
+        let error = result.expect_err("--cache").to_string();
+        assert!(error.starts_with("--cache needs a Windows host"), "{error}");
+        assert_eq!(text, "");
     }
 }

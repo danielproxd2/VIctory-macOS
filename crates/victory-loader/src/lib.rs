@@ -27,6 +27,7 @@ mod crash;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod names;
 pub mod prepare;
+pub(crate) mod publish;
 pub mod resolve;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod stacks;

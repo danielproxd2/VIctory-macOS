@@ -357,23 +357,30 @@ fn manifest_text(bytes: &[u8]) -> Option<String> {
     }
 }
 
-/// Where the tag that `rest` starts with ends (just past its `>`), or why
-/// it does not. A `>` inside a quoted attribute value is part of the
-/// value, as in XML.
-fn tag_end(rest: &str) -> Result<usize, Refusal> {
-    let mut quote = None;
-    for (at, c) in rest.char_indices() {
-        match (quote, c) {
-            (None, '"' | '\'') => quote = Some(c),
-            (Some(open), c) if c == open => quote = None,
-            (None, '>') => return Ok(at + 1),
-            _ => {}
+/// The trimmed text of one element: comments inside it are skipped, not
+/// treated as the end of its value. A manifest generator can write
+/// `<TitleId><!-- generated -->639AA8DD</TitleId>`, which must still give
+/// the title's id rather than an empty field.
+fn field_text(rest: &str) -> String {
+    let mut out = String::new();
+    let mut rest = rest;
+    loop {
+        let Some(open) = rest.find('<') else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..open]);
+        if rest[open..].starts_with("<!--") {
+            let Some(end) = rest[open..].find("-->") else {
+                break;
+            };
+            rest = &rest[open + end + 3..];
+        } else {
+            // A child element, a closing tag or anything else ends the text.
+            break;
         }
     }
-    Err(match quote {
-        Some(_) => Refusal::UnbalancedQuote,
-        None => Refusal::UnclosedTag,
-    })
+    out.trim().to_owned()
 }
 
 /// Each element of an XML text as its path from the root (`Game/TitleId`)
@@ -417,7 +424,7 @@ fn elements(text: &str) -> (Vec<(String, String)>, Option<Refusal>) {
             .next()
             .unwrap_or("");
         path.push(name);
-        let body = rest[..rest.find('<').unwrap_or(rest.len())].trim();
+        let body = field_text(rest);
         let body = [
             ("&lt;", "<"),
             ("&gt;", ">"),
@@ -426,13 +433,33 @@ fn elements(text: &str) -> (Vec<(String, String)>, Option<Refusal>) {
             ("&amp;", "&"),
         ]
         .iter()
-        .fold(body.to_owned(), |b, (entity, c)| b.replace(entity, c));
+        .fold(body, |b, (entity, c)| b.replace(entity, c));
         out.push((path.join("/"), body));
         if closed {
             path.pop();
         }
     }
     (out, None)
+}
+
+/// Where the tag that starts `text` ends, past its `>`; a `>` in a quoted
+/// attribute value is part of the value (XML allows it there unescaped).
+/// A tag that never ends says why: a quote in it that never closes, or
+/// no `>` at all.
+fn tag_end(text: &str) -> Result<usize, Refusal> {
+    let mut quote = None;
+    for (at, c) in text.char_indices() {
+        match (quote, c) {
+            (None, '"' | '\'') => quote = Some(c),
+            (Some(open), _) if c == open => quote = None,
+            (None, '>') => return Ok(at + 1),
+            _ => {}
+        }
+    }
+    Err(match quote {
+        Some(_) => Refusal::UnbalancedQuote,
+        None => Refusal::UnclosedTag,
+    })
 }
 
 static TITLE: Mutex<Option<Title>> = Mutex::new(None);
@@ -484,6 +511,15 @@ pub fn use_console_timers() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_quoted_angle_bracket_does_not_end_its_tag() {
+        let text = "<Game><ShellVisuals DefaultDisplayName=\"A > B\" Description='x>y'/>\
+                    <TitleId>639AA8DD</TitleId>\
+                    <PersistentLocalStorage><SizeMB>64</SizeMB></PersistentLocalStorage></Game>";
+        let t = Title::from_manifest(text);
+        assert_eq!((t.id, t.storage_bytes), (0x639A_A8DD, 64 << 20));
+    }
 
     #[test]
     fn reads_title_id_store_id_and_storage_quota() {
@@ -1025,5 +1061,18 @@ mod tests {
         }
         // The cases reach both outcomes.
         assert!(with_id > 0 && without > 0, "{with_id} {without}");
+    }
+
+    #[test]
+    fn inline_comments_do_not_truncate_a_field() {
+        let text = "<Game>\
+            <TitleId><!-- generated -->639AA8DD</TitleId>\
+            <StoreId>9&amp;<!-- keep -->C</StoreId>\
+            <PersistentLocalStorage><SizeMB><!-- n -->1024</SizeMB></PersistentLocalStorage>\
+            </Game>";
+        let t = Title::from_manifest(text);
+        assert_eq!(t.id, 0x639A_A8DD);
+        assert_eq!(t.store_id, "9&C");
+        assert_eq!(t.storage_bytes, 1024 << 20);
     }
 }
