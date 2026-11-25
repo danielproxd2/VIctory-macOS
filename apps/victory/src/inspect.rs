@@ -186,9 +186,14 @@ mod tests {
         let file = write(dir.path(), "title.dll", &image);
 
         let text = report_of(|out| run(&file, false, false, out));
+        // The path and the size both start with "file".
         assert_eq!(
-            line(&text, "file "),
+            line(&text, "file  "),
             format!("file           {}", file.display())
+        );
+        assert_eq!(
+            line(&text, "file size "),
+            format!("file size      {} bytes", image.len())
         );
         assert_eq!(
             line(&text, "blake3 "),
