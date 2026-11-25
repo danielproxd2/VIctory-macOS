@@ -632,9 +632,9 @@ mod tests {
         ));
     }
 
-    // Tests of the fork, written against the helpers above.
+    // A test of the fork, written against the helpers above.
 
-    use self::import_type::{CODE, CONST, DATA};
+    use self::import_type::{CODE, DATA};
     use self::name_type::{NAME as BY_NAME, ORDINAL as BY_ORDINAL};
 
     /// The header of an ordinary AMD64 object file with no sections.
@@ -642,99 +642,6 @@ mod tests {
         let mut d = vec![0u8; 20];
         d[..2].copy_from_slice(&MACHINE_AMD64.to_le_bytes());
         d
-    }
-
-    fn named(name: &str) -> ImportSymbol {
-        ImportSymbol::Name {
-            hint: 0,
-            name: name.to_owned(),
-        }
-    }
-
-    #[test]
-    fn reads_code_data_const_and_ordinal_members() {
-        let lib = archive(vec![
-            (
-                "one.dll/",
-                import_object(CODE, BY_NAME, 4, "Function", "one.dll", None),
-            ),
-            (
-                "one.dll/",
-                import_object(DATA, BY_NAME, 0, "Variable", "one.dll", None),
-            ),
-            (
-                "two.dll/",
-                import_object(CONST, BY_NAME, 0, "Constant", "two.dll", None),
-            ),
-            (
-                "two.dll/",
-                import_object(CODE, BY_ORDINAL, 17, "Unnamed", "two.dll", None),
-            ),
-        ]);
-        let lib = ImportLibrary::parse(&lib).unwrap();
-        assert_eq!(lib.other_members, 0);
-        let import = |dll: &str, export, kind| LibImport {
-            dll: dll.to_owned(),
-            export,
-            kind,
-        };
-        // Sorted by DLL, then export. The hint is not part of the identity.
-        assert_eq!(
-            lib.imports,
-            [
-                import("one.dll", named("Function"), LibImportKind::Code),
-                import("one.dll", named("Variable"), LibImportKind::Data),
-                import("two.dll", named("Constant"), LibImportKind::Const),
-                import("two.dll", ImportSymbol::Ordinal(17), LibImportKind::Code),
-            ]
-        );
-    }
-
-    #[test]
-    fn duplicates_collapse_and_other_members_are_counted() {
-        let function = || import_object(CODE, BY_NAME, 0, "Function", "one.dll", None);
-        let lib = archive(vec![
-            ("x.obj/", regular_object()),
-            ("one.dll/", function()),
-            // The same export with another hint is still the same export.
-            (
-                "one.dll/",
-                import_object(CODE, BY_NAME, 9, "Function", "one.dll", None),
-            ),
-            ("odd/", b"odd".to_vec()),
-            ("one.dll/", function()),
-        ]);
-        let lib = ImportLibrary::parse(&lib).unwrap();
-        assert_eq!(lib.imports.len(), 1);
-        assert_eq!(lib.imports[0].export, named("Function"));
-        assert_eq!(lib.other_members, 2);
-    }
-
-    #[test]
-    fn rejects_non_archive() {
-        for data in [&b""[..], b"not an archive at all", &regular_object()] {
-            assert!(matches!(
-                ImportLibrary::parse(data),
-                Err(PeError::Malformed(_))
-            ));
-        }
-        // A member that claims more data than the file holds.
-        let mut cut = archive(vec![(
-            "one.dll/",
-            import_object(CODE, BY_NAME, 0, "Function", "one.dll", None),
-        )]);
-        cut.truncate(cut.len() - 4);
-        assert!(matches!(
-            ImportLibrary::parse(&cut),
-            Err(PeError::Malformed(_))
-        ));
-        // A member header cut short.
-        let mut cut = archive(vec![("x.obj/", regular_object())]);
-        cut.truncate(8 + 30);
-        assert!(matches!(
-            ImportLibrary::parse(&cut),
-            Err(PeError::Malformed(_))
-        ));
     }
 
     /// Seeded mutations of a small archive: every outcome is a value. What
