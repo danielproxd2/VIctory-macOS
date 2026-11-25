@@ -36,6 +36,10 @@ pub(crate) struct Pending {
     /// Makes [`Pending::make`] panic where the host pipeline would be made.
     #[cfg(test)]
     panics: AtomicBool,
+    /// Makes a worker's turn ([`work`]) panic after the pipeline is made,
+    /// outside what [`Pending::make`] contains.
+    #[cfg(test)]
+    panics_later: AtomicBool,
     /// The name of the thread that made it.
     #[cfg(test)]
     made_by: OnceLock<String>,
@@ -71,6 +75,8 @@ impl Pending {
             #[cfg(test)]
             panics: AtomicBool::new(false),
             #[cfg(test)]
+            panics_later: AtomicBool::new(false),
+            #[cfg(test)]
             made_by: OnceLock::new(),
         }
     }
@@ -100,13 +106,14 @@ impl Pending {
                 );
                 None
             });
-            // `OnceLock::get_or_init` would leave the cell empty after a
-            // panic; this fills it either way.
-            let _ = self.made.set(made);
+            // Before `made`: a test that sees the pipeline made reads this.
             #[cfg(test)]
             let _ = self
                 .made_by
                 .set(std::thread::current().name().unwrap_or("").to_owned());
+            // `OnceLock::get_or_init` would leave the cell empty after a
+            // panic; this fills it either way.
+            let _ = self.made.set(made);
         }
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -234,6 +241,12 @@ fn work(p: &Pending) {
     let turn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let counted = Counted;
         p.make();
+        // Where the rest of a turn (the log line, saving the cache) would
+        // panic: past `make`'s own containment, still counted as waiting.
+        #[cfg(test)]
+        if p.panics_later.load(Ordering::Relaxed) {
+            panic!("test: a worker's turn panics after its pipeline is made");
+        }
         if counted.made() {
             drained();
         } else {
@@ -347,9 +360,38 @@ mod tests {
         assert!(ready(&p).is_none());
     }
 
-    /// Panics do not end workers or leave pipelines counted as waiting:
-    /// after more panics than there are workers, an ordinary pipeline is
-    /// still made by a worker and nothing waits.
+    /// Whether nothing is counted as waiting within 10 s. Other tests
+    /// queue pipelines too (without the lock), so this waits for the
+    /// count instead of reading it once.
+    fn none_waiting_soon() -> bool {
+        let started = Instant::now();
+        while waiting() != 0 && started.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        waiting() == 0
+    }
+
+    /// Whether an ordinary pipeline queued now is made by a worker.
+    fn a_worker_is_left() -> Result<(), String> {
+        let good = Arc::new(Pending::new(Vec::new(), None));
+        start(&good);
+        if !made_soon(&good) {
+            return Err("an ordinary pipeline was never made".into());
+        }
+        // Without workers the queueing thread makes it.
+        let by = good.made_by.get().map(String::as_str).unwrap_or("");
+        if !by.starts_with("victory-pipelines-") {
+            return Err(format!("made by {by:?}, not by a worker"));
+        }
+        Ok(())
+    }
+
+    /// Panics while pipelines are made do not end workers or leave
+    /// pipelines counted as waiting: after more of them than there are
+    /// workers, an ordinary pipeline is still made by a worker and nothing
+    /// waits. These panics are contained by [`Pending::make`] and never
+    /// reach a worker's own containment; `a_workers_turn_survives_a_panic`
+    /// is the test of that.
     #[test]
     fn workers_survive_panics() {
         let _serial = crate::test_support::serial();
@@ -362,17 +404,41 @@ mod tests {
             assert!(made_soon(p), "panicking pipeline {i} was never made");
             assert!(matches!(p.made.get(), Some(None)));
         }
-        let good = Arc::new(Pending::new(Vec::new(), None));
-        start(&good);
-        assert!(made_soon(&good), "no worker is left");
-        let by = good.made_by.get().map(String::as_str).unwrap_or("");
-        assert!(by.starts_with("victory-pipelines-"), "made by {by:?}");
-        // Other tests queue pipelines too (without the lock), so this
-        // waits for the count instead of reading it once.
-        let started = Instant::now();
-        while waiting() != 0 && started.elapsed() < Duration::from_secs(10) {
-            std::thread::sleep(Duration::from_millis(1));
+        assert_eq!(a_worker_is_left(), Ok(()));
+        assert!(none_waiting_soon(), "{} still waiting", waiting());
+    }
+
+    /// A panic in a worker's turn outside [`Pending::make`] (after the
+    /// pipeline is made, where the turn logs and saves the cache) ends
+    /// neither the worker nor the count of the pipeline: [`work`] contains
+    /// it and the turn's [`Counted`] guard takes the pipeline off the
+    /// count as the panic unwinds. After three times as many such turns
+    /// as there can be workers, a worker still makes an ordinary pipeline
+    /// and nothing is counted as waiting.
+    ///
+    /// Shown by mutation: without the `catch_unwind` in `work` every
+    /// worker ends at its first such turn and this fails on "never made";
+    /// without `Counted`'s `Drop` it fails on the count.
+    #[test]
+    fn a_workers_turn_survives_a_panic() {
+        let _serial = crate::test_support::serial();
+        assert!(none_waiting_soon(), "{} waiting at the start", waiting());
+        let bad: Vec<Arc<Pending>> = (0..24)
+            .map(|_| {
+                let p = Pending::new(Vec::new(), None);
+                p.panics_later.store(true, Ordering::Relaxed);
+                Arc::new(p)
+            })
+            .collect();
+        for p in &bad {
+            start(p);
         }
-        assert_eq!(waiting(), 0);
+        for (i, p) in bad.iter().enumerate() {
+            assert!(made_soon(p), "pipeline {i} was never made");
+            let by = p.made_by.get().map(String::as_str).unwrap_or("");
+            assert!(by.starts_with("victory-pipelines-"), "{i} made by {by:?}");
+        }
+        assert_eq!(a_worker_is_left(), Ok(()));
+        assert!(none_waiting_soon(), "{} still waiting", waiting());
     }
 }
