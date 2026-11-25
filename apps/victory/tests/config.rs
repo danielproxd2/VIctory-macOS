@@ -17,6 +17,7 @@ fn config(game: &Path, cache: &Path, data: &Path) -> Output {
         .current_dir(&elsewhere)
         .env_remove("VICTORY_CONFIG")
         .env_remove("VICTORY_TEST_TITLES")
+        .env_remove("VICTORY_FIDELITYFX_DIR")
         .env("VICTORY_GAME_DIR", game)
         .env("VICTORY_CACHE_DIR", cache)
         .env("VICTORY_DATA_DIR", data)
