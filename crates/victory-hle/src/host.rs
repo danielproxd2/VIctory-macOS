@@ -182,7 +182,9 @@ const ENOSYS: i32 = 40;
 /// the error, Winsock functions return `SOCKET_ERROR`, an invalid socket
 /// or null and set the Winsock error, name resolution returns its error
 /// code, and C runtime functions return -1, null or an `errno_t` and set
-/// `errno`. A stand-in does not write through the call's pointers.
+/// `errno`, and Windows Runtime functions return a failure `HRESULT` (a
+/// string buffer query returns null). A stand-in does not write through
+/// the call's pointers.
 #[cfg(any(windows, test))]
 pub(crate) fn failure(dll: &str, name: &str) -> (ThreadError, i64) {
     let starts = |prefix: &str| name.starts_with(prefix);
@@ -200,6 +202,15 @@ pub(crate) fn failure(dll: &str, name: &str) -> (ThreadError, i64) {
         "advapi32.dll" => (
             ThreadError::Win32(ERROR_PROC_NOT_FOUND),
             ERROR_PROC_NOT_FOUND.into(),
+        ),
+        "combase.dll" => (
+            ThreadError::Win32(ERROR_PROC_NOT_FOUND),
+            if starts("Ro") {
+                // HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND), sign-extended.
+                (0x8007_0000_u32 | ERROR_PROC_NOT_FOUND) as i32 as i64
+            } else {
+                0
+            },
         ),
         "ucrtbase.dll" | "msvcp140.dll" => {
             let value = match name {
@@ -530,6 +541,25 @@ mod tests {
         assert_eq!(failure("kernel32.dll", "GetFileAttributesExW"), (win32, 0));
         assert_eq!(failure("winhttp.dll", "WinHttpOpen"), (win32, 0));
         assert_eq!(failure("advapi32.dll", "RegOpenKeyExW"), (win32, 127));
+        assert_eq!(failure("iphlpapi.dll", "IcmpSendEcho"), (win32, 0));
+        assert_eq!(
+            failure("crypt32.dll", "CertGetCertificateChain"),
+            (win32, 0)
+        );
+        // A Windows Runtime call must not look like it succeeded (S_OK is 0).
+        let not_found = i64::from(0x8007_007F_u32 as i32);
+        assert_eq!(
+            failure("combase.dll", "RoGetActivationFactory"),
+            (win32, not_found)
+        );
+        assert_eq!(
+            failure("combase.dll", "RoActivateInstance"),
+            (win32, not_found)
+        );
+        assert_eq!(
+            failure("combase.dll", "WindowsGetStringRawBuffer"),
+            (win32, 0)
+        );
 
         let winsock = ThreadError::Winsock(10045);
         assert_eq!(failure("ws2_32.dll", "connect"), (winsock, -1));
